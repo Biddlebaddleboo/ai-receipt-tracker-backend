@@ -1,27 +1,26 @@
-from typing import Iterable, List, Optional, Sequence, Union
 import json
+import os
+from functools import lru_cache
+from typing import List, Optional
 
 from dotenv import load_dotenv
-from pydantic import Field, validator
-from pydantic_settings import BaseSettings
+from pydantic import BaseModel, Field, validator
 
 load_dotenv()
 
 
-class Settings(BaseSettings):
-    gcs_bucket_name: str = Field(..., env="GCLOUD_BUCKET_NAME")
-    firestore_collection: str = Field("receipts", env="FIRESTORE_COLLECTION_NAME")
-    openai_model_name: str = Field("gpt-4.1-mini", env="OPENAI_MODEL_NAME")
-    openai_api_key: Optional[str] = Field(None, env="OPENAI_API_KEY")
-    categories_collection: str = Field("categories", env="CATEGORIES_COLLECTION_NAME")
+class Settings(BaseModel):
+    gcs_bucket_name: str = Field(..., min_length=1)
+    firestore_collection: str = "receipts"
+    openai_model_name: str = "gpt-4.1-mini"
+    openai_api_key: Optional[str] = None
+    categories_collection: str = "categories"
     allowed_origins: List[str] = Field(
-        default_factory=lambda: ["http://localhost:3000"], env="ALLOWED_ORIGINS"
+        default_factory=lambda: ["http://localhost:3000"]
     )
 
     @validator("allowed_origins", pre=True)
-    def _split_origins(
-        cls, value: Union[str, Sequence[str], None]
-    ) -> List[str]:
+    def _split_origins(cls, value):
         if value is None:
             return []
         if isinstance(value, str):
@@ -33,14 +32,13 @@ class Settings(BaseSettings):
             except json.JSONDecodeError:
                 decoded = None
             if isinstance(decoded, list):
-                value = decoded
-            else:
                 return [
                     origin.strip()
-                    for origin in value.split(",")
-                    if origin.strip()
+                    for origin in decoded
+                    if isinstance(origin, str) and origin.strip()
                 ]
-        if isinstance(value, Sequence):
+            return [origin.strip() for origin in cleaned.split(",") if origin.strip()]
+        if isinstance(value, list):
             return [
                 origin.strip()
                 for origin in value
@@ -48,10 +46,14 @@ class Settings(BaseSettings):
             ]
         return [str(value).strip()] if str(value).strip() else []
 
-    class Config:
-        case_sensitive = False
-        env_file = ".env"
 
-
+@lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    return Settings(
+        gcs_bucket_name=os.getenv("GCLOUD_BUCKET_NAME", ""),
+        firestore_collection=os.getenv("FIRESTORE_COLLECTION_NAME", "receipts"),
+        openai_model_name=os.getenv("OPENAI_MODEL_NAME", "gpt-4.1-mini"),
+        openai_api_key=os.getenv("OPENAI_API_KEY"),
+        categories_collection=os.getenv("CATEGORIES_COLLECTION_NAME", "categories"),
+        allowed_origins=os.getenv("ALLOWED_ORIGINS", "http://localhost:3000"),
+    )

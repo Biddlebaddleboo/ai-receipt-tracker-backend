@@ -25,6 +25,7 @@ async def get_current_user(
     require_oauth_flag = getattr(settings, "require_oauth", False)
     if not require_oauth_flag:
         return None
+    print(settings.oauth_client_id)
     if not settings.oauth_client_id:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -45,6 +46,7 @@ async def get_current_user(
         )
     except ValueError as exc:
         raise HTTPException(
+            logger.warning("ID Token Verification failed: %s", exc)
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired OAuth token",
             headers={"WWW-Authenticate": "Bearer"},

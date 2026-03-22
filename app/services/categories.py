@@ -14,17 +14,14 @@ class CategoryService:
         self._collection = self._client.collection(collection_name)
 
     def list_categories(self, owner_email: str) -> List[Dict[str, Any]]:
-        query = (
-            self._collection.where(OWNER_FIELD, "==", owner_email)
-            .order_by("name")
-        )
+        query = self._collection.where(OWNER_FIELD, "==", owner_email)
         categories: List[Dict[str, Any]] = []
         for doc in query.stream():
             data = doc.to_dict() or {}
             normalized = self._normalize_category(doc.id, data)
             if normalized is not None:
                 categories.append(normalized)
-        return categories
+        return sorted(categories, key=lambda category: category["name"].lower())
 
     def category_names(self, owner_email: str) -> List[str]:
         return [doc.get("name") for doc in self.list_categories(owner_email) if doc.get("name")]

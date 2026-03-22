@@ -76,23 +76,6 @@ def _validate_subtotal_against_items(
     return updated_subtotal, validation_info
 
 
-def _items_total(items: List[Dict[str, Any]]) -> Optional[float]:
-    if not items:
-        return None
-    total = 0.0
-    counted = False
-    for item in items:
-        quantity = item.get("quantity")
-        price = item.get("price")
-        if quantity is None or price is None:
-            continue
-        total += quantity * price
-        counted = True
-    if not counted:
-        return None
-    return round(total, 2)
-
-
 settings = get_settings()
 app = FastAPI(title="Receipt Scanner API")
 

@@ -2,7 +2,8 @@ from typing import Iterable, List, Optional, Sequence, Union
 import json
 
 from dotenv import load_dotenv
-from pydantic import BaseSettings, Field, validator
+from pydantic import Field, validator
+from pydantic_settings import BaseSettings
 
 load_dotenv()
 

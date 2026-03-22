@@ -19,6 +19,7 @@ class AuthenticatedUser(BaseModel):
 
 
 async def get_current_user(
+    print("auth dep running", credentials)
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     settings: Settings = Depends(get_settings),
 ) -> Optional[AuthenticatedUser]:

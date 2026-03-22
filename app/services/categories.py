@@ -5,30 +5,37 @@ from typing import Any, Dict, List
 from google.cloud import firestore
 from google.api_core import exceptions as google_exceptions
 
+OWNER_FIELD = "owner_email"
+
 
 class CategoryService:
     def __init__(self, collection_name: str, database_id: str = "(default)"):
         self._client = firestore.Client(database=database_id)
         self._collection = self._client.collection(collection_name)
 
-    def list_categories(self) -> List[Dict[str, Any]]:
+    def list_categories(self, owner_email: str) -> List[Dict[str, Any]]:
+        query = (
+            self._collection.where(OWNER_FIELD, "==", owner_email)
+            .order_by("name")
+        )
         categories: List[Dict[str, Any]] = []
-        for doc in self._collection.stream():
+        for doc in query.stream():
             data = doc.to_dict() or {}
             normalized = self._normalize_category(doc.id, data)
             if normalized is not None:
                 categories.append(normalized)
-        return sorted(categories, key=lambda category: category["name"].lower())
+        return categories
 
-    def category_names(self) -> List[str]:
-        return [doc.get("name") for doc in self.list_categories() if doc.get("name")]
+    def category_names(self, owner_email: str) -> List[str]:
+        return [doc.get("name") for doc in self.list_categories(owner_email) if doc.get("name")]
 
-    def create_category(self, payload: Dict[str, Any]) -> str:
+    def create_category(self, payload: Dict[str, Any], owner_email: str) -> str:
         doc_ref = self._collection.document()
-        doc_ref.set(self._sanitize_payload(payload))
+        payload_with_owner = {**self._sanitize_payload(payload), OWNER_FIELD: owner_email}
+        doc_ref.set(payload_with_owner)
         return doc_ref.id
 
-    def get_category(self, category_id: str) -> Dict[str, Any]:
+    def get_category(self, category_id: str, owner_email: str) -> Dict[str, Any]:
         doc_ref = self._collection.document(category_id)
         try:
             snapshot = doc_ref.get()
@@ -37,12 +44,14 @@ class CategoryService:
         if not snapshot.exists:
             raise KeyError(f"Category {category_id} not found")
         data = snapshot.to_dict() or {}
+        if data.get(OWNER_FIELD) != owner_email:
+            raise KeyError(f"Category {category_id} not found")
         normalized = self._normalize_category(snapshot.id, data)
         if normalized is None:
             raise KeyError(f"Category {category_id} not found")
         return normalized
 
-    def update_category(self, category_id: str, payload: Dict[str, Any]) -> None:
+    def update_category(self, category_id: str, payload: Dict[str, Any], owner_email: str) -> None:
         doc_ref = self._collection.document(category_id)
         try:
             snapshot = doc_ref.get()
@@ -50,15 +59,22 @@ class CategoryService:
             raise KeyError(f"Category {category_id} not found") from exc
         if not snapshot.exists:
             raise KeyError(f"Category {category_id} not found")
-        doc_ref.update(self._sanitize_payload(payload))
+        data = snapshot.to_dict() or {}
+        if data.get(OWNER_FIELD) != owner_email:
+            raise KeyError(f"Category {category_id} not found")
+        sanitized = self._sanitize_payload(payload)
+        doc_ref.update(sanitized)
 
-    def delete_category(self, category_id: str) -> None:
+    def delete_category(self, category_id: str, owner_email: str) -> None:
         doc_ref = self._collection.document(category_id)
         try:
             snapshot = doc_ref.get()
         except google_exceptions.NotFound as exc:
             raise KeyError(f"Category {category_id} not found") from exc
         if not snapshot.exists:
+            raise KeyError(f"Category {category_id} not found")
+        data = snapshot.to_dict() or {}
+        if data.get(OWNER_FIELD) != owner_email:
             raise KeyError(f"Category {category_id} not found")
         doc_ref.delete()
 

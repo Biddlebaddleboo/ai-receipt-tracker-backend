@@ -33,6 +33,7 @@ class ReceiptRecord(BaseModel):
     items: List[ReceiptItem] = Field(default_factory=list)
     image_url: str
     storage_path: str = Field(..., exclude=True)
+    owner_email: str = Field(..., exclude=True)
     extracted_text: str
     extracted_fields: Dict[str, Any]
     created_at: datetime

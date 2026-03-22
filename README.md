@@ -29,6 +29,11 @@ This backend exposes a FastAPI app that ingests receipt images, stores them in a
     - `FIRESTORE_COLLECTION_NAME`: Firestore collection name (default `receipts`).
     - `CATEGORIES_COLLECTION_NAME`: category collection name (default `categories`).
     - `OPENAI_API_KEY`: key with Responses access.
+    - `OPENAI_MODEL_NAME`: model to ask (default `gpt-4.1-mini`).
+    - `ALLOWED_ORIGINS`: comma-separated list or JSON array of origins that may call the API (e.g., `["https://ai-receipt-tracker.web.app"]`). Cloud Run may require quoting.
+    - `REQUIRE_OAUTH`: `true` to force every endpoint (except `/healthz`) to require a Google OAuth bearer token.
+    - `OAUTH_CLIENT_ID`: Google OAuth client ID (used as the token audience when OAuth is enabled).
+    - `OAUTH_ALLOWED_DOMAINS`: optional comma-separated list or JSON array of allowed Google Workspace domains (e.g., `example.com`).
 
 3. Start the development server:
 
@@ -47,8 +52,9 @@ Upload a receipt image and optional metadata. The endpoint:
 - calls the OpenAI responses API to extract the visible text, line items (name + quantity + price), and inferred totals.
 - persists data in Firestore along with the extraction.
 
-If any metadata field is omitted the AI extraction step tries to populate it from the receipt image before saving it; you can still override the inferred values by including the form parameter yourself. The backend also validates that the AI subtotal matches the sum of the inferred items and stores that validation state under `extracted_fields.validation`.
-The category inference step is constrained to the list stored via `POST /categories`. If the AI cannot confidently match the receipt to one of those names it returns `null` and the record stays uncategorized.
+If any metadata field is omitted the AI extraction step tries to populate it from the receipt image before saving it; you can still override the inferred values by including the form parameter yourself. The backend also validates that the AI subtotal matches the sum of the inferred items and stores that validation state under `extracted_fields.validation`. Each receipt is tied to the authenticated Google email (stored under `owner_email` in Firestore), so only that user can fetch or modify their receipts.
+The `items` property is a structured list of objects with `name`, `quantity`, and `price` (both `quantity` and `price` are floats when the AI can extract them). This makes it easy for the frontend to render line items, and the backend will override or infer the `subtotal` so it matches the computed total of every `quantity * price`.
+The category inference step is constrained to the list stored via `POST /categories`. If the AI cannot confidently match the receipt to one of those names it returns `null` and the record stays uncategorized. Every receipt document also records `extracted_fields`, including the `model` that answered, the trimmed `text_length`, `ai_suggestions` (vendor, totals, category, purchase date, items) and the `validation` details so you can show what values were forced or inferred.
 
 Response payload includes the created Firestore ID and stored fields.
 
@@ -77,14 +83,18 @@ Streams receipts sorted by the most recent upload first.
 
 - Query parameters:
   - `limit` (default `10`, max `100`): how many receipts to return.
-  - `start_after_id`: use the `next_cursor` value from a previous response to fetch the next page.
+  - `start_after_id`: use the `next_cursor` value (it is the Firestore document ID of the last receipt in the previous batch) to fetch the next page; IDs are not sequential counters, so always pass the ID returned by the API instead of assuming they start at `1`.
 - Response: `{ receipts: [...], next_cursor: "<last-doc-id or null>" }`.
 - Push `start_after_id=<next_cursor>` to load the next batch of 10 receipts until `next_cursor` is `null`.
 - `storage_path` is not included in the API response; use the image proxy endpoint below instead.
 
+### Authentication
+
+The backend now requires Google OAuth ID tokens on every request (everything except `GET /healthz`), so set `REQUIRE_OAUTH=true` when you deploy for production. Send `Authorization: Bearer <id_token>` with the token issued for the `OAUTH_CLIENT_ID` audience. The ID token is verified with `google.oauth2.id_token` and, if `OAUTH_ALLOWED_DOMAINS` is set, the token’s `hd` claim must match one of the allowed workspace domains. The authenticated email becomes the owner of every receipt and category document (`owner_email` in Firestore), and the API filters every query/update by that owner so no user can see or modify another user’s data even though the collections are shared.
+
 ### `Category Management`
 
-You can create, list, update, and delete categories via the backend. The API uses a separate `categories` Firestore collection and keeps their metadata entirely within Firestore (no image uploads).
+You can create, list, update, and delete categories via the backend. The API uses a separate `categories` Firestore collection and keeps their metadata entirely within Firestore (no image uploads). Categories are tied to the authenticated Google email, so each user manages their own list of names/descriptions independently of other users.
 
 - `POST /categories` – supply `{ "name": "...", "description": "..." }` to create a category; returns the new ID plus stored fields.
 - `GET /categories` – returns all categories sorted by name.
@@ -118,9 +128,13 @@ Simple readiness check.
       --region us-central1 \
       --platform managed \
       --allow-unauthenticated \
-      --set-env-vars GCLOUD_BUCKET_NAME=<bucket>,FIRESTORE_DATABASE_ID=(default),FIRESTORE_COLLECTION_NAME=receipts,CATEGORIES_COLLECTION_NAME=categories,OPENAI_API_KEY=<key>,OPENAI_MODEL_NAME=gpt-4.1-mini,ALLOWED_ORIGINS=http://localhost:3000 \
+      --set-env-vars GCLOUD_BUCKET_NAME=<bucket>,FIRESTORE_DATABASE_ID=(default),FIRESTORE_COLLECTION_NAME=receipts,CATEGORIES_COLLECTION_NAME=categories,OPENAI_API_KEY=<key>,OPENAI_MODEL_NAME=gpt-4.1-mini,ALLOWED_ORIGINS='[\"https://ai-receipt-tracker.web.app\"]',REQUIRE_OAUTH=true,OAUTH_CLIENT_ID=<client-id>,OAUTH_ALLOWED_DOMAINS=example.com \
       --service-account=<service-account>@<PROJECT>.iam.gserviceaccount.com
     ```
+
+    > Use single quotes around `ALLOWED_ORIGINS` (and any JSON array/CSV) when invoking `gcloud` so the brackets aren't interpreted by the shell. Adjust `REQUIRE_OAUTH`, `OAUTH_CLIENT_ID`, and `OAUTH_ALLOWED_DOMAINS` only if you want Google OAuth enforced.
+
+    > If you see `Error: The database (default) does not exist`, visit the Firestore setup page (https://console.cloud.google.com/datastore/setup) to initialize Firestore and set `FIRESTORE_DATABASE_ID` to the database ID you created. The default database is `(default)` so most deployments can keep that value after the database exists.
 
 3. Secure the runtime:
 
@@ -142,3 +156,5 @@ Simple readiness check.
 - For production, run `uvicorn app.main:app --host 0.0.0.0 --port 8000` behind a secured reverse proxy or gateway.
 - The list of categories also acts as the source of truth for AI classification when a receipt is uploaded; make sure each desired label is saved here before it can be inferred automatically.
 - Firestore collection names and the Firestore database ID are separate settings. `FIRESTORE_DATABASE_ID` selects the database, while `FIRESTORE_COLLECTION_NAME` and `CATEGORIES_COLLECTION_NAME` select collections inside that database.
+- Each receipt document stores an `items` array of `{ "name": "...", "quantity": 1.0, "price": 2.5 }` entries, an `owner_email` field that matches the Google email that created it, and an `extracted_fields` object that captures the `model`, `text_length`, `ai_suggestions`, and `validation` metadata so the frontend can surface what values were inferred or forced.
+- When `REQUIRE_OAUTH=true` every request except `/healthz` must carry a Google OAuth ID token in `Authorization: Bearer <id_token>`; tokens are verified against `OAUTH_CLIENT_ID` and the optional `OAUTH_ALLOWED_DOMAINS` list.

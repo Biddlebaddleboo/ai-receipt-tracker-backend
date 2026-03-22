@@ -5,17 +5,19 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
+import asyncio
 import io
 from concurrent.futures import ThreadPoolExecutor
 
 from PIL import Image
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from google.api_core import exceptions as google_exceptions
 
+from app.auth import AuthenticatedUser, get_current_user
 from app.config import get_settings
 from app.models import (
     CategoryCreate,
@@ -118,6 +120,16 @@ category_service = CategoryService(
 )
 
 
+def _require_owner_email(current_user: Optional[AuthenticatedUser]) -> str:
+    if current_user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="OAuth bearer token required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return current_user.email
+
+
 @app.get("/healthz")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
@@ -133,40 +145,38 @@ async def create_receipt(
     total: Optional[float] = Form(None),
     category: Optional[str] = Form(None),
     purchase_date: Optional[str] = Form(None),
+    current_user: Optional[AuthenticatedUser] = Depends(get_current_user),
 ) -> ReceiptRecord:
     _ensure_image(file.content_type)
     contents = await file.read()
+    owner_email = _require_owner_email(current_user)
     stored_path = _build_storage_key(file.filename or "receipt")
     avif_path = f"{stored_path}.avif"
-    category_options = category_service.category_names()
-    ocr_result = ocr_client.extract(contents, category_options=category_options)
+    category_options = category_service.category_names(owner_email)
+    ocr_task = asyncio.create_task(
+        asyncio.to_thread(
+            ocr_client.extract,
+            contents,
+            category_options=category_options,
+        )
+    )
+    conversion_future = _AVIF_EXECUTOR.submit(
+        _convert_and_upload_avif, storage_client, contents, avif_path
+    )
+    ocr_result = await ocr_task
     extracted_text = ocr_result.text
+    items_payload = [item.dict(exclude_none=True) for item in ocr_result.items]
+    subtotal_candidate = subtotal if subtotal is not None else ocr_result.subtotal
+    subtotal_value, validation_info = _validate_subtotal_against_items(
+        subtotal_candidate, items_payload
+    )
     vendor_value = vendor if vendor is not None else ocr_result.vendor
-    subtotal_value = subtotal if subtotal is not None else ocr_result.subtotal
     tax_value = tax if tax is not None else ocr_result.tax
     total_value = total if total is not None else ocr_result.total
     category_value = category if category is not None else ocr_result.category
     purchase_date_value = (
         purchase_date if purchase_date is not None else ocr_result.purchase_date
     )
-    items_payload = [item.dict(exclude_none=True) for item in ocr_result.items]
-    items_total = _items_total(items_payload)
-    validation_info: Dict[str, Any] = {"items_total": items_total}
-    if items_total is not None:
-        if subtotal_value is None:
-            subtotal_value = items_total
-            validation_info["subtotal_inferred_from_items"] = True
-            validation_info["subtotal_matches_items"] = True
-        else:
-            match = abs(subtotal_value - items_total) <= 0.01
-            validation_info["subtotal_matches_items"] = match
-            if not match:
-                validation_info["subtotal_overridden"] = True
-                subtotal_value = items_total
-    conversion_future = _AVIF_EXECUTOR.submit(
-        _convert_and_upload_avif, storage_client, contents, avif_path
-    )
-
     extracted_fields = {
         "model": settings.openai_model_name,
         "text_length": len(extracted_text),
@@ -177,7 +187,7 @@ async def create_receipt(
             "total": ocr_result.total,
             "category": ocr_result.category,
             "purchase_date": ocr_result.purchase_date,
-            "items": [item.dict(exclude_none=True) for item in ocr_result.items],
+            "items": items_payload,
         },
         "validation": validation_info,
     }
@@ -187,7 +197,7 @@ async def create_receipt(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to convert image: {exc}")
 
-    payload = {
+    payload: Dict[str, Any] = {
         "vendor": vendor_value,
         "subtotal": subtotal_value,
         "tax": tax_value,
@@ -200,13 +210,16 @@ async def create_receipt(
         "extracted_text": extracted_text,
         "extracted_fields": extracted_fields,
         "created_at": datetime.utcnow(),
+        "owner_email": owner_email,
     }
 
-    doc_id = firestore_client.insert_receipt(payload)
+    doc_id = firestore_client.insert_receipt(owner_email, payload)
     # Prefer serving images through the API proxy so the bucket can stay private.
     payload["image_url"] = str(request.url_for("stream_receipt_image", receipt_id=doc_id))
     try:
-        firestore_client.update_receipt(doc_id, {"image_url": payload["image_url"]})
+        firestore_client.update_receipt(
+            doc_id, {"image_url": payload["image_url"]}, owner_email
+        )
     except KeyError:
         # If the receipt was deleted between insert and update, just return the response we have.
         pass
@@ -218,9 +231,13 @@ def list_receipts(
     request: Request,
     limit: int = Query(10, ge=1, le=100),
     start_after_id: Optional[str] = Query(None),
+    current_user: Optional[AuthenticatedUser] = Depends(get_current_user),
 ) -> ReceiptListResponse:
     try:
-        docs, next_cursor = firestore_client.list_receipts(limit=limit, start_after_id=start_after_id)
+        owner_email = _require_owner_email(current_user)
+        docs, next_cursor = firestore_client.list_receipts(
+            owner_email, limit=limit, start_after_id=start_after_id
+        )
     except KeyError as err:
         raise HTTPException(status_code=404, detail=str(err))
 
@@ -233,9 +250,14 @@ def list_receipts(
 
 
 @app.put("/receipts/{receipt_id}", response_model=ReceiptRecord)
-def update_receipt(receipt_id: str, payload: ReceiptUpdate) -> ReceiptRecord:
+def update_receipt(
+    receipt_id: str,
+    payload: ReceiptUpdate,
+    current_user: Optional[AuthenticatedUser] = Depends(get_current_user),
+) -> ReceiptRecord:
+    owner_email = _require_owner_email(current_user)
     try:
-        existing = firestore_client.get_receipt(receipt_id)
+        existing = firestore_client.get_receipt(receipt_id, owner_email)
     except KeyError as err:
         raise HTTPException(status_code=404, detail=str(err))
 
@@ -260,7 +282,9 @@ def update_receipt(receipt_id: str, payload: ReceiptUpdate) -> ReceiptRecord:
         update_data["extracted_fields"] = extracted_fields
 
     try:
-        updated = firestore_client.update_receipt(receipt_id, update_data)
+        updated = firestore_client.update_receipt(
+            receipt_id, update_data, owner_email
+        )
     except KeyError as err:
         raise HTTPException(status_code=404, detail=str(err))
 
@@ -268,51 +292,69 @@ def update_receipt(receipt_id: str, payload: ReceiptUpdate) -> ReceiptRecord:
 
 
 @app.post("/categories", response_model=CategoryRecord)
-def create_category(payload: CategoryCreate):
+def create_category(
+    payload: CategoryCreate,
+    current_user: Optional[AuthenticatedUser] = Depends(get_current_user),
+) -> CategoryRecord:
+    owner_email = _require_owner_email(current_user)
     data = payload.dict(exclude_none=True)
     try:
-        category_id = category_service.create_category(data)
+        category_id = category_service.create_category(data, owner_email)
     except ValueError as err:
         raise HTTPException(status_code=400, detail=str(err))
-    category_doc = category_service.get_category(category_id)
+    category_doc = category_service.get_category(category_id, owner_email)
     return CategoryRecord(**category_doc)
 
 
 @app.get("/categories", response_model=List[CategoryRecord])
-def list_categories():
+def list_categories(current_user: Optional[AuthenticatedUser] = Depends(get_current_user)):
+    owner_email = _require_owner_email(current_user)
     try:
-        docs = category_service.list_categories()
+        docs = category_service.list_categories(owner_email)
     except google_exceptions.GoogleAPICallError as err:
         raise HTTPException(status_code=500, detail=f"Failed to load categories: {err}")
     return [CategoryRecord(**doc) for doc in docs]
 
 
 @app.put("/categories/{category_id}", response_model=CategoryRecord)
-def update_category(category_id: str, payload: CategoryCreate):
+def update_category(
+    category_id: str,
+    payload: CategoryCreate,
+    current_user: Optional[AuthenticatedUser] = Depends(get_current_user),
+) -> CategoryRecord:
+    owner_email = _require_owner_email(current_user)
     data = payload.dict(exclude_none=True)
     try:
-        category_service.update_category(category_id, data)
+        category_service.update_category(category_id, data, owner_email)
     except ValueError as err:
         raise HTTPException(status_code=400, detail=str(err))
     except KeyError as err:
         raise HTTPException(status_code=404, detail=str(err))
 
-    category_doc = category_service.get_category(category_id)
+    category_doc = category_service.get_category(category_id, owner_email)
     return CategoryRecord(**category_doc)
 
 
 @app.delete("/categories/{category_id}", status_code=204)
-def delete_category(category_id: str):
+def delete_category(
+    category_id: str,
+    current_user: Optional[AuthenticatedUser] = Depends(get_current_user),
+) -> None:
+    owner_email = _require_owner_email(current_user)
     try:
-        category_service.delete_category(category_id)
+        category_service.delete_category(category_id, owner_email)
     except KeyError as err:
         raise HTTPException(status_code=404, detail=str(err))
 
 
 @app.get("/receipts/{receipt_id}/image")
-def stream_receipt_image(receipt_id: str):
+def stream_receipt_image(
+    receipt_id: str,
+    current_user: Optional[AuthenticatedUser] = Depends(get_current_user),
+) -> StreamingResponse:
+    owner_email = _require_owner_email(current_user)
     try:
-        stored = firestore_client.get_receipt(receipt_id)
+        stored = firestore_client.get_receipt(receipt_id, owner_email)
     except KeyError as err:
         raise HTTPException(status_code=404, detail=str(err))
 
@@ -329,10 +371,15 @@ def stream_receipt_image(receipt_id: str):
     return StreamingResponse(io.BytesIO(image_bytes), media_type=media_type)
 
 
-@app.get("/receipts/{receipt_id}" )
-def read_receipt(request: Request, receipt_id: str) -> ReceiptRecord:
+@app.get("/receipts/{receipt_id}")
+def read_receipt(
+    request: Request,
+    receipt_id: str,
+    current_user: Optional[AuthenticatedUser] = Depends(get_current_user),
+) -> ReceiptRecord:
+    owner_email = _require_owner_email(current_user)
     try:
-        stored = firestore_client.get_receipt(receipt_id)
+        stored = firestore_client.get_receipt(receipt_id, owner_email)
     except KeyError as err:
         raise HTTPException(status_code=404, detail=str(err))
     stored["image_url"] = str(request.url_for("stream_receipt_image", receipt_id=receipt_id))
@@ -340,9 +387,13 @@ def read_receipt(request: Request, receipt_id: str) -> ReceiptRecord:
 
 
 @app.delete("/receipts/{receipt_id}", status_code=204)
-def delete_receipt(receipt_id: str):
+def delete_receipt(
+    receipt_id: str,
+    current_user: Optional[AuthenticatedUser] = Depends(get_current_user),
+) -> None:
+    owner_email = _require_owner_email(current_user)
     try:
-        stored = firestore_client.delete_receipt(receipt_id)
+        stored = firestore_client.delete_receipt(receipt_id, owner_email)
     except KeyError as err:
         raise HTTPException(status_code=404, detail=str(err))
 

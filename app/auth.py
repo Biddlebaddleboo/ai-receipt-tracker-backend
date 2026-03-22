@@ -22,7 +22,8 @@ async def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     settings: Settings = Depends(get_settings),
 ) -> Optional[AuthenticatedUser]:
-    if not settings.require_oauth:
+    require_oauth_flag = getattr(settings, "require_oauth", False)
+    if not require_oauth_flag:
         return None
     if not settings.oauth_client_id:
         raise HTTPException(

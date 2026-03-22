@@ -46,7 +46,7 @@ async def get_current_user(
         )
     except ValueError as exc:
         raise HTTPException(
-            logger.warning("ID Token Verification failed: %s", exc)
+            logger.warning("ID Token Verification failed: %s", exc),
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired OAuth token",
             headers={"WWW-Authenticate": "Bearer"},

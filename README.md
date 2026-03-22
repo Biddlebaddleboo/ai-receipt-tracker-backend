@@ -25,7 +25,9 @@ This backend exposes a FastAPI app that ingests receipt images, stores them in a
 2. Copy `.env.example` to `.env` and populate the values:
     - `GOOGLE_APPLICATION_CREDENTIALS`: path to the JSON service account with Storage/Firestore permissions.
     - `GCLOUD_BUCKET_NAME`: bucket that already exists and allows uploads.
+    - `FIRESTORE_DATABASE_ID`: Firestore database ID to connect to. Use `(default)` for the default database.
     - `FIRESTORE_COLLECTION_NAME`: Firestore collection name (default `receipts`).
+    - `CATEGORIES_COLLECTION_NAME`: category collection name (default `categories`).
     - `OPENAI_API_KEY`: key with Responses access.
 
 3. Start the development server:
@@ -116,7 +118,7 @@ Simple readiness check.
       --region us-central1 \
       --platform managed \
       --allow-unauthenticated \
-      --set-env-vars GCLOUD_BUCKET_NAME=<bucket>,FIRESTORE_COLLECTION_NAME=receipts,CATEGORIES_COLLECTION_NAME=categories,OPENAI_API_KEY=<key>,OPENAI_MODEL_NAME=gpt-4.1-mini,ALLOWED_ORIGINS=http://localhost:3000 \
+      --set-env-vars GCLOUD_BUCKET_NAME=<bucket>,FIRESTORE_DATABASE_ID=(default),FIRESTORE_COLLECTION_NAME=receipts,CATEGORIES_COLLECTION_NAME=categories,OPENAI_API_KEY=<key>,OPENAI_MODEL_NAME=gpt-4.1-mini,ALLOWED_ORIGINS=http://localhost:3000 \
       --service-account=<service-account>@<PROJECT>.iam.gserviceaccount.com
     ```
 
@@ -139,3 +141,4 @@ Simple readiness check.
 - The OpenAI extractor prompts the model to describe the receipt, so you can adjust the prompt inside `app/services/ocr.py` if you need structured output.
 - For production, run `uvicorn app.main:app --host 0.0.0.0 --port 8000` behind a secured reverse proxy or gateway.
 - The list of categories also acts as the source of truth for AI classification when a receipt is uploaded; make sure each desired label is saved here before it can be inferred automatically.
+- Firestore collection names and the Firestore database ID are separate settings. `FIRESTORE_DATABASE_ID` selects the database, while `FIRESTORE_COLLECTION_NAME` and `CATEGORIES_COLLECTION_NAME` select collections inside that database.

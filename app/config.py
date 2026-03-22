@@ -11,6 +11,7 @@ load_dotenv()
 
 class Settings(BaseModel):
     gcs_bucket_name: str = Field(..., min_length=1)
+    firestore_database_id: str = "(default)"
     firestore_collection: str = "receipts"
     openai_model_name: str = "gpt-4.1-mini"
     openai_api_key: Optional[str] = None
@@ -51,6 +52,7 @@ class Settings(BaseModel):
 def get_settings() -> Settings:
     return Settings(
         gcs_bucket_name=os.getenv("GCLOUD_BUCKET_NAME", ""),
+        firestore_database_id=os.getenv("FIRESTORE_DATABASE_ID", "(default)"),
         firestore_collection=os.getenv("FIRESTORE_COLLECTION_NAME", "receipts"),
         openai_model_name=os.getenv("OPENAI_MODEL_NAME", "gpt-4.1-mini"),
         openai_api_key=os.getenv("OPENAI_API_KEY"),

@@ -7,8 +7,8 @@ from google.api_core import exceptions as google_exceptions
 
 
 class FirestoreClient:
-    def __init__(self, collection_name: str):
-        self._client = firestore.Client()
+    def __init__(self, collection_name: str, database_id: str = "(default)"):
+        self._client = firestore.Client(database=database_id)
         self._collection = self._client.collection(collection_name)
 
     def insert_receipt(self, payload: Dict[str, Any]) -> str:

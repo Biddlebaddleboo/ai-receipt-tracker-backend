@@ -88,9 +88,13 @@ app.add_middleware(
 )
 
 storage_client = GCSStorageClient(settings.gcs_bucket_name)
-firestore_client = FirestoreClient(settings.firestore_collection)
+firestore_client = FirestoreClient(
+    settings.firestore_collection, settings.firestore_database_id
+)
 ocr_client = OpenAITextExtractor(settings.openai_model_name, settings.openai_api_key)
-category_service = CategoryService(settings.categories_collection)
+category_service = CategoryService(
+    settings.categories_collection, settings.firestore_database_id
+)
 
 
 @app.get("/healthz")

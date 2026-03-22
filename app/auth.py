@@ -17,12 +17,11 @@ class AuthenticatedUser(BaseModel):
     email: str
     name: Optional[str] = None
 
-
 async def get_current_user(
-    print("auth dep running", credentials)
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     settings: Settings = Depends(get_settings),
 ) -> Optional[AuthenticatedUser]:
+    print("auth dep running", credentials)
     require_oauth_flag = getattr(settings, "require_oauth", False)
     if not require_oauth_flag:
         return None

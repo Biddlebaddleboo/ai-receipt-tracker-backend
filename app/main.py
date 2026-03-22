@@ -6,8 +6,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 import io
+from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from PIL import Image
+
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -35,6 +38,24 @@ def _ensure_image(content_type: Optional[str]) -> None:
 def _build_storage_key(filename: str) -> str:
     safe_name = Path(filename or "receipt").name
     return f"receipts/{uuid4()}_{safe_name}"
+
+
+_AVIF_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+
+
+def _convert_bytes_to_avif(data: bytes) -> bytes:
+    with Image.open(io.BytesIO(data)) as image:
+        buf = io.BytesIO()
+        image.save(buf, format="AVIF")
+        return buf.getvalue()
+
+
+def _convert_and_upload_avif(
+    storage_client: GCSStorageClient, data: bytes, destination: str
+) -> Tuple[str, str]:
+    avif_bytes = _convert_bytes_to_avif(data)
+    url = storage_client.upload(avif_bytes, destination, content_type="image/avif")
+    return url, destination
 
 
 def _items_total(items: List[Dict[str, Any]]) -> Optional[float]:
@@ -104,6 +125,7 @@ def health() -> Dict[str, str]:
 
 @app.post("/receipts", response_model=ReceiptRecord)
 async def create_receipt(
+    request: Request,
     file: UploadFile = File(...),
     vendor: Optional[str] = Form(None),
     subtotal: Optional[float] = Form(None),
@@ -115,7 +137,7 @@ async def create_receipt(
     _ensure_image(file.content_type)
     contents = await file.read()
     stored_path = _build_storage_key(file.filename or "receipt")
-    image_url = storage_client.upload(contents, stored_path, content_type=file.content_type)
+    avif_path = f"{stored_path}.avif"
     category_options = category_service.category_names()
     ocr_result = ocr_client.extract(contents, category_options=category_options)
     extracted_text = ocr_result.text
@@ -141,6 +163,10 @@ async def create_receipt(
             if not match:
                 validation_info["subtotal_overridden"] = True
                 subtotal_value = items_total
+    conversion_future = _AVIF_EXECUTOR.submit(
+        _convert_and_upload_avif, storage_client, contents, avif_path
+    )
+
     extracted_fields = {
         "model": settings.openai_model_name,
         "text_length": len(extracted_text),
@@ -156,6 +182,11 @@ async def create_receipt(
         "validation": validation_info,
     }
 
+    try:
+        image_url, storage_path = conversion_future.result()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to convert image: {exc}")
+
     payload = {
         "vendor": vendor_value,
         "subtotal": subtotal_value,
@@ -164,7 +195,7 @@ async def create_receipt(
         "category": category_value,
         "purchase_date": purchase_date_value,
         "image_url": image_url,
-        "storage_path": stored_path,
+        "storage_path": storage_path,
         "items": items_payload,
         "extracted_text": extracted_text,
         "extracted_fields": extracted_fields,
@@ -172,11 +203,19 @@ async def create_receipt(
     }
 
     doc_id = firestore_client.insert_receipt(payload)
+    # Prefer serving images through the API proxy so the bucket can stay private.
+    payload["image_url"] = str(request.url_for("stream_receipt_image", receipt_id=doc_id))
+    try:
+        firestore_client.update_receipt(doc_id, {"image_url": payload["image_url"]})
+    except KeyError:
+        # If the receipt was deleted between insert and update, just return the response we have.
+        pass
     return ReceiptRecord(id=doc_id, **payload)
 
 
 @app.get("/receipts", response_model=ReceiptListResponse)
 def list_receipts(
+    request: Request,
     limit: int = Query(10, ge=1, le=100),
     start_after_id: Optional[str] = Query(None),
 ) -> ReceiptListResponse:
@@ -185,6 +224,10 @@ def list_receipts(
     except KeyError as err:
         raise HTTPException(status_code=404, detail=str(err))
 
+    for doc in docs:
+        doc["image_url"] = str(
+            request.url_for("stream_receipt_image", receipt_id=doc["id"])
+        )
     receipts = [ReceiptRecord(**doc) for doc in docs]
     return ReceiptListResponse(receipts=receipts, next_cursor=next_cursor)
 
@@ -287,11 +330,12 @@ def stream_receipt_image(receipt_id: str):
 
 
 @app.get("/receipts/{receipt_id}" )
-def read_receipt(receipt_id: str) -> ReceiptRecord:
+def read_receipt(request: Request, receipt_id: str) -> ReceiptRecord:
     try:
         stored = firestore_client.get_receipt(receipt_id)
     except KeyError as err:
         raise HTTPException(status_code=404, detail=str(err))
+    stored["image_url"] = str(request.url_for("stream_receipt_image", receipt_id=receipt_id))
     return ReceiptRecord(id=receipt_id, **stored)
 
 

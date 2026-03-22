@@ -6,4 +6,6 @@ google-cloud-firestore>=2.11.0
 openai>=1.9.0
 python-dotenv>=1.0.0
 pydantic>=2.6.0
+pillow>=10.0.0
+pillow-avif-plugin>=1.0.0
 

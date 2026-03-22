@@ -1,3 +1,4 @@
+import logging
 from typing import Optional
 
 from fastapi import Depends, HTTPException, status
@@ -9,6 +10,7 @@ from pydantic import BaseModel
 from app.config import Settings, get_settings
 
 security = HTTPBearer(auto_error=False)
+logger = logging.getLogger(__name__)
 
 
 class AuthenticatedUser(BaseModel):
@@ -21,12 +23,17 @@ async def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     settings: Settings = Depends(get_settings),
 ) -> Optional[AuthenticatedUser]:
-    print("auth dep running", credentials)
-    require_oauth_flag = getattr(settings, "require_oauth", False)
-    if not require_oauth_flag:
+    # OAuth is mandatory for multi-user isolation. Fail loudly if settings are malformed.
+    if not hasattr(settings, "require_oauth"):
+        logger.error("Settings is missing require_oauth; check deployed config.py revision")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server auth configuration is incomplete (missing require_oauth)",
+        )
+    if not settings.require_oauth:
         return None
-    print(settings.oauth_client_id)
-    if not settings.oauth_client_id:
+    oauth_client_id = (settings.oauth_client_id or "").strip()
+    if not oauth_client_id:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="OAuth is required but no client ID is configured",
@@ -42,11 +49,11 @@ async def get_current_user(
         token_info = id_token.verify_oauth2_token(
             credentials.credentials,
             request,
-            audience=settings.oauth_client_id,
+            audience=oauth_client_id,
         )
     except ValueError as exc:
+        logger.warning("ID token verification failed: %s", exc)
         raise HTTPException(
-            logger.warning("ID Token Verification failed: %s", exc),
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired OAuth token",
             headers={"WWW-Authenticate": "Bearer"},

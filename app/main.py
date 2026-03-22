@@ -223,13 +223,20 @@ def update_receipt(receipt_id: str, payload: ReceiptUpdate) -> ReceiptRecord:
 @app.post("/categories", response_model=CategoryRecord)
 def create_category(payload: CategoryCreate):
     data = payload.dict(exclude_none=True)
-    category_id = category_service.create_category(data)
-    return CategoryRecord(id=category_id, **data)
+    try:
+        category_id = category_service.create_category(data)
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+    category_doc = category_service.get_category(category_id)
+    return CategoryRecord(**category_doc)
 
 
 @app.get("/categories", response_model=List[CategoryRecord])
 def list_categories():
-    docs = category_service.list_categories()
+    try:
+        docs = category_service.list_categories()
+    except google_exceptions.GoogleAPICallError as err:
+        raise HTTPException(status_code=500, detail=f"Failed to load categories: {err}")
     return [CategoryRecord(**doc) for doc in docs]
 
 
@@ -238,6 +245,8 @@ def update_category(category_id: str, payload: CategoryCreate):
     data = payload.dict(exclude_none=True)
     try:
         category_service.update_category(category_id, data)
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err))
     except KeyError as err:
         raise HTTPException(status_code=404, detail=str(err))
 

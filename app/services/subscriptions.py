@@ -328,16 +328,52 @@ class SubscriptionService:
         return data
 
     def _get_plan(self, plan_id: str) -> Dict[str, Any]:
+        plan = self._find_plan_by_document_id(plan_id)
+        if plan:
+            return plan
+        plan = self._find_plan_by_plan_id_field(plan_id)
+        if plan:
+            return plan
+        plan = self._find_plan_by_name(plan_id)
+        if plan:
+            return plan
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Subscription plan {plan_id} is not defined",
+        )
+
+    def _find_plan_by_document_id(self, plan_id: str) -> Optional[Dict[str, Any]]:
         doc_ref = self._plans.document(plan_id)
         snapshot = doc_ref.get()
         if not snapshot.exists:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Subscription plan {plan_id} is not defined",
-            )
+            return None
         data = snapshot.to_dict() or {}
         data["plan_id"] = plan_id
         return data
+
+    def _find_plan_by_plan_id_field(self, plan_id: str) -> Optional[Dict[str, Any]]:
+        query = self._plans.where("plan_id", "==", plan_id).limit(1)
+        snapshot = next(query.stream(), None)
+        if not snapshot or not snapshot.exists:
+            return None
+        data = snapshot.to_dict() or {}
+        data["plan_id"] = snapshot.id
+        return data
+
+    def _find_plan_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+        normalized = str(name).strip().lower()
+        if not normalized:
+            return None
+        query = self._plans.stream()
+        for snapshot in query:
+            if not snapshot.exists:
+                continue
+            data = snapshot.to_dict() or {}
+            plan_name = str(data.get("name", "")).strip().lower()
+            if plan_name == normalized:
+                data["plan_id"] = snapshot.id
+                return data
+        return None
 
     def user_plan_summary(self, owner_email: str) -> Dict[str, Any]:
         snapshot = self._users.document(owner_email).get()
@@ -346,7 +382,7 @@ class SubscriptionService:
         try:
             plan = self._get_plan(plan_id)
         except HTTPException:
-            plan = self._get_plan(DEFAULT_PLAN_ID)
+            plan = self._default_plan_stub(plan_id)
 
         plan_interval = user_doc.get("plan_interval") or self._plan_interval(plan)
         plan_price_cents = self._coerce_int(user_doc.get("plan_price_cents"))
@@ -370,6 +406,16 @@ class SubscriptionService:
             "plan_updated_at": updated_at,
             "last_transaction_id": user_doc.get("last_transaction_id"),
             "customer_code": user_doc.get("helcim_customer_code"),
+        }
+
+    @staticmethod
+    def _default_plan_stub(plan_id: str) -> Dict[str, Any]:
+        name = plan_id.capitalize()
+        return {
+            "plan_id": plan_id,
+            "name": name,
+            "description": "",
+            "features": [],
         }
 
     @staticmethod

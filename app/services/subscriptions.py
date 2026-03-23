@@ -31,7 +31,7 @@ class SubscriptionService:
 
     def ensure_within_limit(self, owner_email: str, receipt_client: Any) -> None:
         now = datetime.utcnow()
-        user_doc = self._get_or_create_user(owner_email, now)
+        user_doc_ref, user_doc = self._get_or_create_user(owner_email, now)
         plan = self._get_plan(user_doc.get("plan_id", "free"))
         limit = self._plan_limit(plan)
         if limit is None:
@@ -52,7 +52,7 @@ class SubscriptionService:
             end = user_doc.get("current_period_end")
             if start is None or end is None or now >= end:
                 start, end = _period_bounds(now)
-                self._users.document(owner_email).update(
+                user_doc_ref.update(
                     {
                         "current_period_start": start,
                         "current_period_end": end,
@@ -97,7 +97,15 @@ class SubscriptionService:
             "plan_updated_at": now,
             "last_payment_id": self._extract_last_payment_id(payload.get("payments") or []),
         }
-        self._users.document(owner_email).set(update_data, merge=True)
+        user_doc_ref = self._get_or_create_user_ref(owner_email)
+        user_doc_ref.set(update_data, merge=True)
+        logger.info(
+            "apply_subscription_payload owner=%s doc_id=%s stored_plan_id=%s payment_plan_id=%s",
+            owner_email,
+            user_doc_ref.id,
+            plan["plan_id"],
+            payload.get("paymentPlanId"),
+        )
         return plan["plan_id"]
 
     def find_plan_by_payment_plan_id(self, payment_plan_id: Optional[Any]) -> Optional[Dict[str, Any]]:
@@ -112,7 +120,9 @@ class SubscriptionService:
         normalized = str(customer_code).strip()
         if not normalized:
             return None
-        query = self._users.where("helcim_customer_code", "==", normalized).limit(1)
+        query = self._users.where(
+            field_path="helcim_customer_code", op_string="==", value=normalized
+        ).limit(1)
         snapshot = next(query.stream(), None)
         if not snapshot or not snapshot.exists:
             return None
@@ -126,13 +136,20 @@ class SubscriptionService:
         normalized = customer_code.strip()
         if not normalized:
             raise HTTPException(status_code=400, detail="customerCode is required")
-        self._users.document(owner_email).set(
+        user_doc_ref = self._get_or_create_user_ref(owner_email)
+        user_doc_ref.set(
             {
                 OWNER_FIELD: owner_email,
                 "helcim_customer_code": normalized,
                 "customer_code_updated_at": datetime.utcnow(),
             },
             merge=True,
+        )
+        logger.info(
+            "set_owner_customer_code owner=%s doc_id=%s customer_code=%s",
+            owner_email,
+            user_doc_ref.id,
+            normalized,
         )
 
     def activate_plan_from_transaction(
@@ -160,7 +177,15 @@ class SubscriptionService:
         }
         if transaction_id is not None:
             update_data["last_transaction_id"] = transaction_id
-        self._users.document(owner_email).set(update_data, merge=True)
+        user_doc_ref = self._get_or_create_user_ref(owner_email)
+        user_doc_ref.set(update_data, merge=True)
+        logger.info(
+            "activate_plan_from_transaction owner=%s doc_id=%s stored_plan_id=%s transaction_id=%s",
+            owner_email,
+            user_doc_ref.id,
+            plan["plan_id"],
+            transaction_id,
+        )
         return {"owner_email": owner_email, "plan_id": plan["plan_id"]}
 
     def resolve_plan_for_approved_transaction(
@@ -246,7 +271,9 @@ class SubscriptionService:
             return None
 
     def _find_plan_by_payment_plan_id(self, payment_plan_id: int) -> Optional[Dict[str, Any]]:
-        query = self._plans.where("payment_plan_id", "==", payment_plan_id).limit(1)
+        query = self._plans.where(
+            field_path="payment_plan_id", op_string="==", value=payment_plan_id
+        ).limit(1)
         snapshot = next(query.stream(), None)
         if snapshot and snapshot.exists:
             data = snapshot.to_dict() or {}
@@ -313,11 +340,10 @@ class SubscriptionService:
                 return plan
         return None
 
-    def _get_or_create_user(self, owner_email: str, now: datetime) -> Dict[str, Any]:
-        doc_ref = self._users.document(owner_email)
-        snapshot = doc_ref.get()
-        if snapshot.exists:
-            return snapshot.to_dict() or {}
+    def _get_or_create_user(self, owner_email: str, now: datetime):
+        user_doc_ref, user_doc = self._find_or_choose_user_doc(owner_email)
+        if user_doc_ref is not None:
+            return user_doc_ref, user_doc or {}
         start, end = _period_bounds(now)
         data: Dict[str, Any] = {
             OWNER_FIELD: owner_email,
@@ -327,23 +353,106 @@ class SubscriptionService:
             "current_period_end": end,
             "plan_updated_at": now,
         }
+        doc_ref = self._users.document()
         doc_ref.set(data)
-        return data
+        logger.warning(
+            "created_default_user_doc owner=%s doc_id=%s stored_plan_id=%s",
+            owner_email,
+            doc_ref.id,
+            data["plan_id"],
+        )
+        return doc_ref, data
+
+    def _get_or_create_user_ref(self, owner_email: str):
+        user_doc_ref, _ = self._find_or_choose_user_doc(owner_email)
+        if user_doc_ref is not None:
+            return user_doc_ref
+        doc_ref = self._users.document()
+        doc_ref.set({OWNER_FIELD: owner_email}, merge=True)
+        logger.warning("created_empty_user_ref owner=%s doc_id=%s", owner_email, doc_ref.id)
+        return doc_ref
+
+    def _find_or_choose_user_doc(self, owner_email: str):
+        query = self._users.where(
+            field_path=OWNER_FIELD, op_string="==", value=owner_email
+        )
+        snapshots = [snapshot for snapshot in query.stream() if snapshot.exists]
+        if not snapshots:
+            logger.warning("No user docs matched owner=%s", owner_email)
+            return None, None
+
+        if len(snapshots) == 1:
+            snapshot = snapshots[0]
+            data = snapshot.to_dict() or {}
+            logger.info(
+                "Resolved user doc owner=%s doc_id=%s stored_plan_id=%s source=single_match",
+                owner_email,
+                snapshot.id,
+                data.get("plan_id"),
+            )
+            return snapshot.reference, data
+
+        scored = []
+        for snapshot in snapshots:
+            data = snapshot.to_dict() or {}
+            scored.append((self._score_user_doc(data), snapshot, data))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        _, chosen_snapshot, chosen_data = scored[0]
+        logger.warning(
+            "Multiple user docs matched owner=%s chosen_doc_id=%s chosen_plan_id=%s candidates=%s",
+            owner_email,
+            chosen_snapshot.id,
+            chosen_data.get("plan_id"),
+            [
+                {
+                    "doc_id": snapshot.id,
+                    "plan_id": data.get("plan_id"),
+                    "plan_updated_at": str(data.get("plan_updated_at")),
+                    "customer_code": data.get("helcim_customer_code"),
+                }
+                for _, snapshot, data in scored
+            ],
+        )
+        return chosen_snapshot.reference, chosen_data
+
+    def _score_user_doc(self, data: Dict[str, Any]):
+        raw_plan_id = str(data.get("plan_id") or "").strip().lower()
+        non_free = 0 if raw_plan_id in ("", "free") else 1
+        has_customer_code = 1 if data.get("helcim_customer_code") else 0
+        has_period_end = 1 if data.get("current_period_end") else 0
+        updated_at = data.get("plan_updated_at")
+        updated_score = updated_at.timestamp() if isinstance(updated_at, datetime) else 0.0
+        return (non_free, has_customer_code, has_period_end, updated_score)
 
     def _get_plan(self, plan_id: str) -> Dict[str, Any]:
-        logger.debug("Resolving plan for plan_id=%s", plan_id)
+        logger.info("Resolving plan for requested_plan_id=%s", plan_id)
         plan = self._find_plan_by_name(plan_id)
         if plan:
-            logger.debug("Found plan by name=%s -> doc %s", plan_id, plan.get("plan_id"))
+            logger.info(
+                "Plan resolved by name requested_plan_id=%s matched_doc_id=%s matched_name=%s",
+                plan_id,
+                plan.get("plan_id"),
+                plan.get("name"),
+            )
             return plan
         plan = self._find_plan_by_document_id(plan_id)
         if plan:
-            logger.debug("Found plan by document ID=%s", plan_id)
+            logger.info(
+                "Plan resolved by document ID requested_plan_id=%s matched_doc_id=%s",
+                plan_id,
+                plan.get("plan_id"),
+            )
             return plan
         plan = self._find_plan_by_plan_id_field(plan_id)
         if plan:
-            logger.debug("Found plan by plan_id field=%s -> doc %s", plan_id, plan.get("plan_id"))
+            logger.info(
+                "Plan resolved by plan_id field requested_plan_id=%s matched_doc_id=%s",
+                plan_id,
+                plan.get("plan_id"),
+            )
             return plan
+        logger.error("Plan resolution failed requested_plan_id=%s", plan_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Subscription plan {plan_id} is not defined",
@@ -383,8 +492,8 @@ class SubscriptionService:
         return None
 
     def user_plan_summary(self, owner_email: str) -> Dict[str, Any]:
-        snapshot = self._users.document(owner_email).get()
-        user_doc = snapshot.to_dict() if snapshot.exists else {}
+        user_doc_ref, user_doc = self._find_or_choose_user_doc(owner_email)
+        user_doc = user_doc or {}
         plan_id = str(user_doc.get("plan_id", "free") or "free")
         try:
             plan = self._get_plan(plan_id)
@@ -414,7 +523,14 @@ class SubscriptionService:
             "last_transaction_id": user_doc.get("last_transaction_id"),
             "customer_code": user_doc.get("helcim_customer_code"),
         }
-        logger.info("user_plan_summary owner=%s plan_id=%s source_plan_doc=%s", owner_email, plan_id, plan.get("plan_id"))
+        logger.warning(
+            "user_plan_summary owner=%s user_doc_id=%s stored_plan_id=%s resolved_plan_doc=%s resolved_plan_name=%s",
+            owner_email,
+            getattr(user_doc_ref, "id", None),
+            plan_id,
+            plan.get("plan_id"),
+            plan.get("name"),
+        )
         return result
 
     @staticmethod

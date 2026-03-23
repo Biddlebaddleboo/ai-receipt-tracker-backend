@@ -643,6 +643,12 @@ def helcim_approval_landing(
         )
 
 
+@app.get("/users/me/plan")
+def read_user_plan(current_user: Optional[AuthenticatedUser] = Depends(get_current_user)):
+    owner_email = _require_owner_email(current_user)
+    return subscription_service.user_plan_summary(owner_email)
+
+
 @app.get("/billing/helcim/payment-plans")
 def helcim_list_payment_plans(
     request: Request,

@@ -136,6 +136,7 @@ The backend now includes authenticated proxy routes for Helcim recurring APIs so
 - `POST /billing/helcim/subscriptions/{subscription_id}/sync` -> fetch a Helcim subscription and apply it to `users/{owner_email}` using existing `paymentPlanId` mapping logic.
 - `POST /billing/helcim/customer-code` -> save the authenticated user's Helcim `customerCode` for callback mapping.
 - `POST /billing/helcim/approval` -> approval callback endpoint for hosted payment pages (accepts JSON or form-encoded callback payloads). It validates approval and fetches transaction details by `transactionId`, but does not activate plans.
+ - `GET /users/me/plan` -> returns the owner’s active plan metadata (plan_id, name, features, interval, limits, price, last transaction, customerCode); the frontend can call this to show “You are on Pro” without direct Firestore access.
 
 Helcim auth is handled server-side with the `api-token` request header. Frontend calls your backend with `Authorization: Bearer <google_id_token>`, and your backend calls Helcim. The approval callback endpoint is unauthenticated by OAuth because it is called by Helcim; protect it with `HELCIM_APPROVAL_SECRET` and include `?secret=<value>` in your hosted payment callback URL.
 If your provider only lets you configure one callback URL (used for both server callback and browser redirect), you can still use `/billing/helcim/approval`; set `HELCIM_APPROVAL_REDIRECT_URL` so browser GET requests are redirected to your frontend success page after processing.

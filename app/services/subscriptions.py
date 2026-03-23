@@ -339,6 +339,39 @@ class SubscriptionService:
         data["plan_id"] = plan_id
         return data
 
+    def user_plan_summary(self, owner_email: str) -> Dict[str, Any]:
+        snapshot = self._users.document(owner_email).get()
+        user_doc = snapshot.to_dict() if snapshot.exists else {}
+        plan_id = str(user_doc.get("plan_id", "free") or "free")
+        try:
+            plan = self._get_plan(plan_id)
+        except HTTPException:
+            plan = self._get_plan(DEFAULT_PLAN_ID)
+
+        plan_interval = user_doc.get("plan_interval") or self._plan_interval(plan)
+        plan_price_cents = self._coerce_int(user_doc.get("plan_price_cents"))
+        if plan_price_cents is None:
+            plan_price_cents = self._coerce_int(plan.get("price_cents"))
+
+        updated_at = user_doc.get("plan_updated_at")
+        if isinstance(updated_at, datetime):
+            updated_at = updated_at.isoformat()
+
+        return {
+            "owner_email": owner_email,
+            "plan_id": plan["plan_id"],
+            "plan_name": plan.get("name"),
+            "description": plan.get("description"),
+            "subscription_status": user_doc.get("subscription_status", "active"),
+            "plan_interval": plan_interval,
+            "monthly_limit": self._plan_limit(plan),
+            "plan_price_cents": plan_price_cents,
+            "features": self.plan_features(plan),
+            "plan_updated_at": updated_at,
+            "last_transaction_id": user_doc.get("last_transaction_id"),
+            "customer_code": user_doc.get("helcim_customer_code"),
+        }
+
     @staticmethod
     def _plan_interval(plan: Dict[str, Any]) -> str:
         raw = str(plan.get("interval", "month")).strip().lower()

@@ -328,13 +328,13 @@ class SubscriptionService:
         return data
 
     def _get_plan(self, plan_id: str) -> Dict[str, Any]:
+        plan = self._find_plan_by_name(plan_id)
+        if plan:
+            return plan
         plan = self._find_plan_by_document_id(plan_id)
         if plan:
             return plan
         plan = self._find_plan_by_plan_id_field(plan_id)
-        if plan:
-            return plan
-        plan = self._find_plan_by_name(plan_id)
         if plan:
             return plan
         raise HTTPException(

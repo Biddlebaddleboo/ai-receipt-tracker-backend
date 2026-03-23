@@ -297,6 +297,7 @@ helcim_client = HelcimRecurringClient(
     settings.helcim_api_token,
     settings.helcim_api_base_url,
     settings.helcim_timeout_seconds,
+    settings.helcim_user_agent,
 )
 
 

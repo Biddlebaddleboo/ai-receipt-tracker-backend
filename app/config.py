@@ -55,6 +55,7 @@ class Settings(BaseModel):
     helcim_api_token: Optional[str] = None
     helcim_api_base_url: str = "https://api.helcim.com/v2"
     helcim_timeout_seconds: int = 20
+    helcim_user_agent: str = "ai-receipt-tracker-backend/1.0"
     helcim_approval_secret: Optional[str] = None
     helcim_approval_redirect_url: Optional[str] = None
     @field_validator("allowed_origins", mode="before")
@@ -94,6 +95,7 @@ def get_settings() -> Settings:
         helcim_api_token=os.getenv("HELCIM_API_TOKEN"),
         helcim_api_base_url=os.getenv("HELCIM_API_BASE_URL", "https://api.helcim.com/v2"),
         helcim_timeout_seconds=int(os.getenv("HELCIM_TIMEOUT_SECONDS", "20")),
+        helcim_user_agent=os.getenv("HELCIM_USER_AGENT", "ai-receipt-tracker-backend/1.0"),
         helcim_approval_secret=os.getenv("HELCIM_APPROVAL_SECRET"),
         helcim_approval_redirect_url=os.getenv("HELCIM_APPROVAL_REDIRECT_URL"),
     )

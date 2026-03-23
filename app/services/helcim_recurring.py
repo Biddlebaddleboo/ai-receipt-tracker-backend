@@ -10,10 +10,17 @@ from fastapi import HTTPException, status
 
 
 class HelcimRecurringClient:
-    def __init__(self, api_token: Optional[str], base_url: str, timeout_seconds: int = 20):
+    def __init__(
+        self,
+        api_token: Optional[str],
+        base_url: str,
+        timeout_seconds: int = 20,
+        user_agent: str = "ai-receipt-tracker-backend/1.0",
+    ):
         self._api_token = (api_token or "").strip()
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
+        self._user_agent = (user_agent or "").strip() or "ai-receipt-tracker-backend/1.0"
 
     def list_payment_plans(self, query: Dict[str, Any]) -> Any:
         return self._request("GET", "payment-plans", query=query)
@@ -69,6 +76,7 @@ class HelcimRecurringClient:
         headers = {
             "Accept": "application/json",
             "api-token": self._api_token,
+            "User-Agent": self._user_agent,
         }
         data: Optional[bytes] = None
         if payload is not None:

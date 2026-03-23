@@ -39,6 +39,7 @@ This backend exposes a FastAPI app that ingests receipt images, stores them in a
     - `HELCIM_API_TOKEN`: Helcim private API token used for server-to-server recurring API calls.
     - `HELCIM_API_BASE_URL`: Helcim API base URL (default `https://api.helcim.com/v2`).
     - `HELCIM_TIMEOUT_SECONDS`: timeout for outgoing Helcim API requests (default `20`).
+    - `HELCIM_USER_AGENT`: user-agent for outbound Helcim calls (default `ai-receipt-tracker-backend/1.0`).
     - `HELCIM_APPROVAL_SECRET`: optional shared secret for Helcim Approval Send POST callbacks (`/billing/helcim/approval`).
     - `HELCIM_APPROVAL_REDIRECT_URL`: optional frontend URL to redirect browser landings after hosted payment callbacks (for providers that reuse one callback URL).
 

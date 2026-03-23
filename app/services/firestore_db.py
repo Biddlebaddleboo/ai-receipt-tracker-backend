@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from google.cloud import firestore
@@ -87,3 +88,16 @@ class FirestoreClient:
 
         next_cursor = docs[-1]["id"] if docs else None
         return docs, next_cursor
+
+    def count_receipts_by_owner(
+        self,
+        owner_email: str,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+    ) -> int:
+        query = self._collection.where(OWNER_FIELD, "==", owner_email)
+        if start is not None:
+            query = query.where("created_at", ">=", start)
+        if end is not None:
+            query = query.where("created_at", "<", end)
+        return sum(1 for _ in query.stream())

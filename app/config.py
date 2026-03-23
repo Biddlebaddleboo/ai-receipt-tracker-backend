@@ -50,7 +50,13 @@ class Settings(BaseModel):
     require_oauth: bool = False
     oauth_client_id: Optional[str] = None
     oauth_allowed_domains: List[str] = Field(default_factory=list)
-
+    plans_collection: str = "plans"
+    users_collection: str = "users"
+    helcim_api_token: Optional[str] = None
+    helcim_api_base_url: str = "https://api.helcim.com/v2"
+    helcim_timeout_seconds: int = 20
+    helcim_approval_secret: Optional[str] = None
+    helcim_approval_redirect_url: Optional[str] = None
     @field_validator("allowed_origins", mode="before")
     def _parse_allowed_origins(cls, value: Any) -> List[str]:
         parsed = _normalize_list_field(value)
@@ -83,5 +89,12 @@ def get_settings() -> Settings:
         require_oauth=require_oauth_value,
         oauth_client_id=os.getenv("OAUTH_CLIENT_ID"),
         oauth_allowed_domains=os.getenv("OAUTH_ALLOWED_DOMAINS", ""),
+        plans_collection=os.getenv("PLANS_COLLECTION_NAME", "plans"),
+        users_collection=os.getenv("USERS_COLLECTION_NAME", "users"),
+        helcim_api_token=os.getenv("HELCIM_API_TOKEN"),
+        helcim_api_base_url=os.getenv("HELCIM_API_BASE_URL", "https://api.helcim.com/v2"),
+        helcim_timeout_seconds=int(os.getenv("HELCIM_TIMEOUT_SECONDS", "20")),
+        helcim_approval_secret=os.getenv("HELCIM_APPROVAL_SECRET"),
+        helcim_approval_redirect_url=os.getenv("HELCIM_APPROVAL_REDIRECT_URL"),
     )
 

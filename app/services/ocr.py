@@ -107,19 +107,16 @@ class OpenAITextExtractor:
             return ""
         fragments: List[str] = []
         for item in resp_output:
-            for entry in item.content:
-                entry_type = (
-                    entry.get("type")
-                    if isinstance(entry, dict)
-                    else getattr(entry, "type", None)
-                )
-                entry_text = (
-                    entry.get("text")
-                    if isinstance(entry, dict)
-                    else getattr(entry, "text", None)
-                )
+            content_items = getattr(item, "content", []) or []
+            for entry in content_items:
+                if isinstance(entry, dict):
+                    entry_type = entry.get("type")
+                    entry_text = entry.get("text")
+                else:
+                    entry_type = getattr(entry, "type", None)
+                    entry_text = getattr(entry, "text", None)
                 if entry_type == "output_text" and entry_text:
-                    fragments.append(entry_text.strip())
+                    fragments.append(str(entry_text).strip())
         return "\n".join(fragments).strip()
 
     def _extract_json(self, text: str) -> Dict[str, Any]:

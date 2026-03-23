@@ -8,4 +8,5 @@ python-dotenv>=1.0.0
 pydantic>=2.6.0
 pillow>=10.0.0
 pillow-avif-plugin>=1.0.0
+google-auth>=2.24.0
 

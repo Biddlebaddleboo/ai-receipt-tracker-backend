@@ -4,11 +4,14 @@ from datetime import datetime, timedelta
 import re
 from typing import Any, Dict, Optional
 
+import logging
+
 from fastapi import HTTPException, status
 from google.cloud import firestore
 
 OWNER_FIELD = "owner_email"
 DEFAULT_PLAN_ID = "free"
+logger = logging.getLogger(__name__)
 
 
 def _period_bounds(now: datetime) -> tuple[datetime, datetime]:
@@ -328,14 +331,18 @@ class SubscriptionService:
         return data
 
     def _get_plan(self, plan_id: str) -> Dict[str, Any]:
+        logger.debug("Resolving plan for plan_id=%s", plan_id)
         plan = self._find_plan_by_name(plan_id)
         if plan:
+            logger.debug("Found plan by name=%s -> doc %s", plan_id, plan.get("plan_id"))
             return plan
         plan = self._find_plan_by_document_id(plan_id)
         if plan:
+            logger.debug("Found plan by document ID=%s", plan_id)
             return plan
         plan = self._find_plan_by_plan_id_field(plan_id)
         if plan:
+            logger.debug("Found plan by plan_id field=%s -> doc %s", plan_id, plan.get("plan_id"))
             return plan
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -352,7 +359,7 @@ class SubscriptionService:
         return data
 
     def _find_plan_by_plan_id_field(self, plan_id: str) -> Optional[Dict[str, Any]]:
-        query = self._plans.where("plan_id", "==", plan_id).limit(1)
+        query = self._plans.where(field_path="plan_id", op_string="==", value=plan_id).limit(1)
         snapshot = next(query.stream(), None)
         if not snapshot or not snapshot.exists:
             return None
@@ -393,7 +400,7 @@ class SubscriptionService:
         if isinstance(updated_at, datetime):
             updated_at = updated_at.isoformat()
 
-        return {
+        result = {
             "owner_email": owner_email,
             "plan_id": plan["plan_id"],
             "plan_name": plan.get("name"),
@@ -407,10 +414,13 @@ class SubscriptionService:
             "last_transaction_id": user_doc.get("last_transaction_id"),
             "customer_code": user_doc.get("helcim_customer_code"),
         }
+        logger.info("user_plan_summary owner=%s plan_id=%s source_plan_doc=%s", owner_email, plan_id, plan.get("plan_id"))
+        return result
 
     @staticmethod
     def _default_plan_stub(plan_id: str) -> Dict[str, Any]:
         name = plan_id.capitalize()
+        logger.warning("Falling back to stub plan for plan_id=%s", plan_id)
         return {
             "plan_id": plan_id,
             "name": name,

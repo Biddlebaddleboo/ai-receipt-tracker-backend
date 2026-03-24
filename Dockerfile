@@ -18,6 +18,7 @@ FROM golang:1.22-bookworm AS go-firestore-build
 WORKDIR /src/native/firestorebridge
 
 COPY native/firestorebridge/go.mod ./
+COPY native/firestorebridge/go.sum ./
 COPY native/firestorebridge/firestorebridge.go ./
 
 RUN apt-get update && \
@@ -27,13 +28,29 @@ RUN apt-get update && \
     go mod download && \
     go build -buildmode=c-shared -o /out/libfirestorebridge.so
 
+FROM golang:1.22-bookworm AS go-categories-build
+
+WORKDIR /src/native/categoriesbridge
+
+COPY native/categoriesbridge/go.mod ./
+COPY native/categoriesbridge/go.sum ./
+COPY native/categoriesbridge/categoriesbridge.go ./
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    go mod download && \
+    go build -buildmode=c-shared -o /out/libcategoriesbridge.so
+
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/root/.local/bin:$PATH" \
     GO_STORAGE_LIBRARY_PATH=/app/native/libstoragebridge.so \
-    GO_FIRESTORE_LIBRARY_PATH=/app/native/libfirestorebridge.so
+    GO_FIRESTORE_LIBRARY_PATH=/app/native/libfirestorebridge.so \
+    GO_CATEGORIES_LIBRARY_PATH=/app/native/libcategoriesbridge.so
 
 WORKDIR /app
 
@@ -49,6 +66,7 @@ RUN pip install --upgrade pip setuptools wheel && \
 COPY . .
 COPY --from=go-storage-build /out/libstoragebridge.so /app/native/libstoragebridge.so
 COPY --from=go-firestore-build /out/libfirestorebridge.so /app/native/libfirestorebridge.so
+COPY --from=go-categories-build /out/libcategoriesbridge.so /app/native/libcategoriesbridge.so
 
 EXPOSE 8080
 

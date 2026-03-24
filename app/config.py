@@ -30,6 +30,17 @@ def _normalize_list_field(value: Any) -> List[str]:
     return [part.strip() for part in text.split(",") if part.strip()]
 
 
+def _dedupe_preserve_order(values: List[str]) -> List[str]:
+    seen = set()
+    result: List[str] = []
+    for entry in values:
+        if entry in seen:
+            continue
+        seen.add(entry)
+        result.append(entry)
+    return result
+
+
 def _parse_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -161,7 +172,7 @@ def get_settings() -> Settings:
         openai_model_name=os.getenv("OPENAI_MODEL_NAME", "gpt-4.1-mini"),
         openai_api_key=os.getenv("OPENAI_API_KEY"),
         categories_collection=os.getenv("CATEGORIES_COLLECTION_NAME", "categories"),
-        allowed_origins=normalized_origins,
+        allowed_origins=_dedupe_preserve_order(normalized_origins),
         require_oauth=require_oauth_value,
         oauth_client_id=os.getenv("OAUTH_CLIENT_ID"),
         oauth_client_ids=os.getenv("OAUTH_CLIENT_ID", ""),

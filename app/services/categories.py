@@ -112,6 +112,20 @@ class CategoryService:
         )
         return payload or []
 
+    def category_names(self, owner_email: str) -> List[str]:
+        names: List[str] = []
+        seen = set()
+        for category in self.list_categories(owner_email):
+            name = category.get("name")
+            if not isinstance(name, str):
+                continue
+            normalized = name.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            names.append(normalized)
+        return names
+
     def get_category(self, category_id: str, owner_email: str) -> Dict[str, Any]:
         payload = self._call_json(
             self._bridge._library.CategoriesGet,

@@ -5,8 +5,10 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routers import billing, system, users
 from app.config import get_settings
+from app.router_billing import router as billing_router
+from app.router_system import router as system_router
+from app.router_users import router as users_router
 
 
 def create_app() -> FastAPI:
@@ -29,7 +31,7 @@ def create_app() -> FastAPI:
         settings.allowed_origin_regex,
     )
 
-    app.include_router(system.router)
-    app.include_router(users.router)
-    app.include_router(billing.router)
+    app.include_router(system_router)
+    app.include_router(users_router)
+    app.include_router(billing_router)
     return app

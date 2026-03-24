@@ -1,13 +1,9 @@
 from __future__ import annotations
 
-from typing import Optional
-
-from fastapi import HTTPException
-
-from app.auth import AuthenticatedUser
+from fastapi import HTTPException, Request
 from app.config import Settings, get_settings
-from app.services.helcim_recurring import HelcimRecurringClient
-from app.services.subscriptions import SubscriptionService
+from app.helcim_recurring import HelcimRecurringClient
+from app.subscriptions import SubscriptionService
 
 settings = get_settings()
 
@@ -34,11 +30,12 @@ def get_helcim_client() -> HelcimRecurringClient:
     return helcim_client
 
 
-def require_owner_email(current_user: Optional[AuthenticatedUser]) -> str:
-    if current_user is None:
+def require_owner_email(request: Request) -> str:
+    email = request.headers.get("X-Go-Authenticated-Email", "").strip()
+    if not email:
         raise HTTPException(
             status_code=401,
             detail="OAuth bearer token required",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return current_user.email
+    return email

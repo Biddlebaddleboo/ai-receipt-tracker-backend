@@ -1,60 +1,204 @@
 from __future__ import annotations
 
-from datetime import datetime
+import ctypes
+import json
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from google.cloud import firestore
-from google.api_core import exceptions as google_exceptions
+from app.services._native_bridge import NativeLibraryBase
 
 OWNER_FIELD = "owner_email"
+_DATE_MARKER = "__firestorebridge_datetime__"
+
+
+def _normalize_datetime(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+    return value.isoformat().replace("+00:00", "Z")
+
+
+def _encode_bridge_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return {_DATE_MARKER: _normalize_datetime(value)}
+    if isinstance(value, dict):
+        return {str(key): _encode_bridge_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_encode_bridge_value(item) for item in value]
+    return value
+
+
+def _encode_bridge_json(payload: Dict[str, Any]) -> bytes:
+    return json.dumps(_encode_bridge_value(payload), separators=(",", ":")).encode("utf-8")
+
+
+class _GoFirestoreLibrary(NativeLibraryBase):
+    _instance: Optional["_GoFirestoreLibrary"] = None
+    env_var = "GO_FIRESTORE_LIBRARY_PATH"
+    library_stem = "libfirestorebridge"
+    missing_label = "Go Firestore library"
+    free_symbol = "FirestoreFree"
+
+    def _configure(self) -> None:
+        self._library.FirestoreNew.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        self._library.FirestoreNew.restype = ctypes.c_longlong
+        self._library.FirestoreClose.argtypes = [ctypes.c_longlong]
+        self._library.FirestoreClose.restype = None
+        self._library.FirestoreInsertReceipt.argtypes = [
+            ctypes.c_longlong,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        self._library.FirestoreInsertReceipt.restype = ctypes.c_void_p
+        self._library.FirestoreGetReceipt.argtypes = [
+            ctypes.c_longlong,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        self._library.FirestoreGetReceipt.restype = ctypes.c_void_p
+        self._library.FirestoreDeleteReceipt.argtypes = [
+            ctypes.c_longlong,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        self._library.FirestoreDeleteReceipt.restype = ctypes.c_void_p
+        self._library.FirestoreUpdateReceipt.argtypes = [
+            ctypes.c_longlong,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        self._library.FirestoreUpdateReceipt.restype = ctypes.c_void_p
+        self._library.FirestoreListReceipts.argtypes = [
+            ctypes.c_longlong,
+            ctypes.c_char_p,
+            ctypes.c_longlong,
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        self._library.FirestoreListReceipts.restype = ctypes.c_void_p
+        self._library.FirestoreCountReceiptsByOwner.argtypes = [
+            ctypes.c_longlong,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        self._library.FirestoreCountReceiptsByOwner.restype = ctypes.c_longlong
+        self._library.FirestoreFree.argtypes = [ctypes.c_void_p]
+        self._library.FirestoreFree.restype = None
+
+    @staticmethod
+    def _translate_error(message: str) -> Exception | None:
+        if message.startswith("Receipt ") and message.endswith(" not found"):
+            return KeyError(message)
+        return None
 
 
 class FirestoreClient:
     def __init__(self, collection_name: str, database_id: str = "(default)"):
-        self._client = firestore.Client(database=database_id)
-        self._collection = self._client.collection(collection_name)
+        self._bridge = _GoFirestoreLibrary.load()
+        err_ptr = ctypes.c_void_p()
+        self._handle = self._bridge._library.FirestoreNew(
+            collection_name.encode("utf-8"),
+            (database_id or "(default)").encode("utf-8"),
+            ctypes.byref(err_ptr),
+        )
+        self._bridge.raise_on_error(
+            err_ptr,
+            "native firestore bridge failed",
+            translate_error=self._bridge._translate_error,
+        )
+        if not self._handle:
+            raise RuntimeError("native firestore bridge returned an invalid handle")
+
+    def close(self) -> None:
+        if getattr(self, "_handle", 0):
+            self._bridge._library.FirestoreClose(self._handle)
+            self._handle = 0
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def insert_receipt(self, owner_email: str, payload: Dict[str, Any]) -> str:
-        payload_with_owner = {**payload, OWNER_FIELD: owner_email}
-        doc_ref = self._collection.document()
-        doc_ref.set(payload_with_owner)
-        return doc_ref.id
+        err_ptr = ctypes.c_void_p()
+        doc_id_ptr = self._bridge._library.FirestoreInsertReceipt(
+            self._handle,
+            owner_email.encode("utf-8"),
+            _encode_bridge_json(payload),
+            ctypes.byref(err_ptr),
+        )
+        self._bridge.raise_on_error(
+            err_ptr,
+            "native firestore bridge failed",
+            translate_error=self._bridge._translate_error,
+        )
+        return self._bridge.take_string(doc_id_ptr)
 
     def get_receipt(self, receipt_id: str, owner_email: str) -> Dict[str, Any]:
-        doc_ref = self._collection.document(receipt_id)
-        try:
-            snapshot = doc_ref.get()
-        except google_exceptions.NotFound as exc:
-            raise KeyError(f"Receipt {receipt_id} not found") from exc
-        if not snapshot.exists:
-            raise KeyError(f"Receipt {receipt_id} not found")
-        data = snapshot.to_dict() or {}
-        if data.get(OWNER_FIELD) != owner_email:
-            raise KeyError(f"Receipt {receipt_id} not found")
-        return data
+        err_ptr = ctypes.c_void_p()
+        payload_ptr = self._bridge._library.FirestoreGetReceipt(
+            self._handle,
+            receipt_id.encode("utf-8"),
+            owner_email.encode("utf-8"),
+            ctypes.byref(err_ptr),
+        )
+        self._bridge.raise_on_error(
+            err_ptr,
+            "native firestore bridge failed",
+            translate_error=self._bridge._translate_error,
+        )
+        payload = self._bridge.take_string(payload_ptr)
+        return json.loads(payload) if payload else {}
 
     def delete_receipt(self, receipt_id: str, owner_email: str) -> Dict[str, Any]:
-        doc_ref = self._collection.document(receipt_id)
-        data = self.get_receipt(receipt_id, owner_email)
-        doc_ref.delete()
-        return data
+        err_ptr = ctypes.c_void_p()
+        payload_ptr = self._bridge._library.FirestoreDeleteReceipt(
+            self._handle,
+            receipt_id.encode("utf-8"),
+            owner_email.encode("utf-8"),
+            ctypes.byref(err_ptr),
+        )
+        self._bridge.raise_on_error(
+            err_ptr,
+            "native firestore bridge failed",
+            translate_error=self._bridge._translate_error,
+        )
+        payload = self._bridge.take_string(payload_ptr)
+        return json.loads(payload) if payload else {}
 
     def update_receipt(
         self, receipt_id: str, payload: Dict[str, Any], owner_email: str
     ) -> Dict[str, Any]:
-        doc_ref = self._collection.document(receipt_id)
-        try:
-            snapshot = doc_ref.get()
-        except google_exceptions.NotFound as exc:
-            raise KeyError(f"Receipt {receipt_id} not found") from exc
-        if not snapshot.exists:
-            raise KeyError(f"Receipt {receipt_id} not found")
-        existing = snapshot.to_dict() or {}
-        if existing.get(OWNER_FIELD) != owner_email:
-            raise KeyError(f"Receipt {receipt_id} not found")
-        payload.pop(OWNER_FIELD, None)
-        doc_ref.update(payload)
-        return doc_ref.get().to_dict()
+        update_payload = dict(payload)
+        update_payload.pop(OWNER_FIELD, None)
+        err_ptr = ctypes.c_void_p()
+        payload_ptr = self._bridge._library.FirestoreUpdateReceipt(
+            self._handle,
+            receipt_id.encode("utf-8"),
+            owner_email.encode("utf-8"),
+            _encode_bridge_json(update_payload),
+            ctypes.byref(err_ptr),
+        )
+        self._bridge.raise_on_error(
+            err_ptr,
+            "native firestore bridge failed",
+            translate_error=self._bridge._translate_error,
+        )
+        raw = self._bridge.take_string(payload_ptr)
+        return json.loads(raw) if raw else {}
 
     def list_receipts(
         self,
@@ -62,32 +206,25 @@ class FirestoreClient:
         limit: int = 10,
         start_after_id: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-        query = (
-            self._collection.where(OWNER_FIELD, "==", owner_email)
-            .order_by("created_at", direction=firestore.Query.DESCENDING)
-            .limit(limit)
+        err_ptr = ctypes.c_void_p()
+        start_after_bytes = start_after_id.encode("utf-8") if start_after_id else None
+        payload_ptr = self._bridge._library.FirestoreListReceipts(
+            self._handle,
+            owner_email.encode("utf-8"),
+            limit,
+            start_after_bytes,
+            ctypes.byref(err_ptr),
         )
-        after_snapshot = None
-        if start_after_id:
-            after_doc = self._collection.document(start_after_id)
-            try:
-                after_snapshot = after_doc.get()
-            except google_exceptions.NotFound as exc:
-                raise KeyError(f"Receipt {start_after_id} not found") from exc
-            if not after_snapshot.exists:
-                raise KeyError(f"Receipt {start_after_id} not found")
-            after_data = after_snapshot.to_dict() or {}
-            if after_data.get(OWNER_FIELD) != owner_email:
-                raise KeyError(f"Receipt {start_after_id} not found")
-            query = query.start_after(after_snapshot)
-
-        docs: List[Dict[str, Any]] = []
-        for snapshot in query.stream():
-            data = snapshot.to_dict() or {}
-            docs.append({"id": snapshot.id, **data})
-
-        next_cursor = docs[-1]["id"] if docs else None
-        return docs, next_cursor
+        self._bridge.raise_on_error(
+            err_ptr,
+            "native firestore bridge failed",
+            translate_error=self._bridge._translate_error,
+        )
+        raw = self._bridge.take_string(payload_ptr)
+        if not raw:
+            return [], None
+        payload = json.loads(raw)
+        return payload.get("docs", []), payload.get("next_cursor")
 
     def count_receipts_by_owner(
         self,
@@ -95,9 +232,19 @@ class FirestoreClient:
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
     ) -> int:
-        query = self._collection.where(OWNER_FIELD, "==", owner_email)
-        if start is not None:
-            query = query.where("created_at", ">=", start)
-        if end is not None:
-            query = query.where("created_at", "<", end)
-        return sum(1 for _ in query.stream())
+        err_ptr = ctypes.c_void_p()
+        start_bytes = _normalize_datetime(start).encode("utf-8") if start else None
+        end_bytes = _normalize_datetime(end).encode("utf-8") if end else None
+        count = self._bridge._library.FirestoreCountReceiptsByOwner(
+            self._handle,
+            owner_email.encode("utf-8"),
+            start_bytes,
+            end_bytes,
+            ctypes.byref(err_ptr),
+        )
+        self._bridge.raise_on_error(
+            err_ptr,
+            "native firestore bridge failed",
+            translate_error=self._bridge._translate_error,
+        )
+        return int(count)

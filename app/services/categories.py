@@ -1,98 +1,139 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+import ctypes
+import json
+from typing import Any, Dict, List, Optional
 
-from google.cloud import firestore
-from google.api_core import exceptions as google_exceptions
+from app.services._native_bridge import NativeLibraryBase
 
-OWNER_FIELD = "owner_email"
+
+class _GoCategoriesLibrary(NativeLibraryBase):
+    _instance: Optional["_GoCategoriesLibrary"] = None
+    env_var = "GO_CATEGORIES_LIBRARY_PATH"
+    library_stem = "libcategoriesbridge"
+    missing_label = "Go categories library"
+    free_symbol = "CategoriesFree"
+
+    def _configure(self) -> None:
+        self._library.CategoriesNew.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        self._library.CategoriesNew.restype = ctypes.c_longlong
+        self._library.CategoriesClose.argtypes = [ctypes.c_longlong]
+        self._library.CategoriesClose.restype = None
+        self._library.CategoriesCreate.argtypes = [
+            ctypes.c_longlong,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        self._library.CategoriesCreate.restype = ctypes.c_void_p
+        self._library.CategoriesList.argtypes = [
+            ctypes.c_longlong,
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        self._library.CategoriesList.restype = ctypes.c_void_p
+        self._library.CategoriesGet.argtypes = [
+            ctypes.c_longlong,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        self._library.CategoriesGet.restype = ctypes.c_void_p
+        self._library.CategoriesUpdate.argtypes = [
+            ctypes.c_longlong,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        self._library.CategoriesUpdate.restype = ctypes.c_void_p
+        self._library.CategoriesDelete.argtypes = [
+            ctypes.c_longlong,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        self._library.CategoriesDelete.restype = ctypes.c_void_p
+        self._library.CategoriesFree.argtypes = [ctypes.c_void_p]
+        self._library.CategoriesFree.restype = None
 
 
 class CategoryService:
     def __init__(self, collection_name: str, database_id: str = "(default)"):
-        self._client = firestore.Client(database=database_id)
-        self._collection = self._client.collection(collection_name)
+        self._bridge = _GoCategoriesLibrary.load()
+        err_ptr = ctypes.c_void_p()
+        self._handle = self._bridge._library.CategoriesNew(
+            collection_name.encode("utf-8"),
+            database_id.encode("utf-8"),
+            ctypes.byref(err_ptr),
+        )
+        self._bridge.raise_on_error(err_ptr, "native categories bridge failed")
+        if not self._handle:
+            raise RuntimeError("native categories bridge returned invalid handle")
 
-    def list_categories(self, owner_email: str) -> List[Dict[str, Any]]:
-        query = self._collection.where(OWNER_FIELD, "==", owner_email)
-        categories: List[Dict[str, Any]] = []
-        for doc in query.stream():
-            data = doc.to_dict() or {}
-            normalized = self._normalize_category(doc.id, data)
-            if normalized is not None:
-                categories.append(normalized)
-        return sorted(categories, key=lambda category: category["name"].lower())
+    def close(self) -> None:
+        if getattr(self, "_handle", 0):
+            self._bridge._library.CategoriesClose(self._handle)
+            self._handle = 0
 
-    def category_names(self, owner_email: str) -> List[str]:
-        return [doc.get("name") for doc in self.list_categories(owner_email) if doc.get("name")]
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _call_json(self, func, *args) -> Any:
+        err_ptr = ctypes.c_void_p()
+        ptr = func(*args, ctypes.byref(err_ptr))
+        self._bridge.raise_on_error(err_ptr, "native categories bridge failed")
+        payload = self._bridge.take_string(ptr)
+        return json.loads(payload) if payload else None
 
     def create_category(self, payload: Dict[str, Any], owner_email: str) -> str:
-        doc_ref = self._collection.document()
-        payload_with_owner = {**self._sanitize_payload(payload), OWNER_FIELD: owner_email}
-        doc_ref.set(payload_with_owner)
-        return doc_ref.id
+        err_ptr = ctypes.c_void_p()
+        ptr = self._bridge._library.CategoriesCreate(
+            self._handle,
+            owner_email.encode("utf-8"),
+            json.dumps(payload).encode("utf-8"),
+            ctypes.byref(err_ptr),
+        )
+        self._bridge.raise_on_error(err_ptr, "native categories bridge failed")
+        return self._bridge.take_string(ptr)
+
+    def list_categories(self, owner_email: str) -> List[Dict[str, Any]]:
+        payload = self._call_json(
+            self._bridge._library.CategoriesList,
+            self._handle,
+            owner_email.encode("utf-8"),
+        )
+        return payload or []
 
     def get_category(self, category_id: str, owner_email: str) -> Dict[str, Any]:
-        doc_ref = self._collection.document(category_id)
-        try:
-            snapshot = doc_ref.get()
-        except google_exceptions.NotFound as exc:
-            raise KeyError(f"Category {category_id} not found") from exc
-        if not snapshot.exists:
-            raise KeyError(f"Category {category_id} not found")
-        data = snapshot.to_dict() or {}
-        if data.get(OWNER_FIELD) != owner_email:
-            raise KeyError(f"Category {category_id} not found")
-        normalized = self._normalize_category(snapshot.id, data)
-        if normalized is None:
-            raise KeyError(f"Category {category_id} not found")
-        return normalized
+        payload = self._call_json(
+            self._bridge._library.CategoriesGet,
+            self._handle,
+            owner_email.encode("utf-8"),
+            category_id.encode("utf-8"),
+        )
+        return payload or {}
 
     def update_category(self, category_id: str, payload: Dict[str, Any], owner_email: str) -> None:
-        doc_ref = self._collection.document(category_id)
-        try:
-            snapshot = doc_ref.get()
-        except google_exceptions.NotFound as exc:
-            raise KeyError(f"Category {category_id} not found") from exc
-        if not snapshot.exists:
-            raise KeyError(f"Category {category_id} not found")
-        data = snapshot.to_dict() or {}
-        if data.get(OWNER_FIELD) != owner_email:
-            raise KeyError(f"Category {category_id} not found")
-        sanitized = self._sanitize_payload(payload)
-        doc_ref.update(sanitized)
+        self._call_json(
+            self._bridge._library.CategoriesUpdate,
+            self._handle,
+            owner_email.encode("utf-8"),
+            category_id.encode("utf-8"),
+            json.dumps(payload).encode("utf-8"),
+        )
 
     def delete_category(self, category_id: str, owner_email: str) -> None:
-        doc_ref = self._collection.document(category_id)
-        try:
-            snapshot = doc_ref.get()
-        except google_exceptions.NotFound as exc:
-            raise KeyError(f"Category {category_id} not found") from exc
-        if not snapshot.exists:
-            raise KeyError(f"Category {category_id} not found")
-        data = snapshot.to_dict() or {}
-        if data.get(OWNER_FIELD) != owner_email:
-            raise KeyError(f"Category {category_id} not found")
-        doc_ref.delete()
-
-    @staticmethod
-    def _sanitize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-        name = str(payload.get("name", "")).strip()
-        if not name:
-            raise ValueError("Category name is required")
-        description = payload.get("description")
-        cleaned: Dict[str, Any] = {"name": name}
-        if description is not None:
-            cleaned["description"] = str(description).strip() or None
-        return cleaned
-
-    @staticmethod
-    def _normalize_category(category_id: str, data: Dict[str, Any]) -> Dict[str, Any] | None:
-        name = data.get("name")
-        if not isinstance(name, str) or not name.strip():
-            return None
-        description = data.get("description")
-        normalized: Dict[str, Any] = {"id": category_id, "name": name.strip()}
-        if description is not None:
-            normalized["description"] = str(description).strip() or None
-        return normalized
+        self._call_json(
+            self._bridge._library.CategoriesDelete,
+            self._handle,
+            owner_email.encode("utf-8"),
+            category_id.encode("utf-8"),
+        )

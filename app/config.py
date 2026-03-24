@@ -113,6 +113,7 @@ class Settings(BaseModel):
     allowed_origins: List[str] = Field(default_factory=lambda: _DEFAULT_ALLOWED_ORIGINS.copy())
     require_oauth: bool = False
     oauth_client_id: Optional[str] = None
+    oauth_client_ids: List[str] = Field(default_factory=list)
     oauth_allowed_domains: List[str] = Field(default_factory=list)
     plans_collection: str = "plans"
     users_collection: str = "users"
@@ -139,6 +140,10 @@ class Settings(BaseModel):
         text = str(value).strip()
         return text or None
 
+    @field_validator("oauth_client_ids", mode="before")
+    def _parse_oauth_client_ids(cls, value: Any) -> List[str]:
+        return _normalize_list_field(value)
+
 
 @lru_cache
 
@@ -159,6 +164,7 @@ def get_settings() -> Settings:
         allowed_origins=normalized_origins,
         require_oauth=require_oauth_value,
         oauth_client_id=os.getenv("OAUTH_CLIENT_ID"),
+        oauth_client_ids=os.getenv("OAUTH_CLIENT_ID", ""),
         oauth_allowed_domains=os.getenv("OAUTH_ALLOWED_DOMAINS", ""),
         plans_collection=os.getenv("PLANS_COLLECTION_NAME", "plans"),
         users_collection=os.getenv("USERS_COLLECTION_NAME", "users"),

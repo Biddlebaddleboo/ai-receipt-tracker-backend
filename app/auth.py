@@ -39,8 +39,9 @@ def _decode_unverified_jwt_claims(token: str) -> Optional[dict]:
 
 
 def _allowed_oauth_audiences(settings: Settings) -> list[str]:
-    audiences = [entry.strip() for entry in settings.oauth_client_ids if entry.strip()]
-    legacy_client_id = (settings.oauth_client_id or "").strip()
+    configured_client_ids = getattr(settings, "oauth_client_ids", None) or []
+    audiences = [entry.strip() for entry in configured_client_ids if str(entry).strip()]
+    legacy_client_id = (getattr(settings, "oauth_client_id", None) or "").strip()
     if legacy_client_id and legacy_client_id not in audiences:
         audiences.append(legacy_client_id)
     return audiences

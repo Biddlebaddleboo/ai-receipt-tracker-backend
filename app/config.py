@@ -1,7 +1,9 @@
 ﻿import json
 import os
+import re
 from functools import lru_cache
 from typing import Any, List, Optional
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -37,6 +39,68 @@ def _parse_bool(value: Any) -> bool:
     return text in ("1", "true", "yes", "on")
 
 
+def _firebase_preview_origin_pattern(origin: str) -> Optional[str]:
+    try:
+        parsed = urlparse(origin)
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        return None
+    host = parsed.netloc.lower()
+    for suffix in (".web.app", ".firebaseapp.com"):
+        if not host.endswith(suffix):
+            continue
+        base = host[: -len(suffix)]
+        if not base:
+            continue
+        base = base.rstrip("-")
+        if not base:
+            continue
+        escaped_base = re.escape(base)
+        pattern = f"{scheme}://{escaped_base}(?:--preview-[0-9a-z]+)?{re.escape(suffix)}"
+        return pattern
+    return None
+
+
+def _build_preview_regex(origins: List[str]) -> Optional[str]:
+    patterns: List[str] = []
+    for origin in origins:
+        pattern = _firebase_preview_origin_pattern(origin)
+        if pattern:
+            patterns.append(pattern)
+    if not patterns:
+        return None
+    inner = "|".join(patterns)
+    return f"^(?:{inner})$"
+
+
+def _strip_regex_anchors(pattern: str) -> str:
+    cleaned = pattern.strip()
+    if cleaned.startswith("^"):
+        cleaned = cleaned[1:]
+    if cleaned.endswith("$"):
+        cleaned = cleaned[:-1]
+    return cleaned
+
+
+def _merge_origin_regex(
+    configured_regex: Optional[str], preview_regex: Optional[str]
+) -> Optional[str]:
+    patterns: List[str] = []
+    for candidate in (configured_regex, preview_regex):
+        if not candidate:
+            continue
+        cleaned = _strip_regex_anchors(candidate)
+        if cleaned and cleaned not in patterns:
+            patterns.append(cleaned)
+    if not patterns:
+        return None
+    if len(patterns) == 1:
+        return f"^{patterns[0]}$"
+    return f"^(?:{'|'.join(f'(?:{pattern})' for pattern in patterns)})$"
+
+
 class Settings(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -58,6 +122,7 @@ class Settings(BaseModel):
     helcim_user_agent: str = "ai-receipt-tracker-backend/1.0"
     helcim_approval_secret: Optional[str] = None
     helcim_approval_redirect_url: Optional[str] = None
+    allowed_origin_regex: Optional[str] = None
     @field_validator("allowed_origins", mode="before")
     def _parse_allowed_origins(cls, value: Any) -> List[str]:
         parsed = _normalize_list_field(value)
@@ -79,6 +144,11 @@ class Settings(BaseModel):
 
 def get_settings() -> Settings:
     require_oauth_value = _parse_bool(os.getenv("REQUIRE_OAUTH", "false"))
+    allowed_origins_value = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
+    normalized_origins = _normalize_list_field(allowed_origins_value)
+    configured_regex = os.getenv("ALLOWED_ORIGIN_REGEX")
+    preview_regex = _build_preview_regex(normalized_origins)
+    allowed_origin_regex_value = _merge_origin_regex(configured_regex, preview_regex)
     return Settings(
         gcs_bucket_name=os.getenv("GCLOUD_BUCKET_NAME", ""),
         firestore_database_id=os.getenv("FIRESTORE_DATABASE_ID", "(default)"),
@@ -86,7 +156,7 @@ def get_settings() -> Settings:
         openai_model_name=os.getenv("OPENAI_MODEL_NAME", "gpt-4.1-mini"),
         openai_api_key=os.getenv("OPENAI_API_KEY"),
         categories_collection=os.getenv("CATEGORIES_COLLECTION_NAME", "categories"),
-        allowed_origins=os.getenv("ALLOWED_ORIGINS", "http://localhost:3000"),
+        allowed_origins=normalized_origins,
         require_oauth=require_oauth_value,
         oauth_client_id=os.getenv("OAUTH_CLIENT_ID"),
         oauth_allowed_domains=os.getenv("OAUTH_ALLOWED_DOMAINS", ""),
@@ -98,5 +168,6 @@ def get_settings() -> Settings:
         helcim_user_agent=os.getenv("HELCIM_USER_AGENT", "ai-receipt-tracker-backend/1.0"),
         helcim_approval_secret=os.getenv("HELCIM_APPROVAL_SECRET"),
         helcim_approval_redirect_url=os.getenv("HELCIM_APPROVAL_REDIRECT_URL"),
+        allowed_origin_regex=allowed_origin_regex_value,
     )
 

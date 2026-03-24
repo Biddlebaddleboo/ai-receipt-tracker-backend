@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
+from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, Optional
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
@@ -14,6 +19,8 @@ from app.dependencies import (
     settings,
     subscription_service,
 )
+from app.helcim_recurring import HelcimRecurringClient
+from app.subscriptions import SubscriptionService
 
 router = APIRouter()
 logger = logging.getLogger("app.billing")
@@ -42,8 +49,13 @@ async def helcim_approval_callback(
     secret: Optional[str] = Query(None),
     x_helcim_approval_secret: Optional[str] = Header(None),
 ) -> Dict[str, Any]:
-    validate_helcim_approval_secret(settings, secret, x_helcim_approval_secret)
     payload = await extract_helcim_callback_payload(request)
+    validate_helcim_callback_auth(
+        settings,
+        payload,
+        secret_query=secret,
+        secret_header=x_helcim_approval_secret,
+    )
     result = process_helcim_approval_payload(payload, helcim_client)
     return {"status": "ok", **result}
 
@@ -53,8 +65,8 @@ def helcim_approval_landing(
     request: Request,
     secret: Optional[str] = Query(None),
 ) -> Any:
-    validate_helcim_approval_secret(settings, secret)
     payload = passthrough_query_params(request)
+    validate_helcim_callback_auth(settings, payload, secret_query=secret)
     if not payload.get("transactionId"):
         return approval_redirect_response(
             settings, {"status": "ok", "callback": "received"}
@@ -236,17 +248,50 @@ def parse_helcim_transaction_datetime(
     return None
 
 
-def validate_helcim_approval_secret(
+def validate_helcim_callback_auth(
     settings: Settings,
+    payload: Dict[str, Any],
     secret_query: Optional[str],
     secret_header: Optional[str] = None,
 ) -> None:
     configured_secret = (settings.helcim_approval_secret or "").strip()
-    if not configured_secret:
+    configured_hash_secret = (settings.helcim_hash_secret or "").strip()
+    if not configured_secret and not configured_hash_secret:
         return
-    provided_secret = (secret_query or secret_header or "").strip()
-    if provided_secret != configured_secret:
-        raise HTTPException(status_code=401, detail="Invalid approval secret")
+
+    if configured_secret:
+        provided_secret = (secret_query or secret_header or "").strip()
+        if provided_secret and hmac.compare_digest(provided_secret, configured_secret):
+            return
+
+    if configured_hash_secret and _helcim_amount_hash_matches(payload, configured_hash_secret):
+        return
+
+    raise HTTPException(status_code=401, detail="Invalid approval signature")
+
+
+def _helcim_amount_hash_matches(payload: Dict[str, Any], hash_secret: str) -> bool:
+    provided_hash = str(payload.get("amountHash") or "").strip().lower()
+    if not provided_hash:
+        return False
+    amount = _normalize_helcim_amount(payload.get("amount"))
+    if amount is None:
+        return False
+    expected_hash = hashlib.sha256(f"{hash_secret}{amount}".encode("utf-8")).hexdigest()
+    return hmac.compare_digest(provided_hash, expected_hash.lower())
+
+
+def _normalize_helcim_amount(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        amount = Decimal(text).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError):
+        return None
+    return format(amount, ".2f")
 
 
 def build_redirect_url(base_url: str, params: Dict[str, Any]) -> str:
@@ -291,7 +336,12 @@ def process_helcim_approval_payload(
 
     transaction_response = helcim_client.get_card_transaction(transaction_id)
     transaction_payload = extract_transaction_payload(transaction_response)
-    customer_code = payload.get("customerCode") or transaction_payload.get("customerCode")
+    customer_code = (
+        payload.get("customerCode")
+        or payload.get("customerId")
+        or transaction_payload.get("customerCode")
+        or transaction_payload.get("customerId")
+    )
     paid_at = parse_helcim_transaction_datetime(payload, transaction_payload)
     card_token = payload.get("cardToken") or transaction_payload.get("cardToken")
     transaction_type = payload.get("type") or transaction_payload.get("type")

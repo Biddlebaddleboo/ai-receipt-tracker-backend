@@ -13,12 +13,27 @@ RUN apt-get update && \
     go mod download && \
     go build -buildmode=c-shared -o /out/libstoragebridge.so
 
+FROM golang:1.22-bookworm AS go-firestore-build
+
+WORKDIR /src/native/firestorebridge
+
+COPY native/firestorebridge/go.mod ./
+COPY native/firestorebridge/firestorebridge.go ./
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    go mod download && \
+    go build -buildmode=c-shared -o /out/libfirestorebridge.so
+
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/root/.local/bin:$PATH" \
-    GO_STORAGE_LIBRARY_PATH=/app/native/libstoragebridge.so
+    GO_STORAGE_LIBRARY_PATH=/app/native/libstoragebridge.so \
+    GO_FIRESTORE_LIBRARY_PATH=/app/native/libfirestorebridge.so
 
 WORKDIR /app
 
@@ -33,6 +48,7 @@ RUN pip install --upgrade pip setuptools wheel && \
 
 COPY . .
 COPY --from=go-storage-build /out/libstoragebridge.so /app/native/libstoragebridge.so
+COPY --from=go-firestore-build /out/libfirestorebridge.so /app/native/libfirestorebridge.so
 
 EXPOSE 8080
 

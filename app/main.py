@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -273,13 +274,21 @@ async def _extract_helcim_callback_payload(request: Request) -> Dict[str, Any]:
 
 settings = get_settings()
 app = FastAPI(title="Receipt Scanner API")
+logger = logging.getLogger("app.cors")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+cors_kwargs = {
+    "allow_origins": settings.allowed_origins,
+    "allow_credentials": True,
+    "allow_methods": ["*"],
+    "allow_headers": ["*"],
+}
+if settings.allowed_origin_regex:
+    cors_kwargs["allow_origin_regex"] = settings.allowed_origin_regex
+app.add_middleware(CORSMiddleware, **cors_kwargs)
+logger.warning(
+    "CORS configured allow_origins=%s allow_origin_regex=%s",
+    settings.allowed_origins,
+    settings.allowed_origin_regex,
 )
 
 storage_client = GCSStorageClient(settings.gcs_bucket_name)

@@ -189,7 +189,7 @@ Recommended frontend flow:
 ## Notes
 
 - Images are uploaded with the MIME type they arrive with; convert to PNG/JPEG before uploading if you need a different format.
-- The OpenAI extractor prompts the model to describe the receipt, so you can adjust the prompt inside `app/services/ocr.py` if you need structured output.
+- The OpenAI extractor prompts the model to describe the receipt, so you can adjust the prompt inside `native/ocrbridge/ocrbridge.go` if you need structured output.
 - For production, run `uvicorn app.main:app --host 0.0.0.0 --port 8000` behind a secured reverse proxy or gateway.
 - The list of categories also acts as the source of truth for AI classification when a receipt is uploaded; make sure each desired label is saved here before it can be inferred automatically.
 - Firestore collection names and the Firestore database ID are separate settings. `FIRESTORE_DATABASE_ID` selects the database, while `FIRESTORE_COLLECTION_NAME` and `CATEGORIES_COLLECTION_NAME` select collections inside that database.

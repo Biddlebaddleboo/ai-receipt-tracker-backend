@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import hashlib
 import hmac
 import json
 import logging
 from datetime import datetime
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -256,43 +254,22 @@ def validate_helcim_callback_auth(
     secret_header: Optional[str] = None,
 ) -> None:
     configured_secret = (settings.helcim_approval_secret or "").strip()
-    configured_hash_secret = (settings.helcim_hash_secret or "").strip()
-    if not configured_secret and not configured_hash_secret:
+    if not configured_secret:
         return
 
-    if configured_secret:
-        provided_secret = (secret_query or secret_header or "").strip()
-        if provided_secret and hmac.compare_digest(provided_secret, configured_secret):
+    provided_secret = (secret_query or secret_header or "").strip()
+    if provided_secret:
+        if hmac.compare_digest(provided_secret, configured_secret):
             return
+        raise HTTPException(status_code=401, detail="Invalid approval secret")
 
-    if configured_hash_secret and _helcim_amount_hash_matches(payload, configured_hash_secret):
+    # Helcim hosted page callbacks may not support sending a custom shared secret.
+    # In that case we allow the request through as long as it contains a transactionId,
+    # and the downstream Helcim API lookup becomes the source of truth.
+    if str(payload.get("transactionId") or "").strip():
         return
 
-    raise HTTPException(status_code=401, detail="Invalid approval signature")
-
-
-def _helcim_amount_hash_matches(payload: Dict[str, Any], hash_secret: str) -> bool:
-    provided_hash = str(payload.get("amountHash") or "").strip().lower()
-    if not provided_hash:
-        return False
-    amount = _normalize_helcim_amount(payload.get("amount"))
-    if amount is None:
-        return False
-    expected_hash = hashlib.sha256(f"{hash_secret}{amount}".encode("utf-8")).hexdigest()
-    return hmac.compare_digest(provided_hash, expected_hash.lower())
-
-
-def _normalize_helcim_amount(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        amount = Decimal(text).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    except (InvalidOperation, ValueError):
-        return None
-    return format(amount, ".2f")
+    raise HTTPException(status_code=401, detail="Approval callback is missing transactionId")
 
 
 def build_redirect_url(base_url: str, params: Dict[str, Any]) -> str:

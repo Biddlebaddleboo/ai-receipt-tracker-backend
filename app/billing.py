@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -369,9 +370,10 @@ def process_helcim_approval_payload(
 
 async def extract_helcim_callback_payload(request: Request) -> Dict[str, Any]:
     content_type = (request.headers.get("content-type") or "").lower()
+    raw_body = await request.body()
     if "application/json" in content_type:
         try:
-            payload = await request.json()
+            payload = json.loads(raw_body.decode("utf-8"))
             if isinstance(payload, dict):
                 return payload
         except Exception:
@@ -385,8 +387,11 @@ async def extract_helcim_callback_payload(request: Request) -> Dict[str, Any]:
             return {key: value for key, value in form.items()}
         except Exception:
             pass
+    payload = _parse_urlencoded_payload(raw_body)
+    if payload:
+        return payload
     try:
-        payload = await request.json()
+        payload = json.loads(raw_body.decode("utf-8"))
         if isinstance(payload, dict):
             return payload
     except Exception:
@@ -395,3 +400,28 @@ async def extract_helcim_callback_payload(request: Request) -> Dict[str, Any]:
     if payload:
         return payload
     raise HTTPException(status_code=400, detail="Approval callback payload is missing")
+
+
+def _parse_urlencoded_payload(raw_body: bytes) -> Dict[str, Any]:
+    if not raw_body:
+        return {}
+    try:
+        text = raw_body.decode("utf-8")
+    except UnicodeDecodeError:
+        return {}
+    if "=" not in text:
+        return {}
+    parsed = parse_qsl(text, keep_blank_values=True)
+    if not parsed:
+        return {}
+    payload: Dict[str, Any] = {}
+    for key, value in parsed:
+        if key in payload:
+            existing = payload[key]
+            if isinstance(existing, list):
+                existing.append(value)
+            else:
+                payload[key] = [existing, value]
+        else:
+            payload[key] = value
+    return payload

@@ -1,4 +1,4 @@
-module firestorebridge
+module categoriesbridge
 
 go 1.22
 

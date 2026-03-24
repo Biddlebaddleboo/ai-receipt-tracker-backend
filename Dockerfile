@@ -71,13 +71,15 @@ RUN apt-get update && \
     go mod download && \
     go build -buildmode=c-shared -o /out/libauthbridge.so
 
-FROM golang:1.22-bookworm AS go-api-build
+FROM golang:1.23-bookworm AS go-api-build
 
 WORKDIR /src/cmd/apiserver
 
 COPY cmd/apiserver/go.mod ./
 COPY cmd/apiserver/go.sum ./
 COPY cmd/apiserver/main.go ./
+COPY cmd/apiserver/users.go ./
+COPY cmd/apiserver/receipts.go ./
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends build-essential && \

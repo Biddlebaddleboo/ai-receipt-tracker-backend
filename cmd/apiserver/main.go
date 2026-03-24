@@ -18,20 +18,27 @@ import (
 	"time"
 
 	fs "cloud.google.com/go/firestore"
+	"cloud.google.com/go/storage"
 	"google.golang.org/api/idtoken"
 	"google.golang.org/api/iterator"
 )
 
 type config struct {
-	port               string
-	pythonBackendPort  string
-	firestoreDatabase  string
-	categoriesColl     string
-	requireOAuth       bool
-	oauthClientIDs     []string
-	oauthAllowedDomain []string
-	allowedOrigins     []string
-	allowedOriginRegex *regexp.Regexp
+	port                string
+	pythonBackendPort   string
+	firestoreDatabase   string
+	firestoreCollection string
+	categoriesColl      string
+	plansCollection     string
+	usersCollection     string
+	gcsBucketName       string
+	openAIModel         string
+	openAIAPIKey        string
+	requireOAuth        bool
+	oauthClientIDs      []string
+	oauthAllowedDomain  []string
+	allowedOrigins      []string
+	allowedOriginRegex  *regexp.Regexp
 }
 
 type verifiedUser struct {
@@ -56,8 +63,13 @@ type apiServer struct {
 	cfg        config
 	proxy      *httputil.ReverseProxy
 	firestore  *fs.Client
+	storage    *storage.Client
 	pythonCmd  *exec.Cmd
+	receipts   *fs.CollectionRef
 	categories *fs.CollectionRef
+	plans      *fs.CollectionRef
+	users      *fs.CollectionRef
+	bucket     *storage.BucketHandle
 	pythonURL  *url.URL
 	httpServer *http.Server
 }
@@ -82,6 +94,9 @@ func main() {
 	mux.HandleFunc("/healthz", server.handleHealthz)
 	mux.HandleFunc("/categories", server.handleCategories)
 	mux.HandleFunc("/categories/", server.handleCategoryByID)
+	mux.HandleFunc("/receipts", server.handleReceipts)
+	mux.HandleFunc("/receipts/", server.handleReceiptByID)
+	mux.HandleFunc("/users/me/plan", server.handleUserPlan)
 	mux.Handle("/", server.proxy)
 
 	server.httpServer = &http.Server{
@@ -97,14 +112,20 @@ func main() {
 
 func loadConfig() (config, error) {
 	cfg := config{
-		port:               envOrDefault("PORT", "8080"),
-		pythonBackendPort:  envOrDefault("PYTHON_BACKEND_PORT", "8081"),
-		firestoreDatabase:  envOrDefault("FIRESTORE_DATABASE_ID", "(default)"),
-		categoriesColl:     envOrDefault("CATEGORIES_COLLECTION_NAME", "categories"),
-		requireOAuth:       parseBool(os.Getenv("REQUIRE_OAUTH")),
-		oauthClientIDs:     normalizeListField(os.Getenv("OAUTH_CLIENT_ID")),
-		oauthAllowedDomain: normalizeListField(os.Getenv("OAUTH_ALLOWED_DOMAINS")),
-		allowedOrigins:     normalizeListField(envOrDefault("ALLOWED_ORIGINS", "http://localhost:3000")),
+		port:                envOrDefault("PORT", "8080"),
+		pythonBackendPort:   envOrDefault("PYTHON_BACKEND_PORT", "8081"),
+		firestoreDatabase:   envOrDefault("FIRESTORE_DATABASE_ID", "(default)"),
+		firestoreCollection: envOrDefault("FIRESTORE_COLLECTION_NAME", "receipts"),
+		categoriesColl:      envOrDefault("CATEGORIES_COLLECTION_NAME", "categories"),
+		plansCollection:     envOrDefault("PLANS_COLLECTION_NAME", "plans"),
+		usersCollection:     envOrDefault("USERS_COLLECTION_NAME", "users"),
+		gcsBucketName:       strings.TrimSpace(os.Getenv("GCLOUD_BUCKET_NAME")),
+		openAIModel:         envOrDefault("OPENAI_MODEL_NAME", "gpt-4.1-mini"),
+		openAIAPIKey:        strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
+		requireOAuth:        parseBool(os.Getenv("REQUIRE_OAUTH")),
+		oauthClientIDs:      normalizeListField(os.Getenv("OAUTH_CLIENT_ID")),
+		oauthAllowedDomain:  normalizeListField(os.Getenv("OAUTH_ALLOWED_DOMAINS")),
+		allowedOrigins:      normalizeListField(envOrDefault("ALLOWED_ORIGINS", "http://localhost:3000")),
 	}
 	if len(cfg.allowedOrigins) == 0 {
 		cfg.allowedOrigins = []string{"http://localhost:3000"}
@@ -126,9 +147,15 @@ func newAPIServer(cfg config) (*apiServer, error) {
 	if err != nil {
 		return nil, err
 	}
+	storageClient, err := storage.NewClient(ctx)
+	if err != nil {
+		_ = client.Close()
+		return nil, err
+	}
 	pythonURL, err := url.Parse("http://127.0.0.1:" + cfg.pythonBackendPort)
 	if err != nil {
-		client.Close()
+		_ = client.Close()
+		_ = storageClient.Close()
 		return nil, err
 	}
 	proxy := httputil.NewSingleHostReverseProxy(pythonURL)
@@ -145,7 +172,12 @@ func newAPIServer(cfg config) (*apiServer, error) {
 		cfg:        cfg,
 		proxy:      proxy,
 		firestore:  client,
+		storage:    storageClient,
+		receipts:   client.Collection(cfg.firestoreCollection),
 		categories: client.Collection(cfg.categoriesColl),
+		plans:      client.Collection(cfg.plansCollection),
+		users:      client.Collection(cfg.usersCollection),
+		bucket:     storageClient.Bucket(cfg.gcsBucketName),
 		pythonURL:  pythonURL,
 	}, nil
 }
@@ -161,6 +193,9 @@ func (s *apiServer) close() {
 	}
 	if s.firestore != nil {
 		_ = s.firestore.Close()
+	}
+	if s.storage != nil {
+		_ = s.storage.Close()
 	}
 }
 

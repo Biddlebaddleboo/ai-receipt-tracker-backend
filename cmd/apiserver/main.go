@@ -97,6 +97,8 @@ func main() {
 	mux.HandleFunc("/receipts", server.handleReceipts)
 	mux.HandleFunc("/receipts/", server.handleReceiptByID)
 	mux.HandleFunc("/users/me/plan", server.handleUserPlan)
+	mux.HandleFunc("/billing", server.handleBillingProxy)
+	mux.HandleFunc("/billing/", server.handleBillingProxy)
 	mux.Handle("/", server.proxy)
 
 	server.httpServer = &http.Server{
@@ -163,6 +165,10 @@ func newAPIServer(cfg config) (*apiServer, error) {
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
 		req.Host = pythonURL.Host
+	}
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		stripProxiedCORSHeaders(resp.Header)
+		return nil
 	}
 	proxy.ErrorHandler = func(writer http.ResponseWriter, request *http.Request, err error) {
 		log.Printf("Python backend proxy error for %s %s: %v", request.Method, request.URL.Path, err)
@@ -243,6 +249,15 @@ func (s *apiServer) withCORS(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(writer, request)
 	})
+}
+
+func stripProxiedCORSHeaders(header http.Header) {
+	header.Del("Access-Control-Allow-Origin")
+	header.Del("Access-Control-Allow-Credentials")
+	header.Del("Access-Control-Allow-Methods")
+	header.Del("Access-Control-Allow-Headers")
+	header.Del("Access-Control-Expose-Headers")
+	header.Del("Access-Control-Max-Age")
 }
 
 func (s *apiServer) isAllowedOrigin(origin string) bool {
@@ -687,4 +702,13 @@ func containsFold(values []string, candidate string) bool {
 		}
 	}
 	return false
+}
+
+func (s *apiServer) handleBillingProxy(writer http.ResponseWriter, request *http.Request) {
+	user, ok := s.authenticateRequest(writer, request)
+	if !ok {
+		return
+	}
+	request.Header.Set("X-Go-Authenticated-Email", user.Email)
+	s.proxy.ServeHTTP(writer, request)
 }

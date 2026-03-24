@@ -71,6 +71,21 @@ RUN apt-get update && \
     go mod download && \
     go build -buildmode=c-shared -o /out/libauthbridge.so
 
+FROM golang:1.22-bookworm AS go-api-build
+
+WORKDIR /src/cmd/apiserver
+
+COPY cmd/apiserver/go.mod ./
+COPY cmd/apiserver/go.sum ./
+COPY cmd/apiserver/main.go ./
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    go mod download && \
+    go build -o /out/apiserver
+
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -99,7 +114,8 @@ COPY --from=go-firestore-build /out/libfirestorebridge.so /app/native/libfiresto
 COPY --from=go-categories-build /out/libcategoriesbridge.so /app/native/libcategoriesbridge.so
 COPY --from=go-ocr-build /out/libocrbridge.so /app/native/libocrbridge.so
 COPY --from=go-auth-build /out/libauthbridge.so /app/native/libauthbridge.so
+COPY --from=go-api-build /out/apiserver /app/apiserver
 
 EXPOSE 8080
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["/app/apiserver"]

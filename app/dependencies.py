@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 from fastapi import HTTPException, Request
 from app.config import Settings, get_settings
 from app.helcim_recurring import HelcimRecurringClient
@@ -39,3 +41,8 @@ def require_owner_email(request: Request) -> str:
             headers={"WWW-Authenticate": "Bearer"},
         )
     return email
+
+
+def get_owner_email(request: Request) -> Optional[str]:
+    email = request.headers.get("X-Go-Authenticated-Email", "").strip()
+    return email or None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request
@@ -7,6 +8,7 @@ from fastapi.responses import RedirectResponse
 
 from app.config import Settings
 from app.dependencies import (
+    get_owner_email,
     helcim_client,
     require_owner_email,
     settings,
@@ -14,6 +16,7 @@ from app.dependencies import (
 )
 
 router = APIRouter()
+logger = logging.getLogger("app.billing")
 
 
 @router.post("/billing/notify")
@@ -72,7 +75,9 @@ def helcim_approval_landing(
 
 @router.get("/billing/helcim/payment-plans")
 def helcim_list_payment_plans(request: Request) -> Any:
-    owner_email = require_owner_email(request)
+    owner_email = get_owner_email(request)
+    if owner_email:
+        logger.debug("returning Helcim payment plans for %s", owner_email)
     response = helcim_client.list_payment_plans(passthrough_query_params(request))
     if not isinstance(response, dict):
         return response

@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"strings"
 	"sync"
@@ -132,7 +133,7 @@ func StorageUpload(
 	if mimeType != "" {
 		writer.ContentType = mimeType
 	}
-	if _, err := writer.ReadFrom(bytes.NewReader(payload)); err != nil {
+	if _, err := io.Copy(writer, bytes.NewReader(payload)); err != nil {
 		_ = writer.Close()
 		setError(errOut, err)
 		return nil

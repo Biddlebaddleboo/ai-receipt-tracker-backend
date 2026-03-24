@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"unsafe"
 
 	fs "cloud.google.com/go/firestore"
 	"google.golang.org/api/iterator"
@@ -354,4 +355,11 @@ func CategoriesDelete(
 		return nil
 	}
 	return result
+}
+
+//export CategoriesFree
+func CategoriesFree(ptr unsafe.Pointer) {
+	if ptr != nil {
+		C.free(ptr)
+	}
 }

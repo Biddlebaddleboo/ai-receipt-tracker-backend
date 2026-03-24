@@ -2,44 +2,17 @@ from __future__ import annotations
 
 import ctypes
 import json
-import os
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-_LIBRARY_PATH_ENV = "GO_CATEGORIES_LIBRARY_PATH"
+from app.services._native_bridge import NativeLibraryBase
 
 
-def _default_library_candidates() -> list[Path]:
-    extension = ".so"
-    if os.name == "nt":
-        extension = ".dll"
-    elif os.name == "darwin":
-        extension = ".dylib"
-    project_root = Path(__file__).resolve().parents[2]
-    return [
-        project_root / "native" / f"libcategoriesbridge{extension}",
-        project_root / "native" / "categoriesbridge" / f"libcategoriesbridge{extension}",
-    ]
-
-
-def _resolve_library_path() -> Optional[Path]:
-    configured = os.getenv(_LIBRARY_PATH_ENV)
-    if configured:
-        path = Path(configured).expanduser()
-        if path.exists():
-            return path
-    for candidate in _default_library_candidates():
-        if candidate.exists():
-            return candidate
-    return None
-
-
-class _GoCategoriesLibrary:
+class _GoCategoriesLibrary(NativeLibraryBase):
     _instance: Optional["_GoCategoriesLibrary"] = None
-
-    def __init__(self, path: Path):
-        self._library = ctypes.CDLL(str(path))
-        self._configure()
+    env_var = "GO_CATEGORIES_LIBRARY_PATH"
+    library_stem = "libcategoriesbridge"
+    missing_label = "Go categories library"
+    free_symbol = "CategoriesFree"
 
     def _configure(self) -> None:
         self._library.CategoriesNew.argtypes = [
@@ -88,35 +61,6 @@ class _GoCategoriesLibrary:
         self._library.CategoriesFree.argtypes = [ctypes.c_void_p]
         self._library.CategoriesFree.restype = None
 
-    @classmethod
-    def load(cls) -> "_GoCategoriesLibrary":
-        if cls._instance:
-            return cls._instance
-        path = _resolve_library_path()
-        if path is None:
-            raise RuntimeError(
-                f"Go categories library not found. Set {_LIBRARY_PATH_ENV} or ship the shared library."
-            )
-        cls._instance = cls(path)
-        return cls._instance
-
-    def free(self, ptr: Optional[int]) -> None:
-        if ptr:
-            self._library.CategoriesFree(ctypes.c_void_p(ptr))
-
-    def take_string(self, ptr: Optional[int]) -> str:
-        if not ptr:
-            return ""
-        try:
-            return ctypes.string_at(ptr).decode("utf-8")
-        finally:
-            self.free(ptr)
-
-    def raise_on_error(self, err_ptr: ctypes.c_void_p) -> None:
-        if err_ptr.value:
-            message = self.take_string(err_ptr.value)
-            raise RuntimeError(message or "native categories bridge failed")
-
 
 class CategoryService:
     def __init__(self, collection_name: str, database_id: str = "(default)"):
@@ -127,7 +71,7 @@ class CategoryService:
             database_id.encode("utf-8"),
             ctypes.byref(err_ptr),
         )
-        self._bridge.raise_on_error(err_ptr)
+        self._bridge.raise_on_error(err_ptr, "native categories bridge failed")
         if not self._handle:
             raise RuntimeError("native categories bridge returned invalid handle")
 
@@ -145,7 +89,7 @@ class CategoryService:
     def _call_json(self, func, *args) -> Any:
         err_ptr = ctypes.c_void_p()
         ptr = func(*args, ctypes.byref(err_ptr))
-        self._bridge.raise_on_error(err_ptr)
+        self._bridge.raise_on_error(err_ptr, "native categories bridge failed")
         payload = self._bridge.take_string(ptr)
         return json.loads(payload) if payload else None
 
@@ -157,7 +101,7 @@ class CategoryService:
             json.dumps(payload).encode("utf-8"),
             ctypes.byref(err_ptr),
         )
-        self._bridge.raise_on_error(err_ptr)
+        self._bridge.raise_on_error(err_ptr, "native categories bridge failed")
         return self._bridge.take_string(ptr)
 
     def list_categories(self, owner_email: str) -> List[Dict[str, Any]]:

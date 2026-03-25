@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"image"
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
@@ -24,7 +23,6 @@ import (
 
 	fs "cloud.google.com/go/firestore"
 	gcs "cloud.google.com/go/storage"
-	"github.com/gen2brain/avif"
 	"google.golang.org/api/iterator"
 )
 
@@ -46,18 +44,22 @@ type receiptItem struct {
 }
 
 type receiptRecord struct {
-	ID              string                 `json:"id"`
-	Vendor          *string                `json:"vendor,omitempty"`
-	Subtotal        *float64               `json:"subtotal,omitempty"`
-	Tax             *float64               `json:"tax,omitempty"`
-	Total           *float64               `json:"total,omitempty"`
-	Category        *string                `json:"category,omitempty"`
-	PurchaseDate    *string                `json:"purchase_date,omitempty"`
-	Items           []receiptItem          `json:"items"`
-	ImageURL        string                 `json:"image_url"`
-	ExtractedText   string                 `json:"extracted_text"`
-	ExtractedFields map[string]interface{} `json:"extracted_fields"`
-	CreatedAt       time.Time              `json:"created_at"`
+	ID                    string                 `json:"id"`
+	Vendor                *string                `json:"vendor,omitempty"`
+	Subtotal              *float64               `json:"subtotal,omitempty"`
+	Tax                   *float64               `json:"tax,omitempty"`
+	Total                 *float64               `json:"total,omitempty"`
+	Category              *string                `json:"category,omitempty"`
+	PurchaseDate          *string                `json:"purchase_date,omitempty"`
+	Items                 []receiptItem          `json:"items"`
+	ImageURL              string                 `json:"image_url"`
+	ExtractedText         string                 `json:"extracted_text"`
+	ExtractedFields       map[string]interface{} `json:"extracted_fields"`
+	CreatedAt             time.Time              `json:"created_at"`
+	ProcessingStatus      string                 `json:"processing_status"`
+	ProcessingError       *string                `json:"processing_error,omitempty"`
+	ImageProcessingStatus string                 `json:"image_processing_status"`
+	ImageProcessingError  *string                `json:"image_processing_error,omitempty"`
 }
 
 type receiptListResponse struct {
@@ -184,11 +186,13 @@ func (s *apiServer) handleReceiptByID(writer http.ResponseWriter, request *http.
 }
 
 func (s *apiServer) createReceipt(writer http.ResponseWriter, request *http.Request, user *verifiedUser) {
+	started := time.Now()
 	ownerEmail := strings.TrimSpace(user.Email)
 	if ownerEmail == "" {
 		writeJSONError(writer, http.StatusUnauthorized, "OAuth token is missing an email address")
 		return
 	}
+	log.Printf("create_receipt_start owner=%s", ownerEmail)
 	if _, err := s.ensureWithinLimit(ownerEmail); err != nil {
 		s.writeErr(writer, err)
 		return
@@ -214,109 +218,58 @@ func (s *apiServer) createReceipt(writer http.ResponseWriter, request *http.Requ
 		writeJSONError(writer, http.StatusBadRequest, "failed to read uploaded file")
 		return
 	}
-
-	storedPath := buildStorageKey(header.Filename)
-	avifPath := storedPath + ".avif"
-	categoryOptions, err := s.categoryNames(request.Context(), ownerEmail)
-	if err != nil {
-		s.writeErr(writer, err)
-		return
-	}
-
-	type ocrOutcome struct {
-		result ocrResult
-		err    error
-	}
-	type uploadOutcome struct {
-		err error
-	}
-	ocrCh := make(chan ocrOutcome, 1)
-	uploadCh := make(chan uploadOutcome, 1)
-
-	go func() {
-		result, err := s.extractReceiptOCR(request.Context(), imageBytes, categoryOptions)
-		ocrCh <- ocrOutcome{result: result, err: err}
-	}()
-	go func() {
-		uploadCh <- uploadOutcome{err: s.convertAndUploadAVIF(request.Context(), imageBytes, avifPath)}
-	}()
-
-	ocrRes := <-ocrCh
-	if ocrRes.err != nil {
-		<-uploadCh
-		s.writeErr(writer, ocrRes.err)
-		return
-	}
-	uploadRes := <-uploadCh
-	if uploadRes.err != nil {
-		s.writeErr(writer, uploadRes.err)
-		return
-	}
-
-	itemsPayload := ocrItemsToReceiptItems(ocrRes.result.Items)
-	subtotalValue := firstFormFloat(request.FormValue("subtotal"))
-	taxValue := firstFormFloat(request.FormValue("tax"))
-	totalValue := firstFormFloat(request.FormValue("total"))
-	vendorValue := firstFormString(request.FormValue("vendor"))
-	categoryValue := firstFormString(request.FormValue("category"))
-	purchaseDateValue := firstFormString(request.FormValue("purchase_date"))
-	if vendorValue == nil {
-		vendorValue = ocrRes.result.Vendor
-	}
-	if taxValue == nil {
-		taxValue = ocrRes.result.Tax
-	}
-	if totalValue == nil {
-		totalValue = ocrRes.result.Total
-	}
-	if categoryValue == nil {
-		categoryValue = ocrRes.result.Category
-	}
-	if purchaseDateValue == nil {
-		purchaseDateValue = ocrRes.result.PurchaseDate
-	}
-
-	validation := validateSubtotalAgainstItems(subtotalValueOrOCR(subtotalValue, ocrRes.result.Subtotal), itemsPayload)
-	subtotal := validation.Subtotal
-	extractedFields := map[string]interface{}{
-		"model":       s.cfg.openAIModel,
-		"text_length": len(ocrRes.result.Text),
-		"ai_suggestions": map[string]interface{}{
-			"vendor":        ocrRes.result.Vendor,
-			"subtotal":      ocrRes.result.Subtotal,
-			"tax":           ocrRes.result.Tax,
-			"total":         ocrRes.result.Total,
-			"category":      ocrRes.result.Category,
-			"purchase_date": ocrRes.result.PurchaseDate,
-			"items":         itemsPayload,
-		},
-		"validation": validation.Info,
-	}
+	log.Printf("create_receipt_file_read owner=%s filename=%s bytes=%d content_type=%s", ownerEmail, header.Filename, len(imageBytes), contentType)
 
 	now := time.Now().UTC()
 	docRef := s.receipts.NewDoc()
-	imageURL := s.absoluteURL(request, "/receipts/"+docRef.ID+"/image")
-	payload := map[string]interface{}{
-		"vendor":           vendorValue,
-		"subtotal":         subtotal,
-		"tax":              taxValue,
-		"total":            totalValue,
-		"category":         categoryValue,
-		"purchase_date":    purchaseDateValue,
-		"image_url":        imageURL,
-		"storage_path":     avifPath,
-		"items":            itemsPayload,
-		"extracted_text":   ocrRes.result.Text,
-		"extracted_fields": extractedFields,
-		"created_at":       now,
-		"owner_email":      ownerEmail,
-	}
-	if _, err := docRef.Set(request.Context(), payload); err != nil {
-		_ = s.bucket.Object(avifPath).Delete(request.Context())
+	rawStoragePath := buildStorageKey(header.Filename)
+	if err := s.uploadRawImage(request.Context(), imageBytes, rawStoragePath, contentType); err != nil {
 		s.writeErr(writer, err)
 		return
 	}
-	writeJSON(writer, http.StatusOK, receiptRecordFromMap(docRef.ID, payload))
+	log.Printf("create_receipt_raw_uploaded owner=%s receipt_id=%s raw_path=%s size_bytes=%d", ownerEmail, docRef.ID, rawStoragePath, len(imageBytes))
+	imageURL := s.absoluteURL(request, "/receipts/"+docRef.ID+"/image")
+	payload := map[string]interface{}{
+		"vendor":                            firstFormString(request.FormValue("vendor")),
+		"subtotal":                          firstFormFloat(request.FormValue("subtotal")),
+		"tax":                               firstFormFloat(request.FormValue("tax")),
+		"total":                             firstFormFloat(request.FormValue("total")),
+		"category":                          firstFormString(request.FormValue("category")),
+		"purchase_date":                     firstFormString(request.FormValue("purchase_date")),
+		"image_url":                         imageURL,
+		"storage_path":                      rawStoragePath,
+		"raw_storage_path":                  rawStoragePath,
+		"items":                             []map[string]interface{}{},
+		"extracted_text":                    "",
+		"extracted_fields":                  map[string]interface{}{},
+		"created_at":                        now,
+		"owner_email":                       ownerEmail,
+		"processing_status":                 "processing",
+		"processing_owner":                  s.workerID,
+		"processing_lease_expires_at":       time.Now().UTC().Add(s.cfg.receiptWorkerLease),
+		"processing_error":                  nil,
+		"processing_started_at":             time.Now().UTC(),
+		"processing_attempts":               1,
+		"image_processing_status":           "ready",
+		"image_processing_error":            nil,
+		"image_processing_owner":            nil,
+		"image_processing_lease_expires_at": nil,
+	}
+	if _, err := docRef.Set(request.Context(), payload); err != nil {
+		_ = s.bucket.Object(rawStoragePath).Delete(request.Context())
+		s.writeErr(writer, err)
+		return
+	}
+	// Nudge the background worker immediately so OCR can start quickly.
+	s.wakeReceiptWorker()
+	job := receiptJob{
+		ID:             docRef.ID,
+		OwnerEmail:     ownerEmail,
+		RawStoragePath: rawStoragePath,
+	}
+	go s.processOCRForJob(context.Background(), job, imageBytes)
+	log.Printf("create_receipt_accepted owner=%s receipt_id=%s latency_ms=%d", ownerEmail, docRef.ID, time.Since(started).Milliseconds())
+	writeJSON(writer, http.StatusAccepted, receiptRecordFromMap(docRef.ID, payload))
 }
 
 func (s *apiServer) listReceipts(writer http.ResponseWriter, request *http.Request, user *verifiedUser) {
@@ -475,10 +428,20 @@ func (s *apiServer) deleteReceipt(writer http.ResponseWriter, request *http.Requ
 		s.writeErr(writer, err)
 		return
 	}
-	if storagePath := stringFromAny(data["storage_path"]); storagePath != "" {
+	rawStoragePath := strings.TrimSpace(stringFromAny(data["raw_storage_path"]))
+	storagePath := strings.TrimSpace(stringFromAny(data["storage_path"]))
+	if storagePath != "" {
 		if err := s.bucket.Object(storagePath).Delete(request.Context()); err != nil && !errors.Is(err, gcs.ErrObjectNotExist) {
 			log.Printf("failed to delete storage object %s: %v", storagePath, err)
 		}
+	}
+	if rawStoragePath != "" && rawStoragePath != storagePath {
+		if err := s.bucket.Object(rawStoragePath).Delete(request.Context()); err != nil && !errors.Is(err, gcs.ErrObjectNotExist) {
+			log.Printf("failed to delete raw storage object %s: %v", rawStoragePath, err)
+		}
+	}
+	if rawStoragePath != "" {
+		// No AVIF side objects are generated anymore.
 	}
 	writer.WriteHeader(http.StatusNoContent)
 }
@@ -582,25 +545,245 @@ func (s *apiServer) categoryNames(ctx context.Context, ownerEmail string) ([]str
 	return names, nil
 }
 
-func (s *apiServer) convertAndUploadAVIF(ctx context.Context, data []byte, destination string) error {
-	img, _, err := image.Decode(bytes.NewReader(data))
-	if err != nil {
-		return httpError{status: http.StatusBadRequest, detail: "Uploaded file must be a supported image"}
-	}
-	var avifBuffer bytes.Buffer
-	if err := avif.Encode(&avifBuffer, img, avif.Options{Quality: 60, QualityAlpha: 60, Speed: 6}); err != nil {
-		return fmt.Errorf("failed to convert image: %w", err)
-	}
+func (s *apiServer) uploadRawImage(ctx context.Context, data []byte, destination string, contentType string) error {
 	objWriter := s.bucket.Object(destination).NewWriter(ctx)
-	objWriter.ContentType = "image/avif"
-	if _, err := io.Copy(objWriter, bytes.NewReader(avifBuffer.Bytes())); err != nil {
+	if strings.TrimSpace(contentType) == "" {
+		contentType = "application/octet-stream"
+	}
+	objWriter.ContentType = contentType
+	if _, err := io.Copy(objWriter, bytes.NewReader(data)); err != nil {
 		_ = objWriter.Close()
-		return fmt.Errorf("failed to upload image: %w", err)
+		return fmt.Errorf("failed to upload original image: %w", err)
 	}
 	if err := objWriter.Close(); err != nil {
-		return fmt.Errorf("failed to upload image: %w", err)
+		return fmt.Errorf("failed to upload original image: %w", err)
 	}
 	return nil
+}
+
+type receiptJob struct {
+	ID             string
+	OwnerEmail     string
+	RawStoragePath string
+}
+
+func (s *apiServer) startReceiptWorker() {
+	log.Printf("receipt_worker_start id=%s poll=%s lease=%s", s.workerID, s.cfg.receiptWorkerPoll, s.cfg.receiptWorkerLease)
+	go func() {
+		ticker := time.NewTicker(s.cfg.receiptWorkerPoll)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.workerStop:
+				return
+			default:
+			}
+			for i := 0; i < 3; i++ {
+				job, ok, err := s.claimNextReceiptJob(context.Background())
+				if err != nil {
+					log.Printf("receipt worker claim error: %v", err)
+					break
+				}
+				if !ok {
+					break
+				}
+				log.Printf("receipt_worker_claimed id=%s receipt_id=%s owner=%s", s.workerID, job.ID, job.OwnerEmail)
+				s.processClaimedReceiptJob(context.Background(), job)
+			}
+			select {
+			case <-s.workerStop:
+				return
+			case <-s.workerWake:
+			case <-ticker.C:
+			}
+		}
+	}()
+}
+
+func (s *apiServer) wakeReceiptWorker() {
+	select {
+	case s.workerWake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *apiServer) claimNextReceiptJob(ctx context.Context) (receiptJob, bool, error) {
+	now := time.Now().UTC()
+	queued, err := s.receipts.Where("processing_status", "==", "queued").Limit(25).Documents(ctx).GetAll()
+	if err != nil {
+		return receiptJob{}, false, err
+	}
+	for _, snapshot := range queued {
+		job, ok, err := s.tryClaimReceiptJob(ctx, snapshot.Ref, now)
+		if err != nil {
+			return receiptJob{}, false, err
+		}
+		if ok {
+			return job, true, nil
+		}
+	}
+
+	stale, err := s.receipts.Where("processing_status", "==", "processing").Limit(25).Documents(ctx).GetAll()
+	if err != nil {
+		return receiptJob{}, false, err
+	}
+	for _, snapshot := range stale {
+		job, ok, err := s.tryClaimReceiptJob(ctx, snapshot.Ref, now)
+		if err != nil {
+			return receiptJob{}, false, err
+		}
+		if ok {
+			return job, true, nil
+		}
+	}
+	return receiptJob{}, false, nil
+}
+
+func (s *apiServer) tryClaimReceiptJob(ctx context.Context, ref *fs.DocumentRef, now time.Time) (receiptJob, bool, error) {
+	var claimed receiptJob
+	err := s.firestore.RunTransaction(ctx, func(ctx context.Context, tx *fs.Transaction) error {
+		snapshot, err := tx.Get(ref)
+		if err != nil || !snapshot.Exists() {
+			return err
+		}
+		data := snapshot.Data()
+		status := fallbackString(data["processing_status"], "")
+		lease := timeValue(data["processing_lease_expires_at"])
+		if status != "queued" && !(status == "processing" && (lease == nil || !lease.After(now))) {
+			return nil
+		}
+		ownerEmail := strings.TrimSpace(stringValue(data["owner_email"]))
+		rawStoragePath := strings.TrimSpace(stringValue(data["raw_storage_path"]))
+		if rawStoragePath == "" {
+			rawStoragePath = strings.TrimSpace(stringValue(data["storage_path"]))
+		}
+		if ownerEmail == "" || rawStoragePath == "" {
+			return nil
+		}
+		claimed = receiptJob{
+			ID:             ref.ID,
+			OwnerEmail:     ownerEmail,
+			RawStoragePath: rawStoragePath,
+		}
+		tx.Set(ref, map[string]interface{}{
+			"processing_status":                 "processing",
+			"processing_owner":                  s.workerID,
+			"processing_error":                  nil,
+			"processing_lease_expires_at":       now.Add(s.cfg.receiptWorkerLease),
+			"processing_started_at":             now,
+			"processing_attempts":               fs.Increment(1),
+			"image_processing_status":           "ready",
+			"image_processing_error":            nil,
+			"image_processing_owner":            nil,
+			"image_processing_lease_expires_at": nil,
+		}, fs.MergeAll)
+		return nil
+	})
+	if err != nil {
+		return receiptJob{}, false, err
+	}
+	if claimed.ID == "" {
+		return receiptJob{}, false, nil
+	}
+	return claimed, true, nil
+}
+
+func (s *apiServer) processClaimedReceiptJob(ctx context.Context, job receiptJob) {
+	log.Printf("receipt_worker_process_start receipt_id=%s", job.ID)
+	imageBytes, err := s.downloadImageBytes(ctx, job.RawStoragePath)
+	if err != nil {
+		s.markReceiptProcessingFailed(ctx, job.ID, err)
+		return
+	}
+	s.processOCRForJob(ctx, job, imageBytes)
+}
+
+func (s *apiServer) processOCRForJob(ctx context.Context, job receiptJob, imageBytes []byte) {
+	started := time.Now()
+	log.Printf("ocr_start receipt_id=%s owner=%s image_bytes=%d", job.ID, job.OwnerEmail, len(imageBytes))
+	categoryOptions, err := s.categoryNames(ctx, job.OwnerEmail)
+	if err != nil {
+		s.markReceiptProcessingFailed(ctx, job.ID, err)
+		return
+	}
+	log.Printf("ocr_categories_loaded receipt_id=%s categories=%d", job.ID, len(categoryOptions))
+	openAIStarted := time.Now()
+	ocrRes, err := s.extractReceiptOCR(ctx, imageBytes, categoryOptions)
+	if err != nil {
+		s.markReceiptProcessingFailed(ctx, job.ID, err)
+		return
+	}
+	log.Printf("ocr_openai_done receipt_id=%s latency_ms=%d text_len=%d items=%d", job.ID, time.Since(openAIStarted).Milliseconds(), len(ocrRes.Text), len(ocrRes.Items))
+
+	itemsPayload := ocrItemsToReceiptItems(ocrRes.Items)
+	validation := validateSubtotalAgainstItems(ocrRes.Subtotal, itemsPayload)
+	extractedFields := map[string]interface{}{
+		"model":       s.cfg.openAIModel,
+		"text_length": len(ocrRes.Text),
+		"ai_suggestions": map[string]interface{}{
+			"vendor":        ocrRes.Vendor,
+			"subtotal":      ocrRes.Subtotal,
+			"tax":           ocrRes.Tax,
+			"total":         ocrRes.Total,
+			"category":      ocrRes.Category,
+			"purchase_date": ocrRes.PurchaseDate,
+			"items":         itemsPayload,
+		},
+		"validation": validation.Info,
+	}
+	ocrReadyUpdate := map[string]interface{}{
+		"vendor":                            ocrRes.Vendor,
+		"subtotal":                          validation.Subtotal,
+		"tax":                               ocrRes.Tax,
+		"total":                             ocrRes.Total,
+		"category":                          ocrRes.Category,
+		"purchase_date":                     ocrRes.PurchaseDate,
+		"items":                             itemsPayload,
+		"extracted_text":                    ocrRes.Text,
+		"extracted_fields":                  extractedFields,
+		"processing_status":                 "ready",
+		"processing_owner":                  s.workerID,
+		"processing_error":                  nil,
+		"processing_lease_expires_at":       nil,
+		"processed_at":                      time.Now().UTC(),
+		"image_processing_status":           "ready",
+		"image_processing_error":            nil,
+		"image_processing_owner":            nil,
+		"image_processing_lease_expires_at": nil,
+	}
+	// Expose extracted data as soon as OCR completes.
+	if _, err := s.receipts.Doc(job.ID).Set(ctx, ocrReadyUpdate, fs.MergeAll); err != nil {
+		s.markReceiptProcessingFailed(ctx, job.ID, err)
+		return
+	}
+	imageBytes = nil
+	log.Printf("ocr_done receipt_id=%s latency_ms=%d", job.ID, time.Since(started).Milliseconds())
+}
+
+func (s *apiServer) downloadImageBytes(ctx context.Context, storagePath string) ([]byte, error) {
+	reader, err := s.bucket.Object(storagePath).NewReader(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	return io.ReadAll(reader)
+}
+
+func (s *apiServer) markReceiptProcessingFailed(ctx context.Context, receiptID string, err error) {
+	log.Printf("receipt processing failed receipt_id=%s err=%v", receiptID, err)
+	if _, updateErr := s.receipts.Doc(receiptID).Set(ctx, map[string]interface{}{
+		"processing_status":                 "failed",
+		"processing_owner":                  s.workerID,
+		"processing_error":                  err.Error(),
+		"processing_lease_expires_at":       nil,
+		"processed_at":                      time.Now().UTC(),
+		"image_processing_status":           "failed",
+		"image_processing_error":            err.Error(),
+		"image_processing_owner":            s.workerID,
+		"image_processing_lease_expires_at": nil,
+	}, fs.MergeAll); updateErr != nil {
+		log.Printf("failed to persist processing error receipt_id=%s err=%v", receiptID, updateErr)
+	}
 }
 
 func (s *apiServer) extractReceiptOCR(ctx context.Context, imageBytes []byte, categoryOptions []string) (ocrResult, error) {
@@ -875,18 +1058,22 @@ func validateSubtotalAgainstItems(subtotal *float64, items []map[string]interfac
 
 func receiptRecordFromMap(id string, payload map[string]interface{}) receiptRecord {
 	return receiptRecord{
-		ID:              id,
-		Vendor:          valueStringPtr(payload["vendor"]),
-		Subtotal:        existingFloatPtr(payload["subtotal"]),
-		Tax:             existingFloatPtr(payload["tax"]),
-		Total:           existingFloatPtr(payload["total"]),
-		Category:        valueStringPtr(payload["category"]),
-		PurchaseDate:    valueStringPtr(payload["purchase_date"]),
-		Items:           receiptItemsFromAny(payload["items"]),
-		ImageURL:        stringFromAny(payload["image_url"]),
-		ExtractedText:   stringFromAny(payload["extracted_text"]),
-		ExtractedFields: cloneMap(payload["extracted_fields"]),
-		CreatedAt:       timeFromAny(payload["created_at"]),
+		ID:                    id,
+		Vendor:                valueStringPtr(payload["vendor"]),
+		Subtotal:              existingFloatOrZeroPtr(payload["subtotal"]),
+		Tax:                   existingFloatOrZeroPtr(payload["tax"]),
+		Total:                 existingFloatOrZeroPtr(payload["total"]),
+		Category:              valueStringPtr(payload["category"]),
+		PurchaseDate:          valueStringPtr(payload["purchase_date"]),
+		Items:                 receiptItemsFromAny(payload["items"]),
+		ImageURL:              stringFromAny(payload["image_url"]),
+		ExtractedText:         stringFromAny(payload["extracted_text"]),
+		ExtractedFields:       cloneMap(payload["extracted_fields"]),
+		CreatedAt:             timeFromAny(payload["created_at"]),
+		ProcessingStatus:      fallbackString(payload["processing_status"], "ready"),
+		ProcessingError:       valueStringPtr(payload["processing_error"]),
+		ImageProcessingStatus: fallbackString(payload["image_processing_status"], "ready"),
+		ImageProcessingError:  valueStringPtr(payload["image_processing_error"]),
 	}
 }
 
@@ -898,8 +1085,8 @@ func receiptItemsFromAny(value interface{}) []receiptItem {
 			for _, item := range typed {
 				result = append(result, receiptItem{
 					Name:     stringFromAny(item["name"]),
-					Quantity: existingFloatPtr(item["quantity"]),
-					Price:    existingFloatPtr(item["price"]),
+					Quantity: existingFloatOrZeroPtr(item["quantity"]),
+					Price:    existingFloatOrZeroPtr(item["price"]),
 				})
 			}
 			return result
@@ -914,8 +1101,8 @@ func receiptItemsFromAny(value interface{}) []receiptItem {
 		}
 		result = append(result, receiptItem{
 			Name:     stringFromAny(item["name"]),
-			Quantity: existingFloatPtr(item["quantity"]),
-			Price:    existingFloatPtr(item["price"]),
+			Quantity: existingFloatOrZeroPtr(item["quantity"]),
+			Price:    existingFloatOrZeroPtr(item["price"]),
 		})
 	}
 	return result
@@ -999,6 +1186,15 @@ func normalizeAmount(value interface{}) *float64 {
 
 func existingFloatPtr(value interface{}) *float64 {
 	return normalizeAmount(value)
+}
+
+func existingFloatOrZeroPtr(value interface{}) *float64 {
+	parsed := normalizeAmount(value)
+	if parsed != nil {
+		return parsed
+	}
+	zero := 0.0
+	return &zero
 }
 
 func valueFloatPtr(value interface{}) *float64 {
@@ -1089,6 +1285,15 @@ func (s *apiServer) absoluteURL(request *http.Request, path string) string {
 }
 
 func (s *apiServer) writeErr(writer http.ResponseWriter, err error) {
+	var helcimErr helcimHTTPError
+	if errors.As(err, &helcimErr) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(helcimErr.status)
+		if encodeErr := json.NewEncoder(writer).Encode(map[string]interface{}{"detail": helcimErr.detail}); encodeErr != nil {
+			log.Printf("failed to encode JSON response: %v", encodeErr)
+		}
+		return
+	}
 	var httpErr httpError
 	if errors.As(err, &httpErr) {
 		writeJSONError(writer, httpErr.status, httpErr.detail)

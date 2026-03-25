@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,6 +35,8 @@ type config struct {
 	oauthAllowedDomain  []string
 	allowedOrigins      []string
 	allowedOriginRegex  *regexp.Regexp
+	receiptWorkerPoll   time.Duration
+	receiptWorkerLease  time.Duration
 }
 
 type verifiedUser struct {
@@ -65,6 +68,8 @@ type apiServer struct {
 	users      *fs.CollectionRef
 	bucket     *storage.BucketHandle
 	httpServer *http.Server
+	workerID   string
+	workerStop chan struct{}
 }
 
 func main() {
@@ -78,6 +83,7 @@ func main() {
 		log.Fatalf("failed to initialize API server: %v", err)
 	}
 	defer server.close()
+	server.startReceiptWorker()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", server.handleHealthz)
@@ -118,6 +124,8 @@ func loadConfig() (config, error) {
 		oauthClientIDs:      normalizeListField(os.Getenv("OAUTH_CLIENT_ID")),
 		oauthAllowedDomain:  normalizeListField(os.Getenv("OAUTH_ALLOWED_DOMAINS")),
 		allowedOrigins:      normalizeListField(envOrDefault("ALLOWED_ORIGINS", "http://localhost:3000")),
+		receiptWorkerPoll:   time.Duration(parseIntDefault("RECEIPT_WORKER_POLL_SECONDS", 5)) * time.Second,
+		receiptWorkerLease:  time.Duration(parseIntDefault("RECEIPT_WORKER_LEASE_SECONDS", 1200)) * time.Second,
 	}
 	if len(cfg.allowedOrigins) == 0 {
 		cfg.allowedOrigins = []string{"http://localhost:3000"}
@@ -154,6 +162,8 @@ func newAPIServer(cfg config) (*apiServer, error) {
 		plans:      client.Collection(cfg.plansCollection),
 		users:      client.Collection(cfg.usersCollection),
 		bucket:     storageClient.Bucket(cfg.gcsBucketName),
+		workerID:   buildWorkerID(),
+		workerStop: make(chan struct{}),
 	}, nil
 }
 
@@ -163,6 +173,7 @@ func (s *apiServer) close() {
 		defer cancel()
 		_ = s.httpServer.Shutdown(ctx)
 	}
+	close(s.workerStop)
 	if s.firestore != nil {
 		_ = s.firestore.Close()
 	}
@@ -529,6 +540,33 @@ func parseBool(value string) bool {
 	default:
 		return false
 	}
+}
+
+func parseIntDefault(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
+}
+
+func buildWorkerID() string {
+	revision := strings.TrimSpace(os.Getenv("K_REVISION"))
+	instance := strings.TrimSpace(os.Getenv("HOSTNAME"))
+	if revision == "" && instance == "" {
+		return "local-worker"
+	}
+	if revision == "" {
+		return instance
+	}
+	if instance == "" {
+		return revision
+	}
+	return revision + "/" + instance
 }
 
 func firebasePreviewOriginPattern(origin string) string {

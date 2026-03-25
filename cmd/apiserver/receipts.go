@@ -242,10 +242,12 @@ func (s *apiServer) createReceipt(writer http.ResponseWriter, request *http.Requ
 		"extracted_fields":                  map[string]interface{}{},
 		"created_at":                        now,
 		"owner_email":                       ownerEmail,
-		"processing_status":                 "queued",
-		"processing_owner":                  nil,
-		"processing_lease_expires_at":       nil,
+		"processing_status":                 "processing",
+		"processing_owner":                  s.workerID,
+		"processing_lease_expires_at":       time.Now().UTC().Add(s.cfg.receiptWorkerLease),
 		"processing_error":                  nil,
+		"processing_started_at":             time.Now().UTC(),
+		"processing_attempts":               1,
 		"image_processing_status":           "queued",
 		"image_processing_error":            nil,
 		"image_processing_owner":            nil,
@@ -256,7 +258,12 @@ func (s *apiServer) createReceipt(writer http.ResponseWriter, request *http.Requ
 		s.writeErr(writer, err)
 		return
 	}
-	s.wakeReceiptWorker()
+	job := receiptJob{
+		ID:             docRef.ID,
+		OwnerEmail:     ownerEmail,
+		RawStoragePath: rawStoragePath,
+	}
+	go s.processOCRForJob(context.Background(), job, imageBytes)
 	writeJSON(writer, http.StatusAccepted, receiptRecordFromMap(docRef.ID, payload))
 }
 
@@ -612,7 +619,7 @@ func (s *apiServer) wakeReceiptWorker() {
 
 func (s *apiServer) claimNextReceiptJob(ctx context.Context) (receiptJob, bool, error) {
 	now := time.Now().UTC()
-	queued, err := s.receipts.Where("processing_status", "==", "queued").OrderBy("created_at", fs.Asc).Limit(10).Documents(ctx).GetAll()
+	queued, err := s.receipts.Where("processing_status", "==", "queued").Limit(25).Documents(ctx).GetAll()
 	if err != nil {
 		return receiptJob{}, false, err
 	}
@@ -626,7 +633,7 @@ func (s *apiServer) claimNextReceiptJob(ctx context.Context) (receiptJob, bool, 
 		}
 	}
 
-	stale, err := s.receipts.Where("processing_status", "==", "processing").Where("processing_lease_expires_at", "<", now).Limit(10).Documents(ctx).GetAll()
+	stale, err := s.receipts.Where("processing_status", "==", "processing").Limit(25).Documents(ctx).GetAll()
 	if err != nil {
 		return receiptJob{}, false, err
 	}
@@ -639,7 +646,7 @@ func (s *apiServer) claimNextReceiptJob(ctx context.Context) (receiptJob, bool, 
 			return job, true, nil
 		}
 	}
-	queuedImage, err := s.receipts.Where("processing_status", "==", "ready").Where("image_processing_status", "==", "queued").OrderBy("processed_at", fs.Asc).Limit(10).Documents(ctx).GetAll()
+	queuedImage, err := s.receipts.Where("processing_status", "==", "ready").Limit(25).Documents(ctx).GetAll()
 	if err != nil {
 		return receiptJob{}, false, err
 	}
@@ -653,19 +660,6 @@ func (s *apiServer) claimNextReceiptJob(ctx context.Context) (receiptJob, bool, 
 		}
 	}
 
-	staleImage, err := s.receipts.Where("processing_status", "==", "ready").Where("image_processing_status", "==", "processing").Where("image_processing_lease_expires_at", "<", now).Limit(10).Documents(ctx).GetAll()
-	if err != nil {
-		return receiptJob{}, false, err
-	}
-	for _, snapshot := range staleImage {
-		job, ok, err := s.tryClaimImageJob(ctx, snapshot.Ref, now)
-		if err != nil {
-			return receiptJob{}, false, err
-		}
-		if ok {
-			return job, true, nil
-		}
-	}
 	return receiptJob{}, false, nil
 }
 
@@ -779,6 +773,10 @@ func (s *apiServer) processClaimedReceiptJob(ctx context.Context, job receiptJob
 		s.markReceiptProcessingFailed(ctx, job.ID, err)
 		return
 	}
+	s.processOCRForJob(ctx, job, imageBytes)
+}
+
+func (s *apiServer) processOCRForJob(ctx context.Context, job receiptJob, imageBytes []byte) {
 	categoryOptions, err := s.categoryNames(ctx, job.OwnerEmail)
 	if err != nil {
 		s.markReceiptProcessingFailed(ctx, job.ID, err)
@@ -832,6 +830,7 @@ func (s *apiServer) processClaimedReceiptJob(ctx context.Context, job receiptJob
 		return
 	}
 	imageBytes = nil
+	s.wakeReceiptWorker()
 }
 
 func (s *apiServer) finishImageProcessing(ctx context.Context, job receiptJob) {

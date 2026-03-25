@@ -203,12 +203,20 @@ def activate_subscription_with_saved_method(
             status_code=400,
             detail="No saved Helcim customer or card token available for this user",
         )
+    if not customer_code:
+        raise HTTPException(
+            status_code=400,
+            detail="Saved payment method is missing Helcim customer code",
+        )
 
-    request_payload: Dict[str, Any] = {"paymentPlanId": payment_plan_id}
-    if customer_code:
-        request_payload["customerCode"] = customer_code
-    if card_token:
-        request_payload["cardToken"] = card_token
+    request_payload: Dict[str, Any] = {
+        "paymentPlanId": payment_plan_id,
+        "customerCode": customer_code,
+        "activationDate": datetime.utcnow().date().isoformat(),
+    }
+    payment_method = str(plan.get("paymentMethod", "")).strip().lower()
+    if payment_method:
+        request_payload["paymentMethod"] = payment_method
     idempotency_key = str(uuid.uuid4())
     subscription_response = helcim_client.create_subscriptions(
         request_payload, idempotency_key=idempotency_key

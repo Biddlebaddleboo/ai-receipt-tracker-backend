@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-import re
 from typing import Any, Dict, Optional
 
 import logging
@@ -78,17 +77,24 @@ class SubscriptionService:
         payload: Dict[str, Any],
     ) -> str:
         now = datetime.utcnow()
-        plan_id = self._resolve_plan_from_payment(payload.get("paymentPlanId"))
+        subscription_entry = self._flatten_subscription_payload(payload)
+        plan_id = self._resolve_plan_from_payment(
+            subscription_entry.get("paymentPlanId")
+        )
         plan = self._get_plan(plan_id)
         interval = self._plan_interval(plan)
-        start = self._parse_date(payload.get("dateActivated")) or now
+        start = self._parse_date(subscription_entry.get("dateActivated")) or now
         billing_date = self._parse_date(payload.get("dateBilling"))
         end = None
         if interval == "month":
             end = billing_date or (start + timedelta(days=30))
+        plan_name = str(plan.get("name") or plan.get("plan_id") or "").strip()
+        helcim_payment_plan_id = self._coerce_int(plan.get("payment_plan_id"))
         update_data: Dict[str, Any] = {
             OWNER_FIELD: owner_email,
-            "plan_id": plan["plan_id"],
+            "plan_id": plan_name or plan.get("plan_id"),
+            "plan_doc_id": plan.get("plan_id"),
+            "helcim_payment_plan_id": helcim_payment_plan_id,
             "subscription_status": payload.get("status", "active"),
             "plan_interval": interval,
             "plan_price_cents": self._coerce_int(plan.get("price_cents")),
@@ -107,6 +113,44 @@ class SubscriptionService:
             payload.get("paymentPlanId"),
         )
         return plan["plan_id"]
+
+    def get_user_doc(self, owner_email: str) -> Dict[str, Any]:
+        _, user_doc = self._find_or_choose_user_doc(owner_email)
+        return user_doc or {}
+
+    def resolve_activation_plan(
+        self, plan_id: Optional[str], payment_plan_id: Optional[int]
+    ) -> Optional[Dict[str, Any]]:
+        if payment_plan_id is not None:
+            plan = self._find_plan_by_payment_plan_id(payment_plan_id)
+            if plan:
+                return plan
+        if plan_id:
+            plan = (
+                self._find_plan_by_document_id(plan_id)
+                or self._find_plan_by_plan_id_field(plan_id)
+                or self._find_plan_by_name(plan_id)
+            )
+            if plan:
+                return plan
+        return None
+
+    def plan_payment_plan_id(self, plan: Dict[str, Any]) -> Optional[int]:
+        return self._coerce_int(plan.get("payment_plan_id"))
+
+    def plan_price_cents(self, plan: Dict[str, Any]) -> Optional[int]:
+        return self._coerce_int(plan.get("price_cents"))
+
+    @staticmethod
+    def _flatten_subscription_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+        data = payload.get("data")
+        if isinstance(data, dict):
+            return data
+        if isinstance(data, list) and data:
+            first = data[0]
+            if isinstance(first, dict):
+                return first
+        return payload
 
     def find_plan_by_payment_plan_id(self, payment_plan_id: Optional[Any]) -> Optional[Dict[str, Any]]:
         coerced_payment_plan_id = self._coerce_int(payment_plan_id)
@@ -152,6 +196,45 @@ class SubscriptionService:
             normalized,
         )
 
+    def store_payment_method_registration(
+        self,
+        owner_email: str,
+        customer_code: Optional[str],
+        card_token: Optional[str],
+        transaction_id: Optional[int],
+        approved_at: Optional[datetime],
+    ) -> None:
+        normalized_email = str(owner_email).strip().lower()
+        if not normalized_email:
+            raise HTTPException(status_code=400, detail="owner email is required")
+        update_data: Dict[str, Any] = {
+            OWNER_FIELD: normalized_email,
+            "payment_method_ready": True,
+            "payment_method_status": "verified",
+            "payment_method_updated_at": datetime.utcnow(),
+        }
+        normalized_customer_code = str(customer_code or "").strip()
+        if normalized_customer_code:
+            update_data["helcim_customer_code"] = normalized_customer_code
+            update_data["customer_code_updated_at"] = datetime.utcnow()
+        normalized_card_token = str(card_token or "").strip()
+        if normalized_card_token:
+            update_data["helcim_card_token"] = normalized_card_token
+        if transaction_id is not None:
+            update_data["last_transaction_id"] = transaction_id
+        if approved_at is not None:
+            update_data["payment_method_verified_at"] = approved_at
+        user_doc_ref = self._get_or_create_user_ref(normalized_email)
+        user_doc_ref.set(update_data, merge=True)
+        logger.info(
+            "store_payment_method_registration owner=%s doc_id=%s customer_code=%s has_card_token=%s transaction_id=%s",
+            normalized_email,
+            user_doc_ref.id,
+            normalized_customer_code or None,
+            bool(normalized_card_token),
+            transaction_id,
+        )
+
     def activate_plan_from_transaction(
         self,
         owner_email: str,
@@ -187,49 +270,6 @@ class SubscriptionService:
             transaction_id,
         )
         return {"owner_email": owner_email, "plan_id": plan["plan_id"]}
-
-    def resolve_plan_for_approved_transaction(
-        self,
-        callback_payload: Dict[str, Any],
-        transaction_payload: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        payment_plan_id = (
-            callback_payload.get("paymentPlanId")
-            or transaction_payload.get("paymentPlanId")
-            or transaction_payload.get("paymentPlanID")
-        )
-        plan = self.find_plan_by_payment_plan_id(payment_plan_id)
-        if plan:
-            return plan
-
-        invoice_number = (
-            callback_payload.get("invoiceNumber")
-            or transaction_payload.get("invoiceNumber")
-            or ""
-        )
-        plan_from_invoice = self._find_plan_by_invoice_number(str(invoice_number))
-        if plan_from_invoice:
-            return plan_from_invoice
-
-        amount_cents = self._transaction_amount_cents(transaction_payload)
-        if amount_cents is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Unable to determine purchased plan: no paymentPlanId, invoiceNumber, or amount",
-            )
-        currency = transaction_payload.get("currency")
-        matched = self._find_plans_by_price_cents(amount_cents, currency)
-        if not matched:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unable to map transaction amount {amount_cents} cents to a plan",
-            )
-        if len(matched) > 1:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Ambiguous plan mapping for amount {amount_cents} cents; multiple plans match",
-            )
-        return matched[0]
 
     def _resolve_plan_from_payment(self, payment_plan_id: Optional[Any]) -> str:
         coerced_payment_plan_id = self._coerce_int(payment_plan_id)
@@ -290,55 +330,6 @@ class SubscriptionService:
             data["plan_id"] = snapshot.id
             plans.append(data)
         return plans
-
-    def _find_plans_by_price_cents(
-        self, price_cents: int, currency: Optional[Any]
-    ) -> list[Dict[str, Any]]:
-        normalized_currency = None
-        if currency is not None:
-            text = str(currency).strip().upper()
-            if text:
-                normalized_currency = text
-        matches: list[Dict[str, Any]] = []
-        for plan in self._all_plans():
-            plan_price = self._coerce_int(plan.get("price_cents"))
-            if plan_price is None or plan_price != price_cents:
-                continue
-            plan_currency = plan.get("currency")
-            if normalized_currency and plan_currency:
-                if str(plan_currency).strip().upper() != normalized_currency:
-                    continue
-            matches.append(plan)
-        return matches
-
-    def _find_plan_by_invoice_number(self, invoice_number: str) -> Optional[Dict[str, Any]]:
-        text = invoice_number.strip()
-        if not text:
-            return None
-        # Supported markers:
-        # PLAN:<plan_id>
-        # plan_id=<plan_id>
-        # plan-<plan_id>
-        candidates: list[str] = []
-        if text.upper().startswith("PLAN:"):
-            candidates.append(text.split(":", 1)[1].strip())
-        match = re.search(r"plan[_-]?id=([a-zA-Z0-9_-]+)", text, flags=re.IGNORECASE)
-        if match:
-            candidates.append(match.group(1).strip())
-        match = re.search(r"plan-([a-zA-Z0-9_-]+)", text, flags=re.IGNORECASE)
-        if match:
-            candidates.append(match.group(1).strip())
-
-        if not candidates:
-            return None
-        candidate_set = {c for c in candidates if c}
-        if not candidate_set:
-            return None
-        for plan in self._all_plans():
-            plan_id = str(plan.get("plan_id", "")).strip()
-            if plan_id in candidate_set:
-                return plan
-        return None
 
     def _get_or_create_user(self, owner_email: str, now: datetime):
         user_doc_ref, user_doc = self._find_or_choose_user_doc(owner_email)

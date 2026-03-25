@@ -705,10 +705,18 @@ func containsFold(values []string, candidate string) bool {
 }
 
 func (s *apiServer) handleBillingProxy(writer http.ResponseWriter, request *http.Request) {
+	if isPublicBillingCallback(request.URL.Path) {
+		s.proxy.ServeHTTP(writer, request)
+		return
+	}
 	user, ok := s.authenticateRequest(writer, request)
 	if !ok {
 		return
 	}
 	request.Header.Set("X-Go-Authenticated-Email", user.Email)
 	s.proxy.ServeHTTP(writer, request)
+}
+
+func isPublicBillingCallback(path string) bool {
+	return path == "/billing/helcim/approval"
 }

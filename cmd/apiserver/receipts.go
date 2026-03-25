@@ -16,8 +16,6 @@ import (
 	"log"
 	"math"
 	"net/http"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -252,7 +250,7 @@ func (s *apiServer) createReceipt(writer http.ResponseWriter, request *http.Requ
 		"processing_error":                  nil,
 		"processing_started_at":             time.Now().UTC(),
 		"processing_attempts":               1,
-		"image_processing_status":           "queued",
+		"image_processing_status":           "ready",
 		"image_processing_error":            nil,
 		"image_processing_owner":            nil,
 		"image_processing_lease_expires_at": nil,
@@ -262,7 +260,7 @@ func (s *apiServer) createReceipt(writer http.ResponseWriter, request *http.Requ
 		s.writeErr(writer, err)
 		return
 	}
-	// Nudge the background worker immediately so AVIF can start as a low-priority task.
+	// Nudge the background worker immediately so OCR can start quickly.
 	s.wakeReceiptWorker()
 	job := receiptJob{
 		ID:             docRef.ID,
@@ -443,13 +441,7 @@ func (s *apiServer) deleteReceipt(writer http.ResponseWriter, request *http.Requ
 		}
 	}
 	if rawStoragePath != "" {
-		avifDestination := rawStoragePath + ".avif"
-		if err := s.deleteObjectsByPrefix(request.Context(), avifDestination+".part."); err != nil {
-			log.Printf("failed to delete avif part objects prefix=%s err=%v", avifDestination+".part.", err)
-		}
-		if err := s.deleteObjectsByPrefix(request.Context(), avifDestination+".compose."); err != nil {
-			log.Printf("failed to delete avif compose objects prefix=%s err=%v", avifDestination+".compose.", err)
-		}
+		// No AVIF side objects are generated anymore.
 	}
 	writer.WriteHeader(http.StatusNoContent)
 }
@@ -553,253 +545,6 @@ func (s *apiServer) categoryNames(ctx context.Context, ownerEmail string) ([]str
 	return names, nil
 }
 
-func (s *apiServer) convertAndUploadAVIFFromStorage(ctx context.Context, sourcePath string, destination string) error {
-	if _, err := s.bucket.Object(destination).Attrs(ctx); err == nil {
-		return nil
-	} else if !errors.Is(err, gcs.ErrObjectNotExist) {
-		return fmt.Errorf("failed checking destination image: %w", err)
-	}
-	return s.convertAndUploadAVIFWithFFmpeg(ctx, sourcePath, destination)
-}
-
-func (s *apiServer) convertAndUploadAVIFWithFFmpeg(ctx context.Context, sourcePath string, destination string) error {
-	started := time.Now()
-	ffmpegPath, err := exec.LookPath("ffmpeg")
-	if err != nil {
-		return fmt.Errorf("ffmpeg not available: %w", err)
-	}
-	inputFile, err := os.CreateTemp("", "receipt-avif-input-*")
-	if err != nil {
-		return fmt.Errorf("failed creating ffmpeg input temp file: %w", err)
-	}
-	inputPath := inputFile.Name()
-	_ = inputFile.Close()
-	defer os.Remove(inputPath)
-
-	outputFile, err := os.CreateTemp("", "receipt-avif-output-*.avif")
-	if err != nil {
-		return fmt.Errorf("failed creating ffmpeg output temp file: %w", err)
-	}
-	outputPath := outputFile.Name()
-	_ = outputFile.Close()
-	defer os.Remove(outputPath)
-
-	reader, err := s.bucket.Object(sourcePath).NewReader(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to read source image: %w", err)
-	}
-	if err := func() error {
-		defer reader.Close()
-		dst, createErr := os.Create(inputPath)
-		if createErr != nil {
-			return createErr
-		}
-		defer dst.Close()
-		_, copyErr := io.Copy(dst, reader)
-		return copyErr
-	}(); err != nil {
-		return fmt.Errorf("failed staging source image: %w", err)
-	}
-
-	cmd := exec.CommandContext(
-		ctx,
-		ffmpegPath,
-		"-y",
-		"-hide_banner",
-		"-loglevel", "error",
-		"-threads", "1",
-		"-i", inputPath,
-		"-c:v", "libsvtav1",
-		"-preset", "12",
-		"-crf", "45",
-		"-svtav1-params", "tune=0",
-		outputPath,
-	)
-	log.Printf("ffmpeg_encode_start source=%s destination=%s cmd=%q", sourcePath, destination, strings.Join(cmd.Args, " "))
-	if output, runErr := cmd.CombinedOutput(); runErr != nil {
-		return fmt.Errorf("ffmpeg svt-av1 failed: %v (%s)", runErr, strings.TrimSpace(string(output)))
-	}
-	log.Printf("ffmpeg_encode_done source=%s destination=%s latency_ms=%d", sourcePath, destination, time.Since(started).Milliseconds())
-
-	avifFile, err := os.Open(outputPath)
-	if err != nil {
-		return fmt.Errorf("failed reading ffmpeg output: %w", err)
-	}
-	defer avifFile.Close()
-	objWriter := s.bucket.Object(destination).NewWriter(ctx)
-	objWriter.ContentType = "image/avif"
-	if _, err := io.Copy(objWriter, avifFile); err != nil {
-		_ = objWriter.Close()
-		return fmt.Errorf("failed uploading ffmpeg avif: %w", err)
-	}
-	if err := objWriter.Close(); err != nil {
-		return fmt.Errorf("failed finalizing ffmpeg avif upload: %w", err)
-	}
-	log.Printf("ffmpeg_upload_done source=%s destination=%s total_ms=%d", sourcePath, destination, time.Since(started).Milliseconds())
-	return nil
-}
-
-func (s *apiServer) loadAVIFPartState(ctx context.Context, partPrefix string) ([]string, int64, int, error) {
-	iter := s.bucket.Objects(ctx, &gcs.Query{Prefix: partPrefix})
-	partNamesByIndex := map[int]string{}
-	partSizeByIndex := map[int]int64{}
-	for {
-		attrs, err := iter.Next()
-		if errors.Is(err, iterator.Done) {
-			break
-		}
-		if err != nil {
-			return nil, 0, 0, fmt.Errorf("failed listing avif parts: %w", err)
-		}
-		suffix := strings.TrimPrefix(attrs.Name, partPrefix)
-		index, parseErr := strconv.Atoi(suffix)
-		if parseErr != nil || index < 0 {
-			continue
-		}
-		partNamesByIndex[index] = attrs.Name
-		partSizeByIndex[index] = attrs.Size
-	}
-
-	resumeParts := make([]string, 0)
-	var resumeBytes int64
-	nextIndex := 0
-	for {
-		name, ok := partNamesByIndex[nextIndex]
-		if !ok {
-			break
-		}
-		resumeParts = append(resumeParts, name)
-		resumeBytes += partSizeByIndex[nextIndex]
-		nextIndex++
-	}
-	return resumeParts, resumeBytes, nextIndex, nil
-}
-
-func (s *apiServer) uploadAVIFParts(ctx context.Context, encoded io.Reader, partPrefix string, startIndex int) ([]string, error) {
-	const chunkSize = 8 << 20
-	uploadedParts := make([]string, 0)
-	buffer := make([]byte, chunkSize)
-	partIndex := startIndex
-	for {
-		n, readErr := io.ReadFull(encoded, buffer)
-		if errors.Is(readErr, io.EOF) {
-			break
-		}
-		if errors.Is(readErr, io.ErrUnexpectedEOF) {
-			// n bytes are valid and should be uploaded as the final chunk.
-		} else if readErr != nil {
-			return uploadedParts, fmt.Errorf("failed reading avif stream: %w", readErr)
-		}
-		if n > 0 {
-			partName := fmt.Sprintf("%s%06d", partPrefix, partIndex)
-			objWriter := s.bucket.Object(partName).NewWriter(ctx)
-			objWriter.ContentType = "application/octet-stream"
-			if _, err := io.Copy(objWriter, bytes.NewReader(buffer[:n])); err != nil {
-				_ = objWriter.Close()
-				return uploadedParts, fmt.Errorf("failed writing avif part %s: %w", partName, err)
-			}
-			if err := objWriter.Close(); err != nil {
-				return uploadedParts, fmt.Errorf("failed finalizing avif part %s: %w", partName, err)
-			}
-			uploadedParts = append(uploadedParts, partName)
-			partIndex++
-		}
-		if errors.Is(readErr, io.ErrUnexpectedEOF) {
-			break
-		}
-	}
-	return uploadedParts, nil
-}
-
-func (s *apiServer) composeObjects(ctx context.Context, sourceObjects []string, destination string) error {
-	if len(sourceObjects) == 0 {
-		return fmt.Errorf("compose called with no source objects")
-	}
-	current := append([]string(nil), sourceObjects...)
-	tmpNames := make([]string, 0)
-	batchCounter := 0
-	for len(current) > 32 {
-		next := make([]string, 0, (len(current)+31)/32)
-		for i := 0; i < len(current); i += 32 {
-			end := i + 32
-			if end > len(current) {
-				end = len(current)
-			}
-			tmpName := fmt.Sprintf("%s.compose.%d.%d", destination, time.Now().UnixNano(), batchCounter)
-			if err := s.composeBatch(ctx, current[i:end], tmpName, "application/octet-stream"); err != nil {
-				return err
-			}
-			tmpNames = append(tmpNames, tmpName)
-			next = append(next, tmpName)
-			batchCounter++
-		}
-		current = next
-	}
-	if err := s.composeBatch(ctx, current, destination, "image/avif"); err != nil {
-		return err
-	}
-	if len(tmpNames) > 0 {
-		if err := s.deleteObjects(ctx, tmpNames); err != nil {
-			log.Printf("failed to cleanup temporary compose objects destination=%s err=%v", destination, err)
-		}
-	}
-	return nil
-}
-
-func (s *apiServer) composeBatch(ctx context.Context, sourceObjects []string, destination string, contentType string) error {
-	sources := make([]*gcs.ObjectHandle, 0, len(sourceObjects))
-	for _, name := range sourceObjects {
-		sources = append(sources, s.bucket.Object(name))
-	}
-	composer := s.bucket.Object(destination).ComposerFrom(sources...)
-	composer.ContentType = contentType
-	if _, err := composer.Run(ctx); err != nil {
-		return fmt.Errorf("compose failed destination=%s: %w", destination, err)
-	}
-	return nil
-}
-
-func (s *apiServer) deleteObjects(ctx context.Context, objectNames []string) error {
-	var firstErr error
-	for _, name := range objectNames {
-		if strings.TrimSpace(name) == "" {
-			continue
-		}
-		if err := s.bucket.Object(name).Delete(ctx); err != nil && !errors.Is(err, gcs.ErrObjectNotExist) {
-			if firstErr == nil {
-				firstErr = err
-			}
-		}
-	}
-	return firstErr
-}
-
-func (s *apiServer) deleteObjectsByPrefix(ctx context.Context, prefix string) error {
-	if strings.TrimSpace(prefix) == "" {
-		return nil
-	}
-	iter := s.bucket.Objects(ctx, &gcs.Query{Prefix: prefix})
-	var firstErr error
-	for {
-		attrs, err := iter.Next()
-		if errors.Is(err, iterator.Done) {
-			break
-		}
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			break
-		}
-		if delErr := s.bucket.Object(attrs.Name).Delete(ctx); delErr != nil && !errors.Is(delErr, gcs.ErrObjectNotExist) {
-			if firstErr == nil {
-				firstErr = delErr
-			}
-		}
-	}
-	return firstErr
-}
-
 func (s *apiServer) uploadRawImage(ctx context.Context, data []byte, destination string, contentType string) error {
 	objWriter := s.bucket.Object(destination).NewWriter(ctx)
 	if strings.TrimSpace(contentType) == "" {
@@ -820,7 +565,6 @@ type receiptJob struct {
 	ID             string
 	OwnerEmail     string
 	RawStoragePath string
-	ImageOnly      bool
 }
 
 func (s *apiServer) startReceiptWorker() {
@@ -843,7 +587,7 @@ func (s *apiServer) startReceiptWorker() {
 				if !ok {
 					break
 				}
-				log.Printf("receipt_worker_claimed id=%s receipt_id=%s image_only=%t owner=%s", s.workerID, job.ID, job.ImageOnly, job.OwnerEmail)
+				log.Printf("receipt_worker_claimed id=%s receipt_id=%s owner=%s", s.workerID, job.ID, job.OwnerEmail)
 				s.processClaimedReceiptJob(context.Background(), job)
 			}
 			select {
@@ -892,20 +636,6 @@ func (s *apiServer) claimNextReceiptJob(ctx context.Context) (receiptJob, bool, 
 			return job, true, nil
 		}
 	}
-	queuedImage, err := s.receipts.Where("processing_status", "==", "ready").Limit(25).Documents(ctx).GetAll()
-	if err != nil {
-		return receiptJob{}, false, err
-	}
-	for _, snapshot := range queuedImage {
-		job, ok, err := s.tryClaimImageJob(ctx, snapshot.Ref, now)
-		if err != nil {
-			return receiptJob{}, false, err
-		}
-		if ok {
-			return job, true, nil
-		}
-	}
-
 	return receiptJob{}, false, nil
 }
 
@@ -942,7 +672,7 @@ func (s *apiServer) tryClaimReceiptJob(ctx context.Context, ref *fs.DocumentRef,
 			"processing_lease_expires_at":       now.Add(s.cfg.receiptWorkerLease),
 			"processing_started_at":             now,
 			"processing_attempts":               fs.Increment(1),
-			"image_processing_status":           "queued",
+			"image_processing_status":           "ready",
 			"image_processing_error":            nil,
 			"image_processing_owner":            nil,
 			"image_processing_lease_expires_at": nil,
@@ -958,64 +688,8 @@ func (s *apiServer) tryClaimReceiptJob(ctx context.Context, ref *fs.DocumentRef,
 	return claimed, true, nil
 }
 
-func (s *apiServer) tryClaimImageJob(ctx context.Context, ref *fs.DocumentRef, now time.Time) (receiptJob, bool, error) {
-	var claimed receiptJob
-	err := s.firestore.RunTransaction(ctx, func(ctx context.Context, tx *fs.Transaction) error {
-		snapshot, err := tx.Get(ref)
-		if err != nil || !snapshot.Exists() {
-			return err
-		}
-		data := snapshot.Data()
-		processingStatus := fallbackString(data["processing_status"], "")
-		if processingStatus != "queued" && processingStatus != "processing" && processingStatus != "ready" {
-			return nil
-		}
-		imageStatus := fallbackString(data["image_processing_status"], "")
-		if imageStatus == "processing" {
-			lease := timeValue(data["image_processing_lease_expires_at"])
-			if lease != nil && lease.After(now) {
-				return nil
-			}
-		} else if imageStatus != "queued" {
-			return nil
-		}
-		ownerEmail := strings.TrimSpace(stringValue(data["owner_email"]))
-		rawStoragePath := strings.TrimSpace(stringValue(data["raw_storage_path"]))
-		if rawStoragePath == "" {
-			rawStoragePath = strings.TrimSpace(stringValue(data["storage_path"]))
-		}
-		if ownerEmail == "" || rawStoragePath == "" {
-			return nil
-		}
-		claimed = receiptJob{
-			ID:             ref.ID,
-			OwnerEmail:     ownerEmail,
-			RawStoragePath: rawStoragePath,
-			ImageOnly:      true,
-		}
-		tx.Set(ref, map[string]interface{}{
-			"image_processing_status":           "processing",
-			"image_processing_owner":            s.workerID,
-			"image_processing_lease_expires_at": now.Add(s.cfg.receiptWorkerLease),
-			"image_processing_error":            nil,
-		}, fs.MergeAll)
-		return nil
-	})
-	if err != nil {
-		return receiptJob{}, false, err
-	}
-	if claimed.ID == "" {
-		return receiptJob{}, false, nil
-	}
-	return claimed, true, nil
-}
-
 func (s *apiServer) processClaimedReceiptJob(ctx context.Context, job receiptJob) {
-	log.Printf("receipt_worker_process_start receipt_id=%s image_only=%t", job.ID, job.ImageOnly)
-	if job.ImageOnly {
-		s.finishImageProcessing(ctx, job)
-		return
-	}
+	log.Printf("receipt_worker_process_start receipt_id=%s", job.ID)
 	imageBytes, err := s.downloadImageBytes(ctx, job.RawStoragePath)
 	if err != nil {
 		s.markReceiptProcessingFailed(ctx, job.ID, err)
@@ -1072,7 +746,7 @@ func (s *apiServer) processOCRForJob(ctx context.Context, job receiptJob, imageB
 		"processing_error":                  nil,
 		"processing_lease_expires_at":       nil,
 		"processed_at":                      time.Now().UTC(),
-		"image_processing_status":           "queued",
+		"image_processing_status":           "ready",
 		"image_processing_error":            nil,
 		"image_processing_owner":            nil,
 		"image_processing_lease_expires_at": nil,
@@ -1084,58 +758,6 @@ func (s *apiServer) processOCRForJob(ctx context.Context, job receiptJob, imageB
 	}
 	imageBytes = nil
 	log.Printf("ocr_done receipt_id=%s latency_ms=%d", job.ID, time.Since(started).Milliseconds())
-	s.wakeReceiptWorker()
-}
-
-func (s *apiServer) finishImageProcessing(ctx context.Context, job receiptJob) {
-	started := time.Now()
-	if s.cfg.avifSkipBelowBytes > 0 {
-		if attrs, err := s.bucket.Object(job.RawStoragePath).Attrs(ctx); err == nil && attrs.Size > 0 && attrs.Size <= s.cfg.avifSkipBelowBytes {
-			log.Printf("avif_skipped_small receipt_id=%s raw_path=%s size=%d threshold=%d", job.ID, job.RawStoragePath, attrs.Size, s.cfg.avifSkipBelowBytes)
-			if _, err := s.receipts.Doc(job.ID).Set(ctx, map[string]interface{}{
-				"storage_path":                      job.RawStoragePath,
-				"image_processing_status":           "ready",
-				"image_processing_error":            nil,
-				"image_processing_owner":            s.workerID,
-				"image_processing_lease_expires_at": nil,
-			}, fs.MergeAll); err != nil {
-				log.Printf("failed to persist skipped AVIF receipt_id=%s err=%v", job.ID, err)
-			}
-			return
-		}
-	}
-	avifPath := job.RawStoragePath + ".avif"
-	log.Printf("avif_start receipt_id=%s raw_path=%s avif_path=%s", job.ID, job.RawStoragePath, avifPath)
-	if err := s.convertAndUploadAVIFFromStorage(ctx, job.RawStoragePath, avifPath); err != nil {
-		s.markImageProcessingFailed(ctx, job.ID, err)
-		return
-	}
-	if _, err := s.receipts.Doc(job.ID).Set(ctx, map[string]interface{}{
-		"storage_path":                      avifPath,
-		"image_processing_status":           "ready",
-		"image_processing_error":            nil,
-		"image_processing_owner":            s.workerID,
-		"image_processing_lease_expires_at": nil,
-	}, fs.MergeAll); err != nil {
-		log.Printf("failed to persist AVIF path receipt_id=%s err=%v", job.ID, err)
-		return
-	}
-	if err := s.bucket.Object(job.RawStoragePath).Delete(ctx); err != nil && !errors.Is(err, gcs.ErrObjectNotExist) {
-		log.Printf("failed to delete raw image receipt_id=%s path=%s err=%v", job.ID, job.RawStoragePath, err)
-	}
-	log.Printf("avif_done receipt_id=%s avif_path=%s latency_ms=%d", job.ID, avifPath, time.Since(started).Milliseconds())
-}
-
-func (s *apiServer) markImageProcessingFailed(ctx context.Context, receiptID string, err error) {
-	log.Printf("image processing failed receipt_id=%s err=%v", receiptID, err)
-	if _, updateErr := s.receipts.Doc(receiptID).Set(ctx, map[string]interface{}{
-		"image_processing_status":           "failed",
-		"image_processing_error":            err.Error(),
-		"image_processing_owner":            s.workerID,
-		"image_processing_lease_expires_at": nil,
-	}, fs.MergeAll); updateErr != nil {
-		log.Printf("failed to persist image processing error receipt_id=%s err=%v", receiptID, updateErr)
-	}
 }
 
 func (s *apiServer) downloadImageBytes(ctx context.Context, storagePath string) ([]byte, error) {

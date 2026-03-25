@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,7 +12,6 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
-	"log"
 	"math"
 	"net/http"
 	"path/filepath"
@@ -186,13 +184,11 @@ func (s *apiServer) handleReceiptByID(writer http.ResponseWriter, request *http.
 }
 
 func (s *apiServer) createReceipt(writer http.ResponseWriter, request *http.Request, user *verifiedUser) {
-	started := time.Now()
 	ownerEmail := strings.TrimSpace(user.Email)
 	if ownerEmail == "" {
 		writeJSONError(writer, http.StatusUnauthorized, "OAuth token is missing an email address")
 		return
 	}
-	log.Printf("create_receipt_start owner=%s", ownerEmail)
 	if _, err := s.ensureWithinLimit(ownerEmail); err != nil {
 		s.writeErr(writer, err)
 		return
@@ -213,21 +209,13 @@ func (s *apiServer) createReceipt(writer http.ResponseWriter, request *http.Requ
 		s.writeErr(writer, err)
 		return
 	}
-	imageBytes, err := io.ReadAll(file)
-	if err != nil {
-		writeJSONError(writer, http.StatusBadRequest, "failed to read uploaded file")
-		return
-	}
-	log.Printf("create_receipt_file_read owner=%s filename=%s bytes=%d content_type=%s", ownerEmail, header.Filename, len(imageBytes), contentType)
-
 	now := time.Now().UTC()
 	docRef := s.receipts.NewDoc()
 	rawStoragePath := buildStorageKey(header.Filename)
-	if err := s.uploadRawImage(request.Context(), imageBytes, rawStoragePath, contentType); err != nil {
+	if err := s.uploadRawImageStream(request.Context(), file, rawStoragePath, contentType); err != nil {
 		s.writeErr(writer, err)
 		return
 	}
-	log.Printf("create_receipt_raw_uploaded owner=%s receipt_id=%s raw_path=%s size_bytes=%d", ownerEmail, docRef.ID, rawStoragePath, len(imageBytes))
 	imageURL := s.absoluteURL(request, "/receipts/"+docRef.ID+"/image")
 	payload := map[string]interface{}{
 		"vendor":                            firstFormString(request.FormValue("vendor")),
@@ -260,16 +248,20 @@ func (s *apiServer) createReceipt(writer http.ResponseWriter, request *http.Requ
 		s.writeErr(writer, err)
 		return
 	}
-	// Nudge the background worker immediately so OCR can start quickly.
-	s.wakeReceiptWorker()
 	job := receiptJob{
 		ID:             docRef.ID,
 		OwnerEmail:     ownerEmail,
 		RawStoragePath: rawStoragePath,
 	}
-	go s.processOCRForJob(context.Background(), job, imageBytes)
-	log.Printf("create_receipt_accepted owner=%s receipt_id=%s latency_ms=%d", ownerEmail, docRef.ID, time.Since(started).Milliseconds())
-	writeJSON(writer, http.StatusAccepted, receiptRecordFromMap(docRef.ID, payload))
+	s.processClaimedReceiptJob(request.Context(), job)
+	updated, err := s.receipts.Doc(docRef.ID).Get(request.Context())
+	if err == nil && updated.Exists() {
+		updatedData := updated.Data()
+		updatedData["image_url"] = imageURL
+		writeJSON(writer, http.StatusCreated, receiptRecordFromMap(docRef.ID, updatedData))
+		return
+	}
+	writeJSON(writer, http.StatusCreated, receiptRecordFromMap(docRef.ID, payload))
 }
 
 func (s *apiServer) listReceipts(writer http.ResponseWriter, request *http.Request, user *verifiedUser) {
@@ -432,12 +424,10 @@ func (s *apiServer) deleteReceipt(writer http.ResponseWriter, request *http.Requ
 	storagePath := strings.TrimSpace(stringFromAny(data["storage_path"]))
 	if storagePath != "" {
 		if err := s.bucket.Object(storagePath).Delete(request.Context()); err != nil && !errors.Is(err, gcs.ErrObjectNotExist) {
-			log.Printf("failed to delete storage object %s: %v", storagePath, err)
 		}
 	}
 	if rawStoragePath != "" && rawStoragePath != storagePath {
 		if err := s.bucket.Object(rawStoragePath).Delete(request.Context()); err != nil && !errors.Is(err, gcs.ErrObjectNotExist) {
-			log.Printf("failed to delete raw storage object %s: %v", rawStoragePath, err)
 		}
 	}
 	if rawStoragePath != "" {
@@ -474,9 +464,7 @@ func (s *apiServer) streamReceiptImage(writer http.ResponseWriter, request *http
 	}
 	writer.Header().Set("Content-Type", contentType)
 	writer.WriteHeader(http.StatusOK)
-	if _, err := io.Copy(writer, reader); err != nil {
-		log.Printf("failed to stream receipt image %s: %v", receiptID, err)
-	}
+	_, _ = io.Copy(writer, reader)
 }
 
 func (s *apiServer) getOwnedReceipt(ctx context.Context, receiptID string, ownerEmail string) (map[string]interface{}, error) {
@@ -545,13 +533,13 @@ func (s *apiServer) categoryNames(ctx context.Context, ownerEmail string) ([]str
 	return names, nil
 }
 
-func (s *apiServer) uploadRawImage(ctx context.Context, data []byte, destination string, contentType string) error {
+func (s *apiServer) uploadRawImageStream(ctx context.Context, data io.Reader, destination string, contentType string) error {
 	objWriter := s.bucket.Object(destination).NewWriter(ctx)
 	if strings.TrimSpace(contentType) == "" {
 		contentType = "application/octet-stream"
 	}
 	objWriter.ContentType = contentType
-	if _, err := io.Copy(objWriter, bytes.NewReader(data)); err != nil {
+	if _, err := io.Copy(objWriter, data); err != nil {
 		_ = objWriter.Close()
 		return fmt.Errorf("failed to upload original image: %w", err)
 	}
@@ -568,7 +556,6 @@ type receiptJob struct {
 }
 
 func (s *apiServer) startReceiptWorker() {
-	log.Printf("receipt_worker_start id=%s poll=%s lease=%s", s.workerID, s.cfg.receiptWorkerPoll, s.cfg.receiptWorkerLease)
 	go func() {
 		ticker := time.NewTicker(s.cfg.receiptWorkerPoll)
 		defer ticker.Stop()
@@ -581,13 +568,11 @@ func (s *apiServer) startReceiptWorker() {
 			for i := 0; i < 3; i++ {
 				job, ok, err := s.claimNextReceiptJob(context.Background())
 				if err != nil {
-					log.Printf("receipt worker claim error: %v", err)
 					break
 				}
 				if !ok {
 					break
 				}
-				log.Printf("receipt_worker_claimed id=%s receipt_id=%s owner=%s", s.workerID, job.ID, job.OwnerEmail)
 				s.processClaimedReceiptJob(context.Background(), job)
 			}
 			select {
@@ -689,31 +674,25 @@ func (s *apiServer) tryClaimReceiptJob(ctx context.Context, ref *fs.DocumentRef,
 }
 
 func (s *apiServer) processClaimedReceiptJob(ctx context.Context, job receiptJob) {
-	log.Printf("receipt_worker_process_start receipt_id=%s", job.ID)
-	imageBytes, err := s.downloadImageBytes(ctx, job.RawStoragePath)
-	if err != nil {
-		s.markReceiptProcessingFailed(ctx, job.ID, err)
-		return
-	}
-	s.processOCRForJob(ctx, job, imageBytes)
+	s.processOCRForJob(ctx, job)
 }
 
-func (s *apiServer) processOCRForJob(ctx context.Context, job receiptJob, imageBytes []byte) {
-	started := time.Now()
-	log.Printf("ocr_start receipt_id=%s owner=%s image_bytes=%d", job.ID, job.OwnerEmail, len(imageBytes))
+func (s *apiServer) processOCRForJob(ctx context.Context, job receiptJob) {
 	categoryOptions, err := s.categoryNames(ctx, job.OwnerEmail)
 	if err != nil {
 		s.markReceiptProcessingFailed(ctx, job.ID, err)
 		return
 	}
-	log.Printf("ocr_categories_loaded receipt_id=%s categories=%d", job.ID, len(categoryOptions))
-	openAIStarted := time.Now()
-	ocrRes, err := s.extractReceiptOCR(ctx, imageBytes, categoryOptions)
+	imageURL, err := s.signedImageURL(ctx, job.RawStoragePath)
 	if err != nil {
 		s.markReceiptProcessingFailed(ctx, job.ID, err)
 		return
 	}
-	log.Printf("ocr_openai_done receipt_id=%s latency_ms=%d text_len=%d items=%d", job.ID, time.Since(openAIStarted).Milliseconds(), len(ocrRes.Text), len(ocrRes.Items))
+	ocrRes, err := s.extractReceiptOCR(ctx, imageURL, categoryOptions)
+	if err != nil {
+		s.markReceiptProcessingFailed(ctx, job.ID, err)
+		return
+	}
 
 	itemsPayload := ocrItemsToReceiptItems(ocrRes.Items)
 	validation := validateSubtotalAgainstItems(ocrRes.Subtotal, itemsPayload)
@@ -756,21 +735,9 @@ func (s *apiServer) processOCRForJob(ctx context.Context, job receiptJob, imageB
 		s.markReceiptProcessingFailed(ctx, job.ID, err)
 		return
 	}
-	imageBytes = nil
-	log.Printf("ocr_done receipt_id=%s latency_ms=%d", job.ID, time.Since(started).Milliseconds())
-}
-
-func (s *apiServer) downloadImageBytes(ctx context.Context, storagePath string) ([]byte, error) {
-	reader, err := s.bucket.Object(storagePath).NewReader(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer reader.Close()
-	return io.ReadAll(reader)
 }
 
 func (s *apiServer) markReceiptProcessingFailed(ctx context.Context, receiptID string, err error) {
-	log.Printf("receipt processing failed receipt_id=%s err=%v", receiptID, err)
 	if _, updateErr := s.receipts.Doc(receiptID).Set(ctx, map[string]interface{}{
 		"processing_status":                 "failed",
 		"processing_owner":                  s.workerID,
@@ -782,15 +749,13 @@ func (s *apiServer) markReceiptProcessingFailed(ctx context.Context, receiptID s
 		"image_processing_owner":            s.workerID,
 		"image_processing_lease_expires_at": nil,
 	}, fs.MergeAll); updateErr != nil {
-		log.Printf("failed to persist processing error receipt_id=%s err=%v", receiptID, updateErr)
 	}
 }
 
-func (s *apiServer) extractReceiptOCR(ctx context.Context, imageBytes []byte, categoryOptions []string) (ocrResult, error) {
+func (s *apiServer) extractReceiptOCR(ctx context.Context, imageURL string, categoryOptions []string) (ocrResult, error) {
 	if strings.TrimSpace(s.cfg.openAIAPIKey) == "" {
 		return ocrResult{}, fmt.Errorf("OPENAI_API_KEY is required")
 	}
-	imageDataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(imageBytes)
 	payload := openAIResponsesRequest{
 		Model: s.cfg.openAIModel,
 		Input: []openAIInputMessage{
@@ -798,7 +763,7 @@ func (s *apiServer) extractReceiptOCR(ctx context.Context, imageBytes []byte, ca
 				Role: "user",
 				Content: []openAIInputContent{
 					{Type: "input_text", Text: buildOCRPrompt(categoryOptions)},
-					{Type: "input_image", ImageURL: imageDataURL},
+					{Type: "input_image", ImageURL: imageURL},
 				},
 			},
 		},
@@ -836,6 +801,19 @@ func (s *apiServer) extractReceiptOCR(ctx context.Context, imageBytes []byte, ca
 	}
 	rawText := collectOCRText(envelope)
 	return readStructuredFields(rawText, categoryOptions), nil
+}
+
+func (s *apiServer) signedImageURL(ctx context.Context, storagePath string) (string, error) {
+	expiresAt := time.Now().UTC().Add(10 * time.Minute)
+	url, err := s.bucket.SignedURL(storagePath, &gcs.SignedURLOptions{
+		Scheme:  gcs.SigningSchemeV4,
+		Method:  http.MethodGet,
+		Expires: expiresAt,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create signed image URL: %w", err)
+	}
+	return url, nil
 }
 
 func buildOCRPrompt(categoryOptions []string) string {
@@ -1289,9 +1267,7 @@ func (s *apiServer) writeErr(writer http.ResponseWriter, err error) {
 	if errors.As(err, &helcimErr) {
 		writer.Header().Set("Content-Type", "application/json")
 		writer.WriteHeader(helcimErr.status)
-		if encodeErr := json.NewEncoder(writer).Encode(map[string]interface{}{"detail": helcimErr.detail}); encodeErr != nil {
-			log.Printf("failed to encode JSON response: %v", encodeErr)
-		}
+		_ = json.NewEncoder(writer).Encode(map[string]interface{}{"detail": helcimErr.detail})
 		return
 	}
 	var httpErr httpError

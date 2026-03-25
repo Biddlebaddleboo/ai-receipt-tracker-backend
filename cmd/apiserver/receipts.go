@@ -153,20 +153,6 @@ func (s *apiServer) handleReceiptByID(writer http.ResponseWriter, request *http.
 		writeJSONError(writer, http.StatusNotFound, "Not found")
 		return
 	}
-	if strings.HasSuffix(path, "/image") {
-		receiptID := strings.TrimSuffix(path, "/image")
-		receiptID = strings.TrimSuffix(receiptID, "/")
-		if receiptID == "" || strings.Contains(receiptID, "/") {
-			writeJSONError(writer, http.StatusNotFound, "Not found")
-			return
-		}
-		if request.Method != http.MethodGet {
-			writeJSONError(writer, http.StatusMethodNotAllowed, "Method not allowed")
-			return
-		}
-		s.streamReceiptImage(writer, request, user, receiptID)
-		return
-	}
 	if strings.Contains(path, "/") {
 		writeJSONError(writer, http.StatusNotFound, "Not found")
 		return
@@ -216,7 +202,11 @@ func (s *apiServer) createReceipt(writer http.ResponseWriter, request *http.Requ
 		s.writeErr(writer, err)
 		return
 	}
-	imageURL := s.absoluteURL(request, "/receipts/"+docRef.ID+"/image")
+	imageURL, err := s.signedImageURL(request.Context(), rawStoragePath)
+	if err != nil {
+		s.writeErr(writer, err)
+		return
+	}
 	payload := map[string]interface{}{
 		"vendor":                            firstFormString(request.FormValue("vendor")),
 		"subtotal":                          firstFormFloat(request.FormValue("subtotal")),
@@ -314,7 +304,7 @@ func (s *apiServer) listReceipts(writer http.ResponseWriter, request *http.Reque
 		if err := s.ensureReceiptOwner(data, ownerEmail, snapshot.Ref.ID); err != nil {
 			continue
 		}
-		data["image_url"] = s.absoluteURL(request, "/receipts/"+snapshot.Ref.ID+"/image")
+		s.attachSignedImageURL(request.Context(), data)
 		records = append(records, receiptRecordFromMap(snapshot.Ref.ID, data))
 	}
 	if len(records) > 0 {
@@ -330,7 +320,7 @@ func (s *apiServer) readReceipt(writer http.ResponseWriter, request *http.Reques
 		s.writeErr(writer, err)
 		return
 	}
-	data["image_url"] = s.absoluteURL(request, "/receipts/"+receiptID+"/image")
+	s.attachSignedImageURL(request.Context(), data)
 	writeJSON(writer, http.StatusOK, receiptRecordFromMap(receiptID, data))
 }
 
@@ -392,7 +382,7 @@ func (s *apiServer) updateReceipt(writer http.ResponseWriter, request *http.Requ
 	}
 
 	if len(updateData) == 0 {
-		existing["image_url"] = s.absoluteURL(request, "/receipts/"+receiptID+"/image")
+		s.attachSignedImageURL(request.Context(), existing)
 		writeJSON(writer, http.StatusOK, receiptRecordFromMap(receiptID, existing))
 		return
 	}
@@ -406,7 +396,7 @@ func (s *apiServer) updateReceipt(writer http.ResponseWriter, request *http.Requ
 		s.writeErr(writer, err)
 		return
 	}
-	updated["image_url"] = s.absoluteURL(request, "/receipts/"+receiptID+"/image")
+	s.attachSignedImageURL(request.Context(), updated)
 	writeJSON(writer, http.StatusOK, receiptRecordFromMap(receiptID, updated))
 }
 
@@ -434,37 +424,6 @@ func (s *apiServer) deleteReceipt(writer http.ResponseWriter, request *http.Requ
 		// No AVIF side objects are generated anymore.
 	}
 	writer.WriteHeader(http.StatusNoContent)
-}
-
-func (s *apiServer) streamReceiptImage(writer http.ResponseWriter, request *http.Request, user *verifiedUser, receiptID string) {
-	data, err := s.getOwnedReceipt(request.Context(), receiptID, user.Email)
-	if err != nil {
-		s.writeErr(writer, err)
-		return
-	}
-	storagePath := stringFromAny(data["storage_path"])
-	if storagePath == "" {
-		writeJSONError(writer, http.StatusNotFound, "Receipt image not available")
-		return
-	}
-	reader, err := s.bucket.Object(storagePath).NewReader(request.Context())
-	if err != nil {
-		if errors.Is(err, gcs.ErrObjectNotExist) {
-			writeJSONError(writer, http.StatusNotFound, "Stored receipt image not found")
-			return
-		}
-		s.writeErr(writer, err)
-		return
-	}
-	defer reader.Close()
-
-	contentType := strings.TrimSpace(reader.Attrs.ContentType)
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
-	writer.Header().Set("Content-Type", contentType)
-	writer.WriteHeader(http.StatusOK)
-	_, _ = io.Copy(writer, reader)
 }
 
 func (s *apiServer) getOwnedReceipt(ctx context.Context, receiptID string, ownerEmail string) (map[string]interface{}, error) {
@@ -814,6 +773,22 @@ func (s *apiServer) signedImageURL(ctx context.Context, storagePath string) (str
 		return "", fmt.Errorf("failed to create signed image URL: %w", err)
 	}
 	return url, nil
+}
+
+func (s *apiServer) attachSignedImageURL(ctx context.Context, data map[string]interface{}) {
+	if data == nil {
+		return
+	}
+	storagePath := stringFromAny(data["storage_path"])
+	if storagePath == "" {
+		storagePath = stringFromAny(data["raw_storage_path"])
+	}
+	if storagePath == "" {
+		return
+	}
+	if signedURL, err := s.signedImageURL(ctx, storagePath); err == nil {
+		data["image_url"] = signedURL
+	}
 }
 
 func buildOCRPrompt(categoryOptions []string) string {
@@ -1244,22 +1219,6 @@ func subtotalValueOrOCR(formValue *float64, ocrValue *float64) *float64 {
 
 func roundMoney(value float64) float64 {
 	return math.Round(value*100) / 100
-}
-
-func (s *apiServer) absoluteURL(request *http.Request, path string) string {
-	scheme := "https"
-	if request.TLS == nil {
-		if forwarded := strings.TrimSpace(request.Header.Get("X-Forwarded-Proto")); forwarded != "" {
-			scheme = forwarded
-		} else if request.URL.Scheme != "" {
-			scheme = request.URL.Scheme
-		}
-	}
-	host := request.Host
-	if forwardedHost := strings.TrimSpace(request.Header.Get("X-Forwarded-Host")); forwardedHost != "" {
-		host = forwardedHost
-	}
-	return scheme + "://" + host + path
 }
 
 func (s *apiServer) writeErr(writer http.ResponseWriter, err error) {

@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-import re
 from typing import Any, Dict, Optional
 
 import logging
 
 from fastapi import HTTPException, status
 from google.cloud import firestore
-from typing import Iterable
 
 OWNER_FIELD = "owner_email"
 DEFAULT_PLAN_ID = "free"
@@ -273,49 +271,6 @@ class SubscriptionService:
         )
         return {"owner_email": owner_email, "plan_id": plan["plan_id"]}
 
-    def resolve_plan_for_approved_transaction(
-        self,
-        callback_payload: Dict[str, Any],
-        transaction_payload: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        payment_plan_id = (
-            callback_payload.get("paymentPlanId")
-            or transaction_payload.get("paymentPlanId")
-            or transaction_payload.get("paymentPlanID")
-        )
-        plan = self.find_plan_by_payment_plan_id(payment_plan_id)
-        if plan:
-            return plan
-
-        invoice_number = (
-            callback_payload.get("invoiceNumber")
-            or transaction_payload.get("invoiceNumber")
-            or ""
-        )
-        plan_from_invoice = self._find_plan_by_invoice_number(str(invoice_number))
-        if plan_from_invoice:
-            return plan_from_invoice
-
-        amount_cents = self._transaction_amount_cents(transaction_payload)
-        if amount_cents is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Unable to determine purchased plan: no paymentPlanId, invoiceNumber, or amount",
-            )
-        currency = transaction_payload.get("currency")
-        matched = self._find_plans_by_price_cents(amount_cents, currency)
-        if not matched:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unable to map transaction amount {amount_cents} cents to a plan",
-            )
-        if len(matched) > 1:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Ambiguous plan mapping for amount {amount_cents} cents; multiple plans match",
-            )
-        return matched[0]
-
     def _resolve_plan_from_payment(self, payment_plan_id: Optional[Any]) -> str:
         coerced_payment_plan_id = self._coerce_int(payment_plan_id)
         if coerced_payment_plan_id is None:
@@ -375,55 +330,6 @@ class SubscriptionService:
             data["plan_id"] = snapshot.id
             plans.append(data)
         return plans
-
-    def _find_plans_by_price_cents(
-        self, price_cents: int, currency: Optional[Any]
-    ) -> list[Dict[str, Any]]:
-        normalized_currency = None
-        if currency is not None:
-            text = str(currency).strip().upper()
-            if text:
-                normalized_currency = text
-        matches: list[Dict[str, Any]] = []
-        for plan in self._all_plans():
-            plan_price = self._coerce_int(plan.get("price_cents"))
-            if plan_price is None or plan_price != price_cents:
-                continue
-            plan_currency = plan.get("currency")
-            if normalized_currency and plan_currency:
-                if str(plan_currency).strip().upper() != normalized_currency:
-                    continue
-            matches.append(plan)
-        return matches
-
-    def _find_plan_by_invoice_number(self, invoice_number: str) -> Optional[Dict[str, Any]]:
-        text = invoice_number.strip()
-        if not text:
-            return None
-        # Supported markers:
-        # PLAN:<plan_id>
-        # plan_id=<plan_id>
-        # plan-<plan_id>
-        candidates: list[str] = []
-        if text.upper().startswith("PLAN:"):
-            candidates.append(text.split(":", 1)[1].strip())
-        match = re.search(r"plan[_-]?id=([a-zA-Z0-9_-]+)", text, flags=re.IGNORECASE)
-        if match:
-            candidates.append(match.group(1).strip())
-        match = re.search(r"plan-([a-zA-Z0-9_-]+)", text, flags=re.IGNORECASE)
-        if match:
-            candidates.append(match.group(1).strip())
-
-        if not candidates:
-            return None
-        candidate_set = {c for c in candidates if c}
-        if not candidate_set:
-            return None
-        for plan in self._all_plans():
-            plan_id = str(plan.get("plan_id", "")).strip()
-            if plan_id in candidate_set:
-                return plan
-        return None
 
     def _get_or_create_user(self, owner_email: str, now: datetime):
         user_doc_ref, user_doc = self._find_or_choose_user_doc(owner_email)

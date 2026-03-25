@@ -209,7 +209,7 @@ def activate_subscription_with_saved_method(
             detail="Saved payment method is missing Helcim customer code",
         )
 
-    request_payload: Dict[str, Any] = {
+    subscription_body = {
         "paymentPlanId": payment_plan_id,
         "customerCode": customer_code,
         "activationDate": datetime.utcnow().date().isoformat(),
@@ -218,7 +218,8 @@ def activate_subscription_with_saved_method(
     if not payment_method and card_token:
         payment_method = "card"
     if payment_method:
-        request_payload["paymentMethod"] = payment_method
+        subscription_body["paymentMethod"] = payment_method
+    request_payload = {"subscriptions": [subscription_body]}
     logger.warning(
         "activate_subscription_with_saved_method owner=%s plan_id=%s payment_plan_id=%s payment_method=%s has_customer_code=%s has_card_token=%s payload=%s",
         owner_email,

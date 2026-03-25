@@ -87,9 +87,13 @@ class SubscriptionService:
         end = None
         if interval == "month":
             end = billing_date or (start + timedelta(days=30))
+        plan_name = str(plan.get("name") or plan.get("plan_id") or "").strip()
+        helcim_payment_plan_id = self._coerce_int(plan.get("payment_plan_id"))
         update_data: Dict[str, Any] = {
             OWNER_FIELD: owner_email,
-            "plan_id": plan["plan_id"],
+            "plan_id": plan_name or plan.get("plan_id"),
+            "plan_doc_id": plan.get("plan_id"),
+            "helcim_payment_plan_id": helcim_payment_plan_id,
             "subscription_status": payload.get("status", "active"),
             "plan_interval": interval,
             "plan_price_cents": self._coerce_int(plan.get("price_cents")),

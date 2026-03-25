@@ -130,6 +130,9 @@ class SubscriptionService:
                 return plan
         return None
 
+    def plan_payment_plan_id(self, plan: Dict[str, Any]) -> Optional[int]:
+        return self._coerce_int(plan.get("payment_plan_id"))
+
     def find_plan_by_payment_plan_id(self, payment_plan_id: Optional[Any]) -> Optional[Dict[str, Any]]:
         coerced_payment_plan_id = self._coerce_int(payment_plan_id)
         if coerced_payment_plan_id is None:

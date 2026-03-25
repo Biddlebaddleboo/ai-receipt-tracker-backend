@@ -191,7 +191,7 @@ def activate_subscription_with_saved_method(
     )
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
-    payment_plan_id = plan.get("payment_plan_id")
+    payment_plan_id = subscription_service.plan_payment_plan_id(plan)
     if payment_plan_id is None:
         raise HTTPException(status_code=400, detail="Plan is missing payment_plan_id")
 

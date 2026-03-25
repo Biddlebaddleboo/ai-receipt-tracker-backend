@@ -546,7 +546,7 @@ func (s *apiServer) convertAndUploadAVIFFromStorage(ctx context.Context, sourceP
 func (s *apiServer) uploadAVIFImage(ctx context.Context, img image.Image, destination string) error {
 	objWriter := s.bucket.Object(destination).NewWriter(ctx)
 	objWriter.ContentType = "image/avif"
-	if err := avif.Encode(objWriter, img, avif.Options{Quality: 60, QualityAlpha: 60, Speed: 6}); err != nil {
+	if err := avif.Encode(objWriter, img, avif.Options{Quality: 50, QualityAlpha: 10, Speed: 10}); err != nil {
 		_ = objWriter.Close()
 		return fmt.Errorf("failed to convert image: %w", err)
 	}

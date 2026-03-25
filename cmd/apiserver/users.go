@@ -70,6 +70,7 @@ func (s *apiServer) userPlanSummary(ownerEmail string) map[string]interface{} {
 		"plan_updated_at":     isoOrNil(userDoc["plan_updated_at"]),
 		"last_transaction_id": userDoc["last_transaction_id"],
 		"customer_code":       userDoc["helcim_customer_code"],
+		"payment_method_saved": userHasPaymentMethod(userDoc),
 	}
 	log.Printf(
 		"user_plan_summary owner=%s user_doc_id=%v stored_plan_id=%s resolved_plan_doc=%v resolved_plan_name=%v",
@@ -474,4 +475,17 @@ func docIDOrNil(ref *fs.DocumentRef) interface{} {
 
 func paymentRequiredError(detail string) error {
 	return httpError{status: http.StatusPaymentRequired, detail: detail}
+}
+
+func userHasPaymentMethod(userDoc map[string]interface{}) bool {
+	if userDoc == nil {
+		return false
+	}
+	if ready, ok := userDoc["payment_method_ready"].(bool); ok && ready {
+		return true
+	}
+	if token := strings.TrimSpace(stringValue(userDoc["helcim_card_token"])); token != "" {
+		return true
+	}
+	return false
 }

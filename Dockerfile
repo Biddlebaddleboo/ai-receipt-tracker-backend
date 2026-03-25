@@ -11,14 +11,9 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* && \
     go mod download && \
-    go build -o /out/apiserver
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o /out/apiserver
 
-FROM debian:bookworm-slim
-
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+FROM gcr.io/distroless/static-debian12
 
 WORKDIR /app
 COPY --from=go-api-build /out/apiserver /app/apiserver

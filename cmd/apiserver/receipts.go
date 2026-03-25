@@ -1089,6 +1089,15 @@ func (s *apiServer) absoluteURL(request *http.Request, path string) string {
 }
 
 func (s *apiServer) writeErr(writer http.ResponseWriter, err error) {
+	var helcimErr helcimHTTPError
+	if errors.As(err, &helcimErr) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(helcimErr.status)
+		if encodeErr := json.NewEncoder(writer).Encode(map[string]interface{}{"detail": helcimErr.detail}); encodeErr != nil {
+			log.Printf("failed to encode JSON response: %v", encodeErr)
+		}
+		return
+	}
 	var httpErr httpError
 	if errors.As(err, &httpErr) {
 		writeJSONError(writer, httpErr.status, httpErr.detail)

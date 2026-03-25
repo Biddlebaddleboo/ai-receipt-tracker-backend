@@ -58,18 +58,18 @@ func (s *apiServer) userPlanSummary(ownerEmail string) map[string]interface{} {
 		planPrice = coerceInt(plan["price_cents"])
 	}
 	result := map[string]interface{}{
-		"owner_email":         ownerEmail,
-		"plan_id":             plan["plan_id"],
-		"plan_name":           plan["name"],
-		"description":         plan["description"],
-		"subscription_status": fallbackString(userDoc["subscription_status"], "active"),
-		"plan_interval":       planInterval,
-		"monthly_limit":       planLimit(plan),
-		"plan_price_cents":    planPrice,
-		"features":            planFeatures(plan),
-		"plan_updated_at":     isoOrNil(userDoc["plan_updated_at"]),
-		"last_transaction_id": userDoc["last_transaction_id"],
-		"customer_code":       userDoc["helcim_customer_code"],
+		"owner_email":          ownerEmail,
+		"plan_id":              plan["plan_id"],
+		"plan_name":            plan["name"],
+		"description":          plan["description"],
+		"subscription_status":  fallbackString(userDoc["subscription_status"], "active"),
+		"plan_interval":        planInterval,
+		"monthly_limit":        planLimit(plan),
+		"plan_price_cents":     planPrice,
+		"features":             planFeatures(plan),
+		"plan_updated_at":      isoOrNil(userDoc["plan_updated_at"]),
+		"last_transaction_id":  userDoc["last_transaction_id"],
+		"customer_code":        userDoc["helcim_customer_code"],
 		"payment_method_saved": userHasPaymentMethod(userDoc),
 	}
 	log.Printf(

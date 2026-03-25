@@ -6,15 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
-	"os/exec"
 	"regexp"
 	"strings"
-	"syscall"
 	"time"
 
 	fs "cloud.google.com/go/firestore"
@@ -25,7 +21,6 @@ import (
 
 type config struct {
 	port                string
-	pythonBackendPort   string
 	firestoreDatabase   string
 	firestoreCollection string
 	categoriesColl      string
@@ -61,16 +56,14 @@ type categoryRecord struct {
 
 type apiServer struct {
 	cfg        config
-	proxy      *httputil.ReverseProxy
+	helcim     *helcimClient
 	firestore  *fs.Client
 	storage    *storage.Client
-	pythonCmd  *exec.Cmd
 	receipts   *fs.CollectionRef
 	categories *fs.CollectionRef
 	plans      *fs.CollectionRef
 	users      *fs.CollectionRef
 	bucket     *storage.BucketHandle
-	pythonURL  *url.URL
 	httpServer *http.Server
 }
 
@@ -86,10 +79,6 @@ func main() {
 	}
 	defer server.close()
 
-	if err := server.startPythonBackend(); err != nil {
-		log.Fatalf("failed to start Python backend: %v", err)
-	}
-
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", server.handleHealthz)
 	mux.HandleFunc("/categories", server.handleCategories)
@@ -97,16 +86,18 @@ func main() {
 	mux.HandleFunc("/receipts", server.handleReceipts)
 	mux.HandleFunc("/receipts/", server.handleReceiptByID)
 	mux.HandleFunc("/users/me/plan", server.handleUserPlan)
-	mux.HandleFunc("/billing", server.handleBillingProxy)
-	mux.HandleFunc("/billing/", server.handleBillingProxy)
-	mux.Handle("/", server.proxy)
+	mux.HandleFunc("/billing", server.handleBilling)
+	mux.HandleFunc("/billing/", server.handleBilling)
+	mux.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
+		writeJSONError(writer, http.StatusNotFound, "Not found")
+	})
 
 	server.httpServer = &http.Server{
 		Addr:    ":" + cfg.port,
 		Handler: server.withCORS(mux),
 	}
 
-	log.Printf("Go API server listening on :%s and forwarding Python routes to %s", cfg.port, server.pythonURL.String())
+	log.Printf("Go API server listening on :%s", cfg.port)
 	if err := server.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("Go API server stopped unexpectedly: %v", err)
 	}
@@ -115,7 +106,6 @@ func main() {
 func loadConfig() (config, error) {
 	cfg := config{
 		port:                envOrDefault("PORT", "8080"),
-		pythonBackendPort:   envOrDefault("PYTHON_BACKEND_PORT", "8081"),
 		firestoreDatabase:   envOrDefault("FIRESTORE_DATABASE_ID", "(default)"),
 		firestoreCollection: envOrDefault("FIRESTORE_COLLECTION_NAME", "receipts"),
 		categoriesColl:      envOrDefault("CATEGORIES_COLLECTION_NAME", "categories"),
@@ -154,29 +144,9 @@ func newAPIServer(cfg config) (*apiServer, error) {
 		_ = client.Close()
 		return nil, err
 	}
-	pythonURL, err := url.Parse("http://127.0.0.1:" + cfg.pythonBackendPort)
-	if err != nil {
-		_ = client.Close()
-		_ = storageClient.Close()
-		return nil, err
-	}
-	proxy := httputil.NewSingleHostReverseProxy(pythonURL)
-	originalDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		originalDirector(req)
-		req.Host = pythonURL.Host
-	}
-	proxy.ModifyResponse = func(resp *http.Response) error {
-		stripProxiedCORSHeaders(resp.Header)
-		return nil
-	}
-	proxy.ErrorHandler = func(writer http.ResponseWriter, request *http.Request, err error) {
-		log.Printf("Python backend proxy error for %s %s: %v", request.Method, request.URL.Path, err)
-		writeJSONError(writer, http.StatusBadGateway, "Python backend unavailable")
-	}
 	return &apiServer{
 		cfg:        cfg,
-		proxy:      proxy,
+		helcim:     newHelcimClient(cfg),
 		firestore:  client,
 		storage:    storageClient,
 		receipts:   client.Collection(cfg.firestoreCollection),
@@ -184,7 +154,6 @@ func newAPIServer(cfg config) (*apiServer, error) {
 		plans:      client.Collection(cfg.plansCollection),
 		users:      client.Collection(cfg.usersCollection),
 		bucket:     storageClient.Bucket(cfg.gcsBucketName),
-		pythonURL:  pythonURL,
 	}, nil
 }
 
@@ -194,42 +163,11 @@ func (s *apiServer) close() {
 		defer cancel()
 		_ = s.httpServer.Shutdown(ctx)
 	}
-	if s.pythonCmd != nil && s.pythonCmd.Process != nil {
-		_ = s.pythonCmd.Process.Signal(syscall.SIGTERM)
-	}
 	if s.firestore != nil {
 		_ = s.firestore.Close()
 	}
 	if s.storage != nil {
 		_ = s.storage.Close()
-	}
-}
-
-func (s *apiServer) startPythonBackend() error {
-	cmd := exec.Command("python", "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", s.cfg.pythonBackendPort)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(), "PORT="+s.cfg.pythonBackendPort)
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	s.pythonCmd = cmd
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	address := "127.0.0.1:" + s.cfg.pythonBackendPort
-	for {
-		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
-		if err == nil {
-			_ = conn.Close()
-			log.Printf("Python backend is ready on %s", address)
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("timed out waiting for Python backend on %s", address)
-		case <-time.After(200 * time.Millisecond):
-		}
 	}
 }
 
@@ -249,15 +187,6 @@ func (s *apiServer) withCORS(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(writer, request)
 	})
-}
-
-func stripProxiedCORSHeaders(header http.Header) {
-	header.Del("Access-Control-Allow-Origin")
-	header.Del("Access-Control-Allow-Credentials")
-	header.Del("Access-Control-Allow-Methods")
-	header.Del("Access-Control-Allow-Headers")
-	header.Del("Access-Control-Expose-Headers")
-	header.Del("Access-Control-Max-Age")
 }
 
 func (s *apiServer) isAllowedOrigin(origin string) bool {
@@ -702,19 +631,6 @@ func containsFold(values []string, candidate string) bool {
 		}
 	}
 	return false
-}
-
-func (s *apiServer) handleBillingProxy(writer http.ResponseWriter, request *http.Request) {
-	if isPublicBillingCallback(request.URL.Path) {
-		s.proxy.ServeHTTP(writer, request)
-		return
-	}
-	user, ok := s.authenticateRequest(writer, request)
-	if !ok {
-		return
-	}
-	request.Header.Set("X-Go-Authenticated-Email", user.Email)
-	s.proxy.ServeHTTP(writer, request)
 }
 
 func isPublicBillingCallback(path string) bool {

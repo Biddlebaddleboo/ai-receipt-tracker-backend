@@ -79,10 +79,13 @@ class SubscriptionService:
         payload: Dict[str, Any],
     ) -> str:
         now = datetime.utcnow()
-        plan_id = self._resolve_plan_from_payment(payload.get("paymentPlanId"))
+        subscription_entry = self._flatten_subscription_payload(payload)
+        plan_id = self._resolve_plan_from_payment(
+            subscription_entry.get("paymentPlanId")
+        )
         plan = self._get_plan(plan_id)
         interval = self._plan_interval(plan)
-        start = self._parse_date(payload.get("dateActivated")) or now
+        start = self._parse_date(subscription_entry.get("dateActivated")) or now
         billing_date = self._parse_date(payload.get("dateBilling"))
         end = None
         if interval == "month":
@@ -139,6 +142,17 @@ class SubscriptionService:
 
     def plan_price_cents(self, plan: Dict[str, Any]) -> Optional[int]:
         return self._coerce_int(plan.get("price_cents"))
+
+    @staticmethod
+    def _flatten_subscription_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+        data = payload.get("data")
+        if isinstance(data, dict):
+            return data
+        if isinstance(data, list) and data:
+            first = data[0]
+            if isinstance(first, dict):
+                return first
+        return payload
 
     def find_plan_by_payment_plan_id(self, payment_plan_id: Optional[Any]) -> Optional[Dict[str, Any]]:
         coerced_payment_plan_id = self._coerce_int(payment_plan_id)

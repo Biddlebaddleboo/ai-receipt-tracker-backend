@@ -40,8 +40,10 @@ class HelcimRecurringClient:
     def list_subscriptions(self, query: Dict[str, Any]) -> Any:
         return self._request("GET", "subscriptions", query=query)
 
-    def create_subscriptions(self, payload: Any) -> Any:
-        return self._request("POST", "subscriptions", payload=payload)
+    def create_subscriptions(self, payload: Any, idempotency_key: Optional[str] = None) -> Any:
+        return self._request(
+            "POST", "subscriptions", payload=payload, idempotency_key=idempotency_key
+        )
 
     def patch_subscriptions(self, payload: Any) -> Any:
         return self._request("PATCH", "subscriptions", payload=payload)
@@ -61,6 +63,7 @@ class HelcimRecurringClient:
         path: str,
         payload: Optional[Any] = None,
         query: Optional[Dict[str, Any]] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Any:
         if not self._api_token:
             raise HTTPException(
@@ -78,6 +81,8 @@ class HelcimRecurringClient:
             "api-token": self._api_token,
             "User-Agent": self._user_agent,
         }
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
         data: Optional[bytes] = None
         if payload is not None:
             headers["Content-Type"] = "application/json"

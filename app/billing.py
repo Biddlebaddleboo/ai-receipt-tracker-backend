@@ -3,6 +3,7 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import uuid
 from datetime import datetime
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -208,7 +209,10 @@ def activate_subscription_with_saved_method(
         request_payload["customerCode"] = customer_code
     if card_token:
         request_payload["cardToken"] = card_token
-    subscription_response = helcim_client.create_subscriptions(request_payload)
+    idempotency_key = str(uuid.uuid4())
+    subscription_response = helcim_client.create_subscriptions(
+        request_payload, idempotency_key=idempotency_key
+    )
     activated_plan_id = subscription_service.apply_subscription_payload(
         owner_email, subscription_response
     )

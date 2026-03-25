@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -63,6 +64,21 @@ type receiptRecord struct {
 type receiptListResponse struct {
 	Receipts   []receiptRecord `json:"receipts"`
 	NextCursor *string         `json:"next_cursor"`
+}
+
+type signedUploadRequest struct {
+	Filename    string `json:"filename"`
+	ContentType string `json:"content_type"`
+}
+
+type finalizeUploadRequest struct {
+	StoragePath  string   `json:"storage_path"`
+	Vendor       *string  `json:"vendor"`
+	Subtotal     *float64 `json:"subtotal"`
+	Tax          *float64 `json:"tax"`
+	Total        *float64 `json:"total"`
+	Category     *string  `json:"category"`
+	PurchaseDate *string  `json:"purchase_date"`
 }
 
 type openAIResponsesRequest struct {
@@ -136,7 +152,7 @@ func (s *apiServer) handleReceipts(writer http.ResponseWriter, request *http.Req
 	case http.MethodGet:
 		s.listReceipts(writer, request, user)
 	case http.MethodPost:
-		s.createReceipt(writer, request, user)
+		writeJSONError(writer, http.StatusGone, "Direct multipart upload is disabled. Use signed upload endpoints: POST /receipts/signed-upload then POST /receipts/finalize-upload.")
 	default:
 		writeJSONError(writer, http.StatusMethodNotAllowed, "Method not allowed")
 	}
@@ -151,6 +167,22 @@ func (s *apiServer) handleReceiptByID(writer http.ResponseWriter, request *http.
 	path = strings.TrimSpace(path)
 	if path == "" {
 		writeJSONError(writer, http.StatusNotFound, "Not found")
+		return
+	}
+	if path == "signed-upload" {
+		if request.Method != http.MethodPost {
+			writeJSONError(writer, http.StatusMethodNotAllowed, "Method not allowed")
+			return
+		}
+		s.createSignedUpload(writer, request, user)
+		return
+	}
+	if path == "finalize-upload" {
+		if request.Method != http.MethodPost {
+			writeJSONError(writer, http.StatusMethodNotAllowed, "Method not allowed")
+			return
+		}
+		s.finalizeSignedUpload(writer, request, user)
 		return
 	}
 	if strings.HasSuffix(path, "/image") {
@@ -183,6 +215,137 @@ func (s *apiServer) handleReceiptByID(writer http.ResponseWriter, request *http.
 	}
 }
 
+func (s *apiServer) createSignedUpload(writer http.ResponseWriter, request *http.Request, user *verifiedUser) {
+	defer request.Body.Close()
+	var payload signedUploadRequest
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		writeJSONError(writer, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	contentType := strings.TrimSpace(payload.ContentType)
+	if err := ensureImage(contentType); err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+	storagePath := buildStorageKeyForOwner(user.Email, payload.Filename)
+	expiresAt := time.Now().UTC().Add(10 * time.Minute)
+	uploadURL, err := s.bucket.SignedURL(storagePath, &gcs.SignedURLOptions{
+		Scheme:      gcs.SigningSchemeV4,
+		Method:      http.MethodPut,
+		Expires:     expiresAt,
+		ContentType: contentType,
+	})
+	if err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, map[string]interface{}{
+		"storage_path": storagePath,
+		"upload_url":   uploadURL,
+		"method":       http.MethodPut,
+		"headers": map[string]string{
+			"Content-Type": contentType,
+		},
+		"expires_at": expiresAt.Format(time.RFC3339),
+	})
+}
+
+func (s *apiServer) finalizeSignedUpload(writer http.ResponseWriter, request *http.Request, user *verifiedUser) {
+	defer request.Body.Close()
+	var payload finalizeUploadRequest
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		writeJSONError(writer, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	ownerEmail := strings.TrimSpace(user.Email)
+	storagePath := strings.TrimSpace(payload.StoragePath)
+	if storagePath == "" {
+		writeJSONError(writer, http.StatusBadRequest, "storage_path is required")
+		return
+	}
+	if !strings.HasPrefix(storagePath, ownerStoragePrefix(ownerEmail)) {
+		writeJSONError(writer, http.StatusForbidden, "storage_path does not belong to the authenticated user")
+		return
+	}
+	if _, err := s.ensureWithinLimit(ownerEmail); err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+	attrs, err := s.bucket.Object(storagePath).Attrs(request.Context())
+	if err != nil {
+		if errors.Is(err, gcs.ErrObjectNotExist) {
+			writeJSONError(writer, http.StatusNotFound, "uploaded object not found")
+			return
+		}
+		s.writeErr(writer, err)
+		return
+	}
+	if attrs.Size <= 0 {
+		writeJSONError(writer, http.StatusBadRequest, "uploaded object is empty")
+		return
+	}
+	if err := ensureImage(strings.TrimSpace(attrs.ContentType)); err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+
+	now := time.Now().UTC()
+	docRef := s.receipts.NewDoc()
+	imageURL, err := s.signedImageURL(request.Context(), storagePath)
+	if err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+	receiptPayload := map[string]interface{}{
+		"vendor":                            normalizeOptionalString(payload.Vendor),
+		"subtotal":                          payload.Subtotal,
+		"tax":                               payload.Tax,
+		"total":                             payload.Total,
+		"category":                          normalizeOptionalString(payload.Category),
+		"purchase_date":                     normalizeOptionalString(payload.PurchaseDate),
+		"image_url":                         imageURL,
+		"storage_path":                      storagePath,
+		"raw_storage_path":                  storagePath,
+		"items":                             []map[string]interface{}{},
+		"extracted_text":                    "",
+		"extracted_fields":                  map[string]interface{}{},
+		"created_at":                        now,
+		"owner_email":                       ownerEmail,
+		"processing_status":                 "processing",
+		"processing_owner":                  s.workerID,
+		"processing_lease_expires_at":       time.Now().UTC().Add(s.cfg.receiptWorkerLease),
+		"processing_error":                  nil,
+		"processing_started_at":             time.Now().UTC(),
+		"processing_attempts":               1,
+		"image_processing_status":           "ready",
+		"image_processing_error":            nil,
+		"image_processing_owner":            nil,
+		"image_processing_lease_expires_at": nil,
+	}
+	if _, err := docRef.Set(request.Context(), receiptPayload); err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+	job := receiptJob{
+		ID:             docRef.ID,
+		OwnerEmail:     ownerEmail,
+		RawStoragePath: storagePath,
+	}
+	s.processClaimedReceiptJob(request.Context(), job)
+	updated, err := s.receipts.Doc(docRef.ID).Get(request.Context())
+	if err == nil && updated.Exists() {
+		updatedData := updated.Data()
+		s.attachSignedImageURL(request.Context(), updatedData)
+		writeJSON(writer, http.StatusCreated, receiptRecordFromMap(docRef.ID, updatedData))
+		return
+	}
+	writeJSON(writer, http.StatusCreated, receiptRecordFromMap(docRef.ID, receiptPayload))
+}
+
 func (s *apiServer) createReceipt(writer http.ResponseWriter, request *http.Request, user *verifiedUser) {
 	ownerEmail := strings.TrimSpace(user.Email)
 	if ownerEmail == "" {
@@ -211,7 +374,7 @@ func (s *apiServer) createReceipt(writer http.ResponseWriter, request *http.Requ
 	}
 	now := time.Now().UTC()
 	docRef := s.receipts.NewDoc()
-	rawStoragePath := buildStorageKey(header.Filename)
+	rawStoragePath := buildStorageKeyForOwner(ownerEmail, header.Filename)
 	if err := s.uploadRawImageStream(request.Context(), file, rawStoragePath, contentType); err != nil {
 		s.writeErr(writer, err)
 		return
@@ -499,6 +662,27 @@ func buildStorageKey(filename string) string {
 		return fmt.Sprintf("receipts/%d_%s", time.Now().UnixNano(), base)
 	}
 	return "receipts/" + hex.EncodeToString(tokenBytes) + "_" + base
+}
+
+func buildStorageKeyForOwner(ownerEmail string, filename string) string {
+	return ownerStoragePrefix(ownerEmail) + strings.TrimPrefix(buildStorageKey(filename), "receipts/")
+}
+
+func ownerStoragePrefix(ownerEmail string) string {
+	normalized := strings.ToLower(strings.TrimSpace(ownerEmail))
+	sum := sha256.Sum256([]byte(normalized))
+	return "receipts/u_" + hex.EncodeToString(sum[:8]) + "/"
+}
+
+func normalizeOptionalString(value *string) interface{} {
+	if value == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*value)
+	if trimmed == "" {
+		return nil
+	}
+	return trimmed
 }
 
 func (s *apiServer) categoryNames(ctx context.Context, ownerEmail string) ([]string, error) {

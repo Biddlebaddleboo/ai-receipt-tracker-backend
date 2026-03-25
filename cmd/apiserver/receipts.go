@@ -256,6 +256,7 @@ func (s *apiServer) createReceipt(writer http.ResponseWriter, request *http.Requ
 		s.writeErr(writer, err)
 		return
 	}
+	s.wakeReceiptWorker()
 	writeJSON(writer, http.StatusAccepted, receiptRecordFromMap(docRef.ID, payload))
 }
 
@@ -595,10 +596,18 @@ func (s *apiServer) startReceiptWorker() {
 			select {
 			case <-s.workerStop:
 				return
+			case <-s.workerWake:
 			case <-ticker.C:
 			}
 		}
 	}()
+}
+
+func (s *apiServer) wakeReceiptWorker() {
+	select {
+	case s.workerWake <- struct{}{}:
+	default:
+	}
 }
 
 func (s *apiServer) claimNextReceiptJob(ctx context.Context) (receiptJob, bool, error) {
@@ -1158,9 +1167,9 @@ func receiptRecordFromMap(id string, payload map[string]interface{}) receiptReco
 	return receiptRecord{
 		ID:                    id,
 		Vendor:                valueStringPtr(payload["vendor"]),
-		Subtotal:              existingFloatPtr(payload["subtotal"]),
-		Tax:                   existingFloatPtr(payload["tax"]),
-		Total:                 existingFloatPtr(payload["total"]),
+		Subtotal:              existingFloatOrZeroPtr(payload["subtotal"]),
+		Tax:                   existingFloatOrZeroPtr(payload["tax"]),
+		Total:                 existingFloatOrZeroPtr(payload["total"]),
 		Category:              valueStringPtr(payload["category"]),
 		PurchaseDate:          valueStringPtr(payload["purchase_date"]),
 		Items:                 receiptItemsFromAny(payload["items"]),
@@ -1183,8 +1192,8 @@ func receiptItemsFromAny(value interface{}) []receiptItem {
 			for _, item := range typed {
 				result = append(result, receiptItem{
 					Name:     stringFromAny(item["name"]),
-					Quantity: existingFloatPtr(item["quantity"]),
-					Price:    existingFloatPtr(item["price"]),
+					Quantity: existingFloatOrZeroPtr(item["quantity"]),
+					Price:    existingFloatOrZeroPtr(item["price"]),
 				})
 			}
 			return result
@@ -1199,8 +1208,8 @@ func receiptItemsFromAny(value interface{}) []receiptItem {
 		}
 		result = append(result, receiptItem{
 			Name:     stringFromAny(item["name"]),
-			Quantity: existingFloatPtr(item["quantity"]),
-			Price:    existingFloatPtr(item["price"]),
+			Quantity: existingFloatOrZeroPtr(item["quantity"]),
+			Price:    existingFloatOrZeroPtr(item["price"]),
 		})
 	}
 	return result
@@ -1284,6 +1293,15 @@ func normalizeAmount(value interface{}) *float64 {
 
 func existingFloatPtr(value interface{}) *float64 {
 	return normalizeAmount(value)
+}
+
+func existingFloatOrZeroPtr(value interface{}) *float64 {
+	parsed := normalizeAmount(value)
+	if parsed != nil {
+		return parsed
+	}
+	zero := 0.0
+	return &zero
 }
 
 func valueFloatPtr(value interface{}) *float64 {

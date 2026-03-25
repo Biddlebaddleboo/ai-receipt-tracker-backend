@@ -70,6 +70,7 @@ type apiServer struct {
 	httpServer *http.Server
 	workerID   string
 	workerStop chan struct{}
+	workerWake chan struct{}
 }
 
 func main() {
@@ -164,6 +165,7 @@ func newAPIServer(cfg config) (*apiServer, error) {
 		bucket:     storageClient.Bucket(cfg.gcsBucketName),
 		workerID:   buildWorkerID(),
 		workerStop: make(chan struct{}),
+		workerWake: make(chan struct{}, 1),
 	}, nil
 }
 

@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"image"
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
@@ -17,15 +16,15 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"os"
+	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	fs "cloud.google.com/go/firestore"
 	gcs "cloud.google.com/go/storage"
-	"github.com/gen2brain/avif"
 	"google.golang.org/api/iterator"
 )
 
@@ -555,63 +554,92 @@ func (s *apiServer) convertAndUploadAVIFFromStorage(ctx context.Context, sourceP
 	} else if !errors.Is(err, gcs.ErrObjectNotExist) {
 		return fmt.Errorf("failed checking destination image: %w", err)
 	}
+	return s.convertAndUploadAVIFWithFFmpeg(ctx, sourcePath, destination)
+}
+
+func (s *apiServer) convertAndUploadAVIFWithFFmpeg(ctx context.Context, sourcePath string, destination string) error {
+	ffmpegPath, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		return fmt.Errorf("ffmpeg not available: %w", err)
+	}
+	inputFile, err := os.CreateTemp("", "receipt-avif-input-*")
+	if err != nil {
+		return fmt.Errorf("failed creating ffmpeg input temp file: %w", err)
+	}
+	inputPath := inputFile.Name()
+	_ = inputFile.Close()
+	defer os.Remove(inputPath)
+
+	outputFile, err := os.CreateTemp("", "receipt-avif-output-*.avif")
+	if err != nil {
+		return fmt.Errorf("failed creating ffmpeg output temp file: %w", err)
+	}
+	outputPath := outputFile.Name()
+	_ = outputFile.Close()
+	defer os.Remove(outputPath)
 
 	reader, err := s.bucket.Object(sourcePath).NewReader(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to read source image: %w", err)
 	}
-	defer reader.Close()
-	img, _, err := image.Decode(reader)
-	if err != nil {
-		return httpError{status: http.StatusBadRequest, detail: "Uploaded file must be a supported image"}
-	}
-
-	partPrefix := destination + ".part."
-	parts, resumeBytes, nextIndex, err := s.loadAVIFPartState(ctx, partPrefix)
-	if err != nil {
-		return err
-	}
-	log.Printf("avif_resume_start source=%s destination=%s resume_bytes=%d next_part_index=%d", sourcePath, destination, resumeBytes, nextIndex)
-
-	pipeReader, pipeWriter := io.Pipe()
-	encodeErrCh := make(chan error, 1)
-	go func() {
-		encodeErr := avif.Encode(pipeWriter, img, avif.Options{Quality: 50, QualityAlpha: 10, Speed: 10})
-		if encodeErr != nil {
-			_ = pipeWriter.CloseWithError(encodeErr)
-			encodeErrCh <- encodeErr
-			return
+	if err := func() error {
+		defer reader.Close()
+		dst, createErr := os.Create(inputPath)
+		if createErr != nil {
+			return createErr
 		}
-		_ = pipeWriter.Close()
-		encodeErrCh <- nil
-	}()
+		defer dst.Close()
+		_, copyErr := io.Copy(dst, reader)
+		return copyErr
+	}(); err != nil {
+		return fmt.Errorf("failed staging source image: %w", err)
+	}
 
-	if resumeBytes > 0 {
-		if _, err := io.CopyN(io.Discard, pipeReader, resumeBytes); err != nil {
-			_ = pipeReader.Close()
-			return fmt.Errorf("failed resuming avif stream at byte %d: %w", resumeBytes, err)
+	cmd := exec.CommandContext(
+		ctx,
+		ffmpegPath,
+		"-y",
+		"-hide_banner",
+		"-loglevel", "error",
+		"-i", inputPath,
+		"-c:v", "libsvtav1",
+		"-preset", "12",
+		"-crf", "45",
+		"-svtav1-params", "tune=0",
+		outputPath,
+	)
+	if output, runErr := cmd.CombinedOutput(); runErr != nil {
+		cmd = exec.CommandContext(
+			ctx,
+			ffmpegPath,
+			"-y",
+			"-hide_banner",
+			"-loglevel", "error",
+			"-i", inputPath,
+			"-c:v", "libaom-av1",
+			"-cpu-used", "8",
+			"-crf", "38",
+			"-still-picture", "1",
+			outputPath,
+		)
+		if outputAOM, runErrAOM := cmd.CombinedOutput(); runErrAOM != nil {
+			return fmt.Errorf("ffmpeg svt-av1 failed: %v (%s), aom fallback failed: %v (%s)", runErr, strings.TrimSpace(string(output)), runErrAOM, strings.TrimSpace(string(outputAOM)))
 		}
 	}
 
-	uploadedParts, err := s.uploadAVIFParts(ctx, pipeReader, partPrefix, nextIndex)
+	avifFile, err := os.Open(outputPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed reading ffmpeg output: %w", err)
 	}
-	parts = append(parts, uploadedParts...)
-	if len(parts) == 0 {
-		return fmt.Errorf("no avif parts available for compose")
+	defer avifFile.Close()
+	objWriter := s.bucket.Object(destination).NewWriter(ctx)
+	objWriter.ContentType = "image/avif"
+	if _, err := io.Copy(objWriter, avifFile); err != nil {
+		_ = objWriter.Close()
+		return fmt.Errorf("failed uploading ffmpeg avif: %w", err)
 	}
-	sort.Strings(parts)
-
-	if encodeErr := <-encodeErrCh; encodeErr != nil {
-		return fmt.Errorf("failed to convert image: %w", encodeErr)
-	}
-
-	if err := s.composeObjects(ctx, parts, destination); err != nil {
-		return fmt.Errorf("failed composing avif parts: %w", err)
-	}
-	if err := s.deleteObjects(ctx, parts); err != nil {
-		log.Printf("failed to cleanup avif parts destination=%s err=%v", destination, err)
+	if err := objWriter.Close(); err != nil {
+		return fmt.Errorf("failed finalizing ffmpeg avif upload: %w", err)
 	}
 	return nil
 }

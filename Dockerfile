@@ -13,7 +13,12 @@ RUN apt-get update && \
     go mod download && \
     go build -o /out/apiserver
 
-FROM gcr.io/distroless/cc-debian12
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates ffmpeg && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY --from=go-api-build /out/apiserver /app/apiserver

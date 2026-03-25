@@ -7,8 +7,10 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from pydantic import BaseModel, root_validator
+
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.config import Settings
 from app.dependencies import (
@@ -20,6 +22,18 @@ from app.dependencies import (
 )
 from app.helcim_recurring import HelcimRecurringClient
 from app.subscriptions import SubscriptionService
+
+
+class SubscriptionActivationPayload(BaseModel):
+    plan_id: Optional[str] = None
+    payment_plan_id: Optional[int] = None
+
+    @root_validator
+    def must_specify_plan(cls, values):
+        plan_id, payment_plan_id = values.get("plan_id"), values.get("payment_plan_id")
+        if not plan_id and payment_plan_id is None:
+            raise ValueError("plan_id or payment_plan_id is required")
+        return values
 
 router = APIRouter()
 logger = logging.getLogger("app.billing")
@@ -82,22 +96,10 @@ def helcim_approval_landing(
 ) -> Any:
     payload = passthrough_query_params(request)
     validate_helcim_callback_auth(settings, payload, secret_query=secret)
-    if not payload.get("transactionId"):
-        return approval_redirect_response(
-            settings, {"status": "ok", "callback": "received"}
-        )
-    try:
-        result = process_helcim_approval_payload(payload, helcim_client)
-        return approval_redirect_response(settings, {"status": "ok", **result})
-    except HTTPException as exc:
-        return approval_redirect_response(
-            settings,
-            {
-                "status": "error",
-                "error": exc.detail,
-                "transaction_id": payload.get("transactionId"),
-            },
-        )
+    return HTMLResponse(
+        "<html><body><h1>Success!</h1><p>Your payment method has been saved. You may now close this window and refresh the page to purchase the plan.</p></body></html>",
+        status_code=200,
+    )
 
 
 @router.get("/billing/helcim/payment-plans")
@@ -177,6 +179,46 @@ def helcim_get_subscription(subscription_id: int, request: Request) -> Any:
 def helcim_delete_subscription(subscription_id: int, request: Request) -> Any:
     owner_email = require_owner_email(request)
     return helcim_client.delete_subscription(subscription_id)
+
+
+@router.post("/billing/subscriptions/activate")
+def activate_subscription_with_saved_method(
+    payload: SubscriptionActivationPayload, request: Request
+) -> Dict[str, Any]:
+    owner_email = require_owner_email(request)
+    plan = subscription_service.resolve_activation_plan(
+        payload.plan_id, payload.payment_plan_id
+    )
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    payment_plan_id = plan.get("payment_plan_id")
+    if payment_plan_id is None:
+        raise HTTPException(status_code=400, detail="Plan is missing payment_plan_id")
+
+    user_doc = subscription_service.get_user_doc(owner_email)
+    customer_code = str(user_doc.get("helcim_customer_code", "")).strip()
+    card_token = str(user_doc.get("helcim_card_token", "")).strip()
+    if not customer_code and not card_token:
+        raise HTTPException(
+            status_code=400,
+            detail="No saved Helcim customer or card token available for this user",
+        )
+
+    request_payload: Dict[str, Any] = {"paymentPlanId": payment_plan_id}
+    if customer_code:
+        request_payload["customerCode"] = customer_code
+    if card_token:
+        request_payload["cardToken"] = card_token
+    subscription_response = helcim_client.create_subscriptions(request_payload)
+    activated_plan_id = subscription_service.apply_subscription_payload(
+        owner_email, subscription_response
+    )
+    return {
+        "status": "ok",
+        "plan_id": activated_plan_id,
+        "plan_name": plan.get("name"),
+        "subscription": subscription_response,
+    }
 
 
 @router.post("/billing/helcim/subscriptions/{subscription_id}/sync")

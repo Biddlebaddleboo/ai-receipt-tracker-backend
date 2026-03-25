@@ -8,6 +8,7 @@ import logging
 
 from fastapi import HTTPException, status
 from google.cloud import firestore
+from typing import Iterable
 
 OWNER_FIELD = "owner_email"
 DEFAULT_PLAN_ID = "free"
@@ -107,6 +108,27 @@ class SubscriptionService:
             payload.get("paymentPlanId"),
         )
         return plan["plan_id"]
+
+    def get_user_doc(self, owner_email: str) -> Dict[str, Any]:
+        _, user_doc = self._find_or_choose_user_doc(owner_email)
+        return user_doc or {}
+
+    def resolve_activation_plan(
+        self, plan_id: Optional[str], payment_plan_id: Optional[int]
+    ) -> Optional[Dict[str, Any]]:
+        if payment_plan_id is not None:
+            plan = self._find_plan_by_payment_plan_id(payment_plan_id)
+            if plan:
+                return plan
+        if plan_id:
+            plan = (
+                self._find_plan_by_document_id(plan_id)
+                or self._find_plan_by_plan_id_field(plan_id)
+                or self._find_plan_by_name(plan_id)
+            )
+            if plan:
+                return plan
+        return None
 
     def find_plan_by_payment_plan_id(self, payment_plan_id: Optional[Any]) -> Optional[Dict[str, Any]]:
         coerced_payment_plan_id = self._coerce_int(payment_plan_id)

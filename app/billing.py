@@ -56,7 +56,23 @@ async def helcim_approval_callback(
         secret_header=x_helcim_approval_secret,
     )
     result = process_helcim_approval_payload(payload, helcim_client)
-    return {"status": "ok", **result}
+    owner_email = resolve_owner_email_for_callback(payload)
+    payment_method_saved = False
+    if owner_email:
+        subscription_service.store_payment_method_registration(
+            owner_email=owner_email,
+            customer_code=result.get("customer_code"),
+            card_token=result.get("card_token"),
+            transaction_id=result.get("transaction_id"),
+            approved_at=parse_callback_result_datetime(result.get("approved_at")),
+        )
+        payment_method_saved = True
+    return {
+        "status": "ok",
+        **result,
+        "owner_email": owner_email,
+        "payment_method_saved": payment_method_saved,
+    }
 
 
 @router.get("/billing/helcim/approval")
@@ -343,6 +359,36 @@ def process_helcim_approval_payload(
         "approved_at": paid_at.isoformat() if paid_at else None,
         "plan_activated": False,
     }
+
+
+def resolve_owner_email_for_callback(payload: Dict[str, Any]) -> Optional[str]:
+    candidate_fields = (
+        "billingEmailAddress",
+        "email",
+        "emailAddress",
+        "customerEmail",
+        "shippingEmailAddress",
+    )
+    for field_name in candidate_fields:
+        value = payload.get(field_name)
+        if value is None:
+            continue
+        text = str(value).strip().lower()
+        if text:
+            return text
+    return None
+
+
+def parse_callback_result_datetime(value: Optional[Any]) -> Optional[datetime]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
 
 
 async def extract_helcim_callback_payload(request: Request) -> Dict[str, Any]:

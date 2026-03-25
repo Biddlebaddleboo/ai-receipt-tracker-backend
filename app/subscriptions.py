@@ -152,6 +152,45 @@ class SubscriptionService:
             normalized,
         )
 
+    def store_payment_method_registration(
+        self,
+        owner_email: str,
+        customer_code: Optional[str],
+        card_token: Optional[str],
+        transaction_id: Optional[int],
+        approved_at: Optional[datetime],
+    ) -> None:
+        normalized_email = str(owner_email).strip().lower()
+        if not normalized_email:
+            raise HTTPException(status_code=400, detail="owner email is required")
+        update_data: Dict[str, Any] = {
+            OWNER_FIELD: normalized_email,
+            "payment_method_ready": True,
+            "payment_method_status": "verified",
+            "payment_method_updated_at": datetime.utcnow(),
+        }
+        normalized_customer_code = str(customer_code or "").strip()
+        if normalized_customer_code:
+            update_data["helcim_customer_code"] = normalized_customer_code
+            update_data["customer_code_updated_at"] = datetime.utcnow()
+        normalized_card_token = str(card_token or "").strip()
+        if normalized_card_token:
+            update_data["helcim_card_token"] = normalized_card_token
+        if transaction_id is not None:
+            update_data["last_transaction_id"] = transaction_id
+        if approved_at is not None:
+            update_data["payment_method_verified_at"] = approved_at
+        user_doc_ref = self._get_or_create_user_ref(normalized_email)
+        user_doc_ref.set(update_data, merge=True)
+        logger.info(
+            "store_payment_method_registration owner=%s doc_id=%s customer_code=%s has_card_token=%s transaction_id=%s",
+            normalized_email,
+            user_doc_ref.id,
+            normalized_customer_code or None,
+            bool(normalized_card_token),
+            transaction_id,
+        )
+
     def activate_plan_from_transaction(
         self,
         owner_email: str,

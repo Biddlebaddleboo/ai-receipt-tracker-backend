@@ -115,6 +115,7 @@ def _merge_origin_regex(
 class Settings(BaseModel):
     model_config = ConfigDict(extra="allow")
 
+    firestore_database_id: str = "(default)"
     plans_collection: str = "plans"
     users_collection: str = "users"
     helcim_api_token: Optional[str] = None
@@ -142,6 +143,7 @@ def get_settings() -> Settings:
     preview_regex = _build_preview_regex(normalized_origins)
     allowed_origin_regex_value = _merge_origin_regex(configured_regex, preview_regex)
     return Settings(
+        firestore_database_id=os.getenv("FIRESTORE_DATABASE_ID", "(default)"),
         plans_collection=os.getenv("PLANS_COLLECTION_NAME", "plans"),
         users_collection=os.getenv("USERS_COLLECTION_NAME", "users"),
         helcim_api_token=os.getenv("HELCIM_API_TOKEN"),

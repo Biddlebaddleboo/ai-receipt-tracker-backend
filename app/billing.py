@@ -209,11 +209,15 @@ def activate_subscription_with_saved_method(
             detail="Saved payment method is missing Helcim customer code",
         )
 
+    activation_date = datetime.utcnow().date().isoformat()
     subscription_body = {
         "paymentPlanId": payment_plan_id,
         "customerCode": customer_code,
-        "activationDate": datetime.utcnow().date().isoformat(),
+        "dateActivated": activation_date,
     }
+    recurring_amount = subscription_service.plan_price_cents(plan)
+    if recurring_amount is not None:
+        subscription_body["recurringAmount"] = recurring_amount / 100.0
     payment_method = str(plan.get("paymentMethod", "")).strip().lower()
     if not payment_method and card_token:
         payment_method = "card"

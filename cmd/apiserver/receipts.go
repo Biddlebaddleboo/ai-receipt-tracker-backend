@@ -153,6 +153,20 @@ func (s *apiServer) handleReceiptByID(writer http.ResponseWriter, request *http.
 		writeJSONError(writer, http.StatusNotFound, "Not found")
 		return
 	}
+	if strings.HasSuffix(path, "/image") {
+		receiptID := strings.TrimSuffix(path, "/image")
+		receiptID = strings.TrimSuffix(receiptID, "/")
+		if receiptID == "" || strings.Contains(receiptID, "/") {
+			writeJSONError(writer, http.StatusNotFound, "Not found")
+			return
+		}
+		if request.Method != http.MethodGet {
+			writeJSONError(writer, http.StatusMethodNotAllowed, "Method not allowed")
+			return
+		}
+		s.redirectReceiptImage(writer, request, user, receiptID)
+		return
+	}
 	if strings.Contains(path, "/") {
 		writeJSONError(writer, http.StatusNotFound, "Not found")
 		return
@@ -424,6 +438,28 @@ func (s *apiServer) deleteReceipt(writer http.ResponseWriter, request *http.Requ
 		// No AVIF side objects are generated anymore.
 	}
 	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (s *apiServer) redirectReceiptImage(writer http.ResponseWriter, request *http.Request, user *verifiedUser, receiptID string) {
+	data, err := s.getOwnedReceipt(request.Context(), receiptID, user.Email)
+	if err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+	storagePath := stringFromAny(data["storage_path"])
+	if storagePath == "" {
+		storagePath = stringFromAny(data["raw_storage_path"])
+	}
+	if storagePath == "" {
+		writeJSONError(writer, http.StatusNotFound, "Receipt image not available")
+		return
+	}
+	signedURL, err := s.signedImageURL(request.Context(), storagePath)
+	if err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+	http.Redirect(writer, request, signedURL, http.StatusTemporaryRedirect)
 }
 
 func (s *apiServer) getOwnedReceipt(ctx context.Context, receiptID string, ownerEmail string) (map[string]interface{}, error) {

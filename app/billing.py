@@ -215,11 +215,30 @@ def activate_subscription_with_saved_method(
         "activationDate": datetime.utcnow().date().isoformat(),
     }
     payment_method = str(plan.get("paymentMethod", "")).strip().lower()
+    if not payment_method and card_token:
+        payment_method = "card"
     if payment_method:
         request_payload["paymentMethod"] = payment_method
+    logger.warning(
+        "activate_subscription_with_saved_method owner=%s plan_id=%s payment_plan_id=%s payment_method=%s has_customer_code=%s has_card_token=%s payload=%s",
+        owner_email,
+        plan.get("plan_id"),
+        payment_plan_id,
+        payment_method or None,
+        bool(customer_code),
+        bool(card_token),
+        request_payload,
+    )
     idempotency_key = str(uuid.uuid4())
     subscription_response = helcim_client.create_subscriptions(
         request_payload, idempotency_key=idempotency_key
+    )
+    logger.warning(
+        "activate_subscription_with_saved_method_response owner=%s plan_id=%s payment_plan_id=%s response=%s",
+        owner_email,
+        plan.get("plan_id"),
+        payment_plan_id,
+        subscription_response,
     )
     activated_plan_id = subscription_service.apply_subscription_payload(
         owner_email, subscription_response

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Dict, Optional
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
 from fastapi import HTTPException, status
+
+logger = logging.getLogger("app.helcim")
 
 
 class HelcimRecurringClient:
@@ -87,12 +90,27 @@ class HelcimRecurringClient:
         if payload is not None:
             headers["Content-Type"] = "application/json"
             data = json.dumps(payload).encode("utf-8")
+        logger.warning(
+            "helcim_request method=%s path=%s url=%s payload=%s idempotency_key=%s",
+            method,
+            path,
+            url,
+            payload,
+            idempotency_key,
+        )
 
         req = urllib_request.Request(url=url, data=data, headers=headers, method=method)
 
         try:
             with urllib_request.urlopen(req, timeout=self._timeout_seconds) as resp:
                 raw = resp.read().decode("utf-8").strip()
+                logger.warning(
+                    "helcim_response method=%s path=%s status=%s body=%s",
+                    method,
+                    path,
+                    getattr(resp, "status", "unknown"),
+                    raw,
+                )
                 if not raw:
                     return {}
                 try:
@@ -101,6 +119,13 @@ class HelcimRecurringClient:
                     return {"raw": raw}
         except urllib_error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="replace").strip()
+            logger.error(
+                "helcim_http_error method=%s path=%s status=%s body=%s",
+                method,
+                path,
+                exc.code,
+                raw,
+            )
             detail: Any = f"Helcim API request failed ({exc.code})"
             if raw:
                 try:
@@ -110,6 +135,12 @@ class HelcimRecurringClient:
             raise HTTPException(status_code=exc.code, detail=detail) from exc
         except urllib_error.URLError as exc:
             reason = getattr(exc, "reason", "unknown network error")
+            logger.error(
+                "helcim_url_error method=%s path=%s reason=%s",
+                method,
+                path,
+                reason,
+            )
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=f"Failed to reach Helcim API: {reason}",

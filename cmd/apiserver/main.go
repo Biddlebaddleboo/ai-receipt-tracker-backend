@@ -38,6 +38,7 @@ type config struct {
 	receiptWorkerPoll   time.Duration
 	receiptWorkerLease  time.Duration
 	avifEncoder         string
+	avifSkipBelowBytes  int64
 }
 
 type verifiedUser struct {
@@ -129,6 +130,7 @@ func loadConfig() (config, error) {
 		receiptWorkerPoll:   time.Duration(parseIntDefault("RECEIPT_WORKER_POLL_SECONDS", 5)) * time.Second,
 		receiptWorkerLease:  time.Duration(parseIntDefault("RECEIPT_WORKER_LEASE_SECONDS", 1200)) * time.Second,
 		avifEncoder:         strings.ToLower(strings.TrimSpace(envOrDefault("AVIF_ENCODER", "auto"))),
+		avifSkipBelowBytes:  int64(parseIntDefault("AVIF_SKIP_BELOW_BYTES", 200*1024)),
 	}
 	if len(cfg.allowedOrigins) == 0 {
 		cfg.allowedOrigins = []string{"http://localhost:3000"}

@@ -18,6 +18,7 @@ import (
 	"math"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -258,6 +259,8 @@ func (s *apiServer) createReceipt(writer http.ResponseWriter, request *http.Requ
 		s.writeErr(writer, err)
 		return
 	}
+	// Nudge the background worker immediately so AVIF can start as a low-priority task.
+	s.wakeReceiptWorker()
 	job := receiptJob{
 		ID:             docRef.ID,
 		OwnerEmail:     ownerEmail,
@@ -423,9 +426,25 @@ func (s *apiServer) deleteReceipt(writer http.ResponseWriter, request *http.Requ
 		s.writeErr(writer, err)
 		return
 	}
-	if storagePath := stringFromAny(data["storage_path"]); storagePath != "" {
+	rawStoragePath := strings.TrimSpace(stringFromAny(data["raw_storage_path"]))
+	storagePath := strings.TrimSpace(stringFromAny(data["storage_path"]))
+	if storagePath != "" {
 		if err := s.bucket.Object(storagePath).Delete(request.Context()); err != nil && !errors.Is(err, gcs.ErrObjectNotExist) {
 			log.Printf("failed to delete storage object %s: %v", storagePath, err)
+		}
+	}
+	if rawStoragePath != "" && rawStoragePath != storagePath {
+		if err := s.bucket.Object(rawStoragePath).Delete(request.Context()); err != nil && !errors.Is(err, gcs.ErrObjectNotExist) {
+			log.Printf("failed to delete raw storage object %s: %v", rawStoragePath, err)
+		}
+	}
+	if rawStoragePath != "" {
+		avifDestination := rawStoragePath + ".avif"
+		if err := s.deleteObjectsByPrefix(request.Context(), avifDestination+".part."); err != nil {
+			log.Printf("failed to delete avif part objects prefix=%s err=%v", avifDestination+".part.", err)
+		}
+		if err := s.deleteObjectsByPrefix(request.Context(), avifDestination+".compose."); err != nil {
+			log.Printf("failed to delete avif compose objects prefix=%s err=%v", avifDestination+".compose.", err)
 		}
 	}
 	writer.WriteHeader(http.StatusNoContent)
@@ -531,6 +550,12 @@ func (s *apiServer) categoryNames(ctx context.Context, ownerEmail string) ([]str
 }
 
 func (s *apiServer) convertAndUploadAVIFFromStorage(ctx context.Context, sourcePath string, destination string) error {
+	if _, err := s.bucket.Object(destination).Attrs(ctx); err == nil {
+		return nil
+	} else if !errors.Is(err, gcs.ErrObjectNotExist) {
+		return fmt.Errorf("failed checking destination image: %w", err)
+	}
+
 	reader, err := s.bucket.Object(sourcePath).NewReader(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to read source image: %w", err)
@@ -540,20 +565,216 @@ func (s *apiServer) convertAndUploadAVIFFromStorage(ctx context.Context, sourceP
 	if err != nil {
 		return httpError{status: http.StatusBadRequest, detail: "Uploaded file must be a supported image"}
 	}
-	return s.uploadAVIFImage(ctx, img, destination)
-}
 
-func (s *apiServer) uploadAVIFImage(ctx context.Context, img image.Image, destination string) error {
-	objWriter := s.bucket.Object(destination).NewWriter(ctx)
-	objWriter.ContentType = "image/avif"
-	if err := avif.Encode(objWriter, img, avif.Options{Quality: 50, QualityAlpha: 10, Speed: 10}); err != nil {
-		_ = objWriter.Close()
-		return fmt.Errorf("failed to convert image: %w", err)
+	partPrefix := destination + ".part."
+	parts, resumeBytes, nextIndex, err := s.loadAVIFPartState(ctx, partPrefix)
+	if err != nil {
+		return err
 	}
-	if err := objWriter.Close(); err != nil {
-		return fmt.Errorf("failed to upload image: %w", err)
+	log.Printf("avif_resume_start source=%s destination=%s resume_bytes=%d next_part_index=%d", sourcePath, destination, resumeBytes, nextIndex)
+
+	pipeReader, pipeWriter := io.Pipe()
+	encodeErrCh := make(chan error, 1)
+	go func() {
+		encodeErr := avif.Encode(pipeWriter, img, avif.Options{Quality: 50, QualityAlpha: 10, Speed: 10})
+		if encodeErr != nil {
+			_ = pipeWriter.CloseWithError(encodeErr)
+			encodeErrCh <- encodeErr
+			return
+		}
+		_ = pipeWriter.Close()
+		encodeErrCh <- nil
+	}()
+
+	if resumeBytes > 0 {
+		if _, err := io.CopyN(io.Discard, pipeReader, resumeBytes); err != nil {
+			_ = pipeReader.Close()
+			return fmt.Errorf("failed resuming avif stream at byte %d: %w", resumeBytes, err)
+		}
+	}
+
+	uploadedParts, err := s.uploadAVIFParts(ctx, pipeReader, partPrefix, nextIndex)
+	if err != nil {
+		return err
+	}
+	parts = append(parts, uploadedParts...)
+	if len(parts) == 0 {
+		return fmt.Errorf("no avif parts available for compose")
+	}
+	sort.Strings(parts)
+
+	if encodeErr := <-encodeErrCh; encodeErr != nil {
+		return fmt.Errorf("failed to convert image: %w", encodeErr)
+	}
+
+	if err := s.composeObjects(ctx, parts, destination); err != nil {
+		return fmt.Errorf("failed composing avif parts: %w", err)
+	}
+	if err := s.deleteObjects(ctx, parts); err != nil {
+		log.Printf("failed to cleanup avif parts destination=%s err=%v", destination, err)
 	}
 	return nil
+}
+
+func (s *apiServer) loadAVIFPartState(ctx context.Context, partPrefix string) ([]string, int64, int, error) {
+	iter := s.bucket.Objects(ctx, &gcs.Query{Prefix: partPrefix})
+	partNamesByIndex := map[int]string{}
+	partSizeByIndex := map[int]int64{}
+	for {
+		attrs, err := iter.Next()
+		if errors.Is(err, iterator.Done) {
+			break
+		}
+		if err != nil {
+			return nil, 0, 0, fmt.Errorf("failed listing avif parts: %w", err)
+		}
+		suffix := strings.TrimPrefix(attrs.Name, partPrefix)
+		index, parseErr := strconv.Atoi(suffix)
+		if parseErr != nil || index < 0 {
+			continue
+		}
+		partNamesByIndex[index] = attrs.Name
+		partSizeByIndex[index] = attrs.Size
+	}
+
+	resumeParts := make([]string, 0)
+	var resumeBytes int64
+	nextIndex := 0
+	for {
+		name, ok := partNamesByIndex[nextIndex]
+		if !ok {
+			break
+		}
+		resumeParts = append(resumeParts, name)
+		resumeBytes += partSizeByIndex[nextIndex]
+		nextIndex++
+	}
+	return resumeParts, resumeBytes, nextIndex, nil
+}
+
+func (s *apiServer) uploadAVIFParts(ctx context.Context, encoded io.Reader, partPrefix string, startIndex int) ([]string, error) {
+	const chunkSize = 8 << 20
+	uploadedParts := make([]string, 0)
+	buffer := make([]byte, chunkSize)
+	partIndex := startIndex
+	for {
+		n, readErr := io.ReadFull(encoded, buffer)
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if errors.Is(readErr, io.ErrUnexpectedEOF) {
+			// n bytes are valid and should be uploaded as the final chunk.
+		} else if readErr != nil {
+			return uploadedParts, fmt.Errorf("failed reading avif stream: %w", readErr)
+		}
+		if n > 0 {
+			partName := fmt.Sprintf("%s%06d", partPrefix, partIndex)
+			objWriter := s.bucket.Object(partName).NewWriter(ctx)
+			objWriter.ContentType = "application/octet-stream"
+			if _, err := io.Copy(objWriter, bytes.NewReader(buffer[:n])); err != nil {
+				_ = objWriter.Close()
+				return uploadedParts, fmt.Errorf("failed writing avif part %s: %w", partName, err)
+			}
+			if err := objWriter.Close(); err != nil {
+				return uploadedParts, fmt.Errorf("failed finalizing avif part %s: %w", partName, err)
+			}
+			uploadedParts = append(uploadedParts, partName)
+			partIndex++
+		}
+		if errors.Is(readErr, io.ErrUnexpectedEOF) {
+			break
+		}
+	}
+	return uploadedParts, nil
+}
+
+func (s *apiServer) composeObjects(ctx context.Context, sourceObjects []string, destination string) error {
+	if len(sourceObjects) == 0 {
+		return fmt.Errorf("compose called with no source objects")
+	}
+	current := append([]string(nil), sourceObjects...)
+	tmpNames := make([]string, 0)
+	batchCounter := 0
+	for len(current) > 32 {
+		next := make([]string, 0, (len(current)+31)/32)
+		for i := 0; i < len(current); i += 32 {
+			end := i + 32
+			if end > len(current) {
+				end = len(current)
+			}
+			tmpName := fmt.Sprintf("%s.compose.%d.%d", destination, time.Now().UnixNano(), batchCounter)
+			if err := s.composeBatch(ctx, current[i:end], tmpName, "application/octet-stream"); err != nil {
+				return err
+			}
+			tmpNames = append(tmpNames, tmpName)
+			next = append(next, tmpName)
+			batchCounter++
+		}
+		current = next
+	}
+	if err := s.composeBatch(ctx, current, destination, "image/avif"); err != nil {
+		return err
+	}
+	if len(tmpNames) > 0 {
+		if err := s.deleteObjects(ctx, tmpNames); err != nil {
+			log.Printf("failed to cleanup temporary compose objects destination=%s err=%v", destination, err)
+		}
+	}
+	return nil
+}
+
+func (s *apiServer) composeBatch(ctx context.Context, sourceObjects []string, destination string, contentType string) error {
+	sources := make([]*gcs.ObjectHandle, 0, len(sourceObjects))
+	for _, name := range sourceObjects {
+		sources = append(sources, s.bucket.Object(name))
+	}
+	composer := s.bucket.Object(destination).ComposerFrom(sources...)
+	composer.ContentType = contentType
+	if _, err := composer.Run(ctx); err != nil {
+		return fmt.Errorf("compose failed destination=%s: %w", destination, err)
+	}
+	return nil
+}
+
+func (s *apiServer) deleteObjects(ctx context.Context, objectNames []string) error {
+	var firstErr error
+	for _, name := range objectNames {
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		if err := s.bucket.Object(name).Delete(ctx); err != nil && !errors.Is(err, gcs.ErrObjectNotExist) {
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
+func (s *apiServer) deleteObjectsByPrefix(ctx context.Context, prefix string) error {
+	if strings.TrimSpace(prefix) == "" {
+		return nil
+	}
+	iter := s.bucket.Objects(ctx, &gcs.Query{Prefix: prefix})
+	var firstErr error
+	for {
+		attrs, err := iter.Next()
+		if errors.Is(err, iterator.Done) {
+			break
+		}
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			break
+		}
+		if delErr := s.bucket.Object(attrs.Name).Delete(ctx); delErr != nil && !errors.Is(delErr, gcs.ErrObjectNotExist) {
+			if firstErr == nil {
+				firstErr = delErr
+			}
+		}
+	}
+	return firstErr
 }
 
 func (s *apiServer) uploadRawImage(ctx context.Context, data []byte, destination string, contentType string) error {
@@ -720,7 +941,8 @@ func (s *apiServer) tryClaimImageJob(ctx context.Context, ref *fs.DocumentRef, n
 			return err
 		}
 		data := snapshot.Data()
-		if fallbackString(data["processing_status"], "") != "ready" {
+		processingStatus := fallbackString(data["processing_status"], "")
+		if processingStatus != "queued" && processingStatus != "processing" && processingStatus != "ready" {
 			return nil
 		}
 		imageStatus := fallbackString(data["image_processing_status"], "")

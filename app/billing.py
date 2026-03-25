@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
-from pydantic import BaseModel, root_validator
+from pydantic import BaseModel, model_validator
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -28,10 +28,9 @@ class SubscriptionActivationPayload(BaseModel):
     plan_id: Optional[str] = None
     payment_plan_id: Optional[int] = None
 
-    @root_validator
+    @model_validator(mode="after")
     def must_specify_plan(cls, values):
-        plan_id, payment_plan_id = values.get("plan_id"), values.get("payment_plan_id")
-        if not plan_id and payment_plan_id is None:
+        if not values.plan_id and values.payment_plan_id is None:
             raise ValueError("plan_id or payment_plan_id is required")
         return values
 

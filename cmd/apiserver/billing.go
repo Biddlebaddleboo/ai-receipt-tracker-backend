@@ -38,14 +38,6 @@ func (s *apiServer) handleBilling(writer http.ResponseWriter, request *http.Requ
 		s.handleBillingNotify(writer, request, user.Email)
 	case path == "/helcim/customer-code" && request.Method == http.MethodPost:
 		s.handleSetCustomerCode(writer, request, user.Email)
-	case path == "/helcim/payment-plans" && request.Method == http.MethodGet:
-		s.handleHelcimPaymentPlansList(writer, request)
-	case path == "/helcim/payment-plans" && request.Method == http.MethodPost:
-		s.forwardHelcimPayload(writer, request, http.MethodPost, "payment-plans", "")
-	case path == "/helcim/payment-plans" && request.Method == http.MethodPatch:
-		s.forwardHelcimPayload(writer, request, http.MethodPatch, "payment-plans", "")
-	case strings.HasPrefix(path, "/helcim/payment-plans/"):
-		s.handleHelcimPaymentPlanByID(writer, request, strings.TrimPrefix(path, "/helcim/payment-plans/"))
 	case path == "/helcim/subscriptions" && request.Method == http.MethodGet:
 		s.forwardHelcimQuery(writer, request, http.MethodGet, "subscriptions")
 	case path == "/helcim/subscriptions" && request.Method == http.MethodPost:
@@ -155,80 +147,6 @@ func (s *apiServer) handleHelcimApproval(writer http.ResponseWriter, request *ht
 	result["owner_email"] = ownerEmail
 	result["payment_method_saved"] = paymentMethodSaved
 	writeJSON(writer, http.StatusOK, result)
-}
-
-func (s *apiServer) handleHelcimPaymentPlansList(writer http.ResponseWriter, request *http.Request) {
-	resp, err := s.helcim.request(http.MethodGet, "payment-plans", toQueryMap(request.URL.Query()), nil, "")
-	if err != nil {
-		s.writeErr(writer, err)
-		return
-	}
-	respMap, ok := resp.(map[string]interface{})
-	if !ok {
-		writeJSON(writer, http.StatusOK, resp)
-		return
-	}
-	data, ok := respMap["data"].([]interface{})
-	if !ok {
-		writeJSON(writer, http.StatusOK, respMap)
-		return
-	}
-	for i, entry := range data {
-		planEntry, ok := entry.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		paymentPlanID := coerceInt(planEntry["id"])
-		if paymentPlanID == nil {
-			continue
-		}
-		firestorePlan, exists := s.findPlanByPaymentPlanID(*paymentPlanID)
-		if !exists {
-			planEntry["features"] = []string{}
-		} else {
-			planEntry["features"] = planFeatures(firestorePlan)
-		}
-		data[i] = planEntry
-	}
-	respMap["data"] = data
-	writeJSON(writer, http.StatusOK, respMap)
-}
-
-func (s *apiServer) handleHelcimPaymentPlanByID(writer http.ResponseWriter, request *http.Request, rawID string) {
-	id, err := strconv.Atoi(strings.TrimSpace(rawID))
-	if err != nil {
-		writeJSONError(writer, http.StatusNotFound, "Not found")
-		return
-	}
-	path := fmt.Sprintf("payment-plans/%d", id)
-	switch request.Method {
-	case http.MethodGet:
-		resp, err := s.helcim.request(http.MethodGet, path, nil, nil, "")
-		if err != nil {
-			s.writeErr(writer, err)
-			return
-		}
-		plan, ok := resp.(map[string]interface{})
-		if ok {
-			if firestorePlan, exists := s.findPlanByPaymentPlanID(id); exists {
-				plan["features"] = planFeatures(firestorePlan)
-			} else {
-				plan["features"] = []string{}
-			}
-			writeJSON(writer, http.StatusOK, plan)
-			return
-		}
-		writeJSON(writer, http.StatusOK, resp)
-	case http.MethodDelete:
-		resp, err := s.helcim.request(http.MethodDelete, path, nil, nil, "")
-		if err != nil {
-			s.writeErr(writer, err)
-			return
-		}
-		writeJSON(writer, http.StatusOK, resp)
-	default:
-		writeJSONError(writer, http.StatusMethodNotAllowed, "Method not allowed")
-	}
 }
 
 func (s *apiServer) handleHelcimSubscriptionByID(writer http.ResponseWriter, request *http.Request, rawID string) {

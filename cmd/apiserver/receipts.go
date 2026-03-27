@@ -61,11 +61,6 @@ type receiptRecord struct {
 	ImageProcessingError  *string                `json:"image_processing_error,omitempty"`
 }
 
-type receiptListResponse struct {
-	Receipts   []receiptRecord `json:"receipts"`
-	NextCursor *string         `json:"next_cursor"`
-}
-
 type signedUploadRequest struct {
 	Filename    string `json:"filename"`
 	ContentType string `json:"content_type"`
@@ -144,13 +139,11 @@ func requestContext() context.Context {
 }
 
 func (s *apiServer) handleReceipts(writer http.ResponseWriter, request *http.Request) {
-	user, ok := s.authenticateRequest(writer, request)
+	_, ok := s.authenticateRequest(writer, request)
 	if !ok {
 		return
 	}
 	switch request.Method {
-	case http.MethodGet:
-		s.listReceipts(writer, request, user)
 	case http.MethodPost:
 		writeJSONError(writer, http.StatusGone, "Direct multipart upload is disabled. Use signed upload endpoints: POST /receipts/signed-upload then POST /receipts/finalize-upload.")
 	default:
@@ -204,8 +197,6 @@ func (s *apiServer) handleReceiptByID(writer http.ResponseWriter, request *http.
 		return
 	}
 	switch request.Method {
-	case http.MethodGet:
-		s.readReceipt(writer, request, user, path)
 	case http.MethodPut:
 		s.updateReceipt(writer, request, user, path)
 	case http.MethodDelete:
@@ -429,76 +420,6 @@ func (s *apiServer) createReceipt(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 	writeJSON(writer, http.StatusCreated, receiptRecordFromMap(docRef.ID, payload))
-}
-
-func (s *apiServer) listReceipts(writer http.ResponseWriter, request *http.Request, user *verifiedUser) {
-	ownerEmail := strings.TrimSpace(user.Email)
-	limit := 10
-	if raw := strings.TrimSpace(request.URL.Query().Get("limit")); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed < 1 || parsed > 100 {
-			writeJSONError(writer, http.StatusBadRequest, "limit must be between 1 and 100")
-			return
-		}
-		limit = parsed
-	}
-	startAfterID := strings.TrimSpace(request.URL.Query().Get("start_after_id"))
-
-	query := s.receipts.Where("owner_email", "==", ownerEmail).OrderBy("created_at", fs.Desc).Limit(limit)
-	if startAfterID != "" {
-		afterSnapshot, err := s.receipts.Doc(startAfterID).Get(request.Context())
-		if err != nil || !afterSnapshot.Exists() {
-			writeJSONError(writer, http.StatusNotFound, fmt.Sprintf("Receipt %s not found", startAfterID))
-			return
-		}
-		if err := s.ensureReceiptOwner(afterSnapshot.Data(), ownerEmail, startAfterID); err != nil {
-			s.writeErr(writer, err)
-			return
-		}
-		createdAt, ok := afterSnapshot.Data()["created_at"]
-		if !ok {
-			writeJSONError(writer, http.StatusNotFound, fmt.Sprintf("Receipt %s not found", startAfterID))
-			return
-		}
-		query = query.StartAfter(createdAt)
-	}
-
-	iter := query.Documents(request.Context())
-	defer iter.Stop()
-
-	records := make([]receiptRecord, 0)
-	var nextCursor *string
-	for {
-		snapshot, err := iter.Next()
-		if errors.Is(err, iterator.Done) {
-			break
-		}
-		if err != nil {
-			s.writeErr(writer, err)
-			return
-		}
-		data := snapshot.Data()
-		if err := s.ensureReceiptOwner(data, ownerEmail, snapshot.Ref.ID); err != nil {
-			continue
-		}
-		s.attachSignedImageURL(request.Context(), data)
-		records = append(records, receiptRecordFromMap(snapshot.Ref.ID, data))
-	}
-	if len(records) > 0 {
-		cursor := records[len(records)-1].ID
-		nextCursor = &cursor
-	}
-	writeJSON(writer, http.StatusOK, receiptListResponse{Receipts: records, NextCursor: nextCursor})
-}
-
-func (s *apiServer) readReceipt(writer http.ResponseWriter, request *http.Request, user *verifiedUser, receiptID string) {
-	data, err := s.getOwnedReceipt(request.Context(), receiptID, user.Email)
-	if err != nil {
-		s.writeErr(writer, err)
-		return
-	}
-	s.attachSignedImageURL(request.Context(), data)
-	writeJSON(writer, http.StatusOK, receiptRecordFromMap(receiptID, data))
 }
 
 func (s *apiServer) updateReceipt(writer http.ResponseWriter, request *http.Request, user *verifiedUser, receiptID string) {

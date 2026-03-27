@@ -248,11 +248,17 @@ func (s *apiServer) createSignedUpload(writer http.ResponseWriter, request *http
 		s.writeErr(writer, err)
 		return
 	}
+	formFields := postPolicy.Fields
+	if formFields == nil {
+		formFields = map[string]string{}
+	}
 	writeJSON(writer, http.StatusOK, map[string]interface{}{
 		"storage_path": storagePath,
 		"upload_url":   postPolicy.URL,
 		"method":       http.MethodPost,
-		"form_fields":  postPolicy.Fields,
+		"form_fields":  formFields,
+		"fields":       formFields,
+		"headers":      map[string]string{},
 		"expires_at":   expiresAt.Format(time.RFC3339),
 	})
 }

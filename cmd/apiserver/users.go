@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -25,62 +24,6 @@ type userDocScore struct {
 	hasCustomerCode int
 	hasPeriodEnd    int
 	updatedUnix     float64
-}
-
-func (s *apiServer) handleUserPlan(writer http.ResponseWriter, request *http.Request) {
-	if request.Method != http.MethodGet {
-		writeJSONError(writer, http.StatusMethodNotAllowed, "Method not allowed")
-		return
-	}
-	user, ok := s.authenticateRequest(writer, request)
-	if !ok {
-		return
-	}
-	writeJSON(writer, http.StatusOK, s.userPlanSummary(user.Email))
-}
-
-func (s *apiServer) userPlanSummary(ownerEmail string) map[string]interface{} {
-	userRef, userDoc := s.findOrChooseUserDoc(ownerEmail)
-	planID := strings.TrimSpace(stringValue(userDoc["plan_id"]))
-	if planID == "" {
-		planID = defaultPlanID
-	}
-	plan, ok := s.getPlan(planID)
-	if !ok {
-		plan = defaultPlanStub(planID)
-	}
-	planInterval := stringValue(userDoc["plan_interval"])
-	if planInterval == "" {
-		planInterval = planIntervalValue(plan)
-	}
-	planPrice := coerceInt(userDoc["plan_price_cents"])
-	if planPrice == nil {
-		planPrice = coerceInt(plan["price_cents"])
-	}
-	result := map[string]interface{}{
-		"owner_email":          ownerEmail,
-		"plan_id":              plan["plan_id"],
-		"plan_name":            plan["name"],
-		"description":          plan["description"],
-		"subscription_status":  fallbackString(userDoc["subscription_status"], "active"),
-		"plan_interval":        planInterval,
-		"monthly_limit":        planLimit(plan),
-		"plan_price_cents":     planPrice,
-		"features":             planFeatures(plan),
-		"plan_updated_at":      isoOrNil(userDoc["plan_updated_at"]),
-		"last_transaction_id":  userDoc["last_transaction_id"],
-		"customer_code":        userDoc["helcim_customer_code"],
-		"payment_method_saved": userHasPaymentMethod(userDoc),
-	}
-	log.Printf(
-		"user_plan_summary owner=%s user_doc_id=%v stored_plan_id=%s resolved_plan_doc=%v resolved_plan_name=%v",
-		ownerEmail,
-		docIDOrNil(userRef),
-		planID,
-		plan["plan_id"],
-		plan["name"],
-	)
-	return result
 }
 
 func (s *apiServer) ensureWithinLimit(ownerEmail string) (map[string]interface{}, error) {
@@ -196,10 +139,8 @@ func (s *apiServer) getOrCreateUser(ownerEmail string, now time.Time) (*fs.Docum
 	docRef := s.users.NewDoc()
 	_, err := docRef.Set(requestContext(), data)
 	if err != nil {
-		log.Printf("failed to create default user doc for %s: %v", ownerEmail, err)
 		return nil, data
 	}
-	log.Printf("created_default_user_doc owner=%s doc_id=%s stored_plan_id=%s", ownerEmail, docRef.ID, data["plan_id"])
 	return docRef, data
 }
 
@@ -213,7 +154,6 @@ func (s *apiServer) findOrChooseUserDoc(ownerEmail string) (*fs.DocumentRef, map
 			break
 		}
 		if err != nil {
-			log.Printf("failed to query user docs for %s: %v", ownerEmail, err)
 			return nil, nil
 		}
 		if !snapshot.Exists() {
@@ -227,30 +167,16 @@ func (s *apiServer) findOrChooseUserDoc(ownerEmail string) (*fs.DocumentRef, map
 		})
 	}
 	if len(candidates) == 0 {
-		log.Printf("No user docs matched owner=%s", ownerEmail)
 		return nil, nil
 	}
 	if len(candidates) == 1 {
 		candidate := candidates[0]
-		log.Printf(
-			"Resolved user doc owner=%s doc_id=%s stored_plan_id=%v source=single_match",
-			ownerEmail,
-			candidate.snapshot.Ref.ID,
-			candidate.data["plan_id"],
-		)
 		return candidate.snapshot.Ref, candidate.data
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
 		return compareUserDocScore(candidates[i].score, candidates[j].score)
 	})
 	chosen := candidates[0]
-	log.Printf(
-		"Multiple user docs matched owner=%s chosen_doc_id=%s chosen_plan_id=%v candidates=%d",
-		ownerEmail,
-		chosen.snapshot.Ref.ID,
-		chosen.data["plan_id"],
-		len(candidates),
-	)
 	return chosen.snapshot.Ref, chosen.data
 }
 

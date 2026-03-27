@@ -178,6 +178,14 @@ func (s *apiServer) handleReceiptByID(writer http.ResponseWriter, request *http.
 		s.finalizeSignedUpload(writer, request, user)
 		return
 	}
+	if path == "sign-image" {
+		if request.Method != http.MethodPost {
+			writeJSONError(writer, http.StatusMethodNotAllowed, "Method not allowed")
+			return
+		}
+		s.signReceiptImage(writer, request, user)
+		return
+	}
 	if strings.HasSuffix(path, "/image") {
 		receiptID := strings.TrimSuffix(path, "/image")
 		receiptID = strings.TrimSuffix(receiptID, "/")
@@ -204,6 +212,47 @@ func (s *apiServer) handleReceiptByID(writer http.ResponseWriter, request *http.
 	default:
 		writeJSONError(writer, http.StatusMethodNotAllowed, "Method not allowed")
 	}
+}
+
+func (s *apiServer) signReceiptImage(writer http.ResponseWriter, request *http.Request, user *verifiedUser) {
+	defer request.Body.Close()
+	var payload struct {
+		ReceiptID string `json:"receipt_id"`
+	}
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		writeJSONError(writer, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	receiptID := strings.TrimSpace(payload.ReceiptID)
+	if receiptID == "" {
+		writeJSONError(writer, http.StatusBadRequest, "receipt_id is required")
+		return
+	}
+	data, err := s.getOwnedReceipt(request.Context(), receiptID, user.Email)
+	if err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+	storagePath := stringFromAny(data["storage_path"])
+	if storagePath == "" {
+		storagePath = stringFromAny(data["raw_storage_path"])
+	}
+	if storagePath == "" {
+		writeJSONError(writer, http.StatusNotFound, "Receipt image not found")
+		return
+	}
+	imageURL, err := s.signedImageURL(request.Context(), storagePath)
+	if err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, map[string]interface{}{
+		"receipt_id": receiptID,
+		"image_url":  imageURL,
+		"expires_at": time.Now().UTC().Add(10 * time.Minute).Format(time.RFC3339),
+	})
 }
 
 func (s *apiServer) createSignedUpload(writer http.ResponseWriter, request *http.Request, user *verifiedUser) {

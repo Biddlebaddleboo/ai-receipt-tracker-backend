@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -76,12 +75,12 @@ type apiServer struct {
 func main() {
 	cfg, err := loadConfig()
 	if err != nil {
-		log.Fatalf("failed to load config: %v", err)
+		panic(fmt.Errorf("failed to load config: %w", err))
 	}
 
 	server, err := newAPIServer(cfg)
 	if err != nil {
-		log.Fatalf("failed to initialize API server: %v", err)
+		panic(fmt.Errorf("failed to initialize API server: %w", err))
 	}
 	defer server.close()
 	server.startReceiptWorker()
@@ -92,7 +91,6 @@ func main() {
 	mux.HandleFunc("/categories/", server.handleCategoryByID)
 	mux.HandleFunc("/receipts", server.handleReceipts)
 	mux.HandleFunc("/receipts/", server.handleReceiptByID)
-	mux.HandleFunc("/users/me/plan", server.handleUserPlan)
 	mux.HandleFunc("/billing", server.handleBilling)
 	mux.HandleFunc("/billing/", server.handleBilling)
 	mux.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
@@ -104,9 +102,8 @@ func main() {
 		Handler: server.withCORS(mux),
 	}
 
-	log.Printf("Go API server listening on :%s", cfg.port)
 	if err := server.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("Go API server stopped unexpectedly: %v", err)
+		panic(fmt.Errorf("Go API server stopped unexpectedly: %w", err))
 	}
 }
 
@@ -489,7 +486,7 @@ func writeJSON(writer http.ResponseWriter, statusCode int, value interface{}) {
 		return
 	}
 	if err := json.NewEncoder(writer).Encode(value); err != nil {
-		log.Printf("failed to encode JSON response: %v", err)
+		return
 	}
 }
 

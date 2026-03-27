@@ -9,9 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	_ "image/gif"
-	_ "image/jpeg"
-	_ "image/png"
 	"io"
 	"math"
 	"net/http"
@@ -55,10 +52,6 @@ type receiptRecord struct {
 	ExtractedText         string                 `json:"extracted_text"`
 	ExtractedFields       map[string]interface{} `json:"extracted_fields"`
 	CreatedAt             time.Time              `json:"created_at"`
-	ProcessingStatus      string                 `json:"processing_status"`
-	ProcessingError       *string                `json:"processing_error,omitempty"`
-	ImageProcessingStatus string                 `json:"image_processing_status"`
-	ImageProcessingError  *string                `json:"image_processing_error,omitempty"`
 }
 
 type signedUploadRequest struct {
@@ -205,8 +198,6 @@ func (s *apiServer) handleReceiptByID(writer http.ResponseWriter, request *http.
 		return
 	}
 	switch request.Method {
-	case http.MethodPut:
-		s.updateReceipt(writer, request, user, path)
 	case http.MethodDelete:
 		s.deleteReceipt(writer, request, user, path)
 	default:
@@ -355,16 +346,6 @@ func (s *apiServer) finalizeSignedUpload(writer http.ResponseWriter, request *ht
 		"extracted_fields":                  map[string]interface{}{},
 		"created_at":                        now,
 		"owner_email":                       ownerEmail,
-		"processing_status":                 "processing",
-		"processing_owner":                  s.workerID,
-		"processing_lease_expires_at":       time.Now().UTC().Add(s.cfg.receiptWorkerLease),
-		"processing_error":                  nil,
-		"processing_started_at":             time.Now().UTC(),
-		"processing_attempts":               1,
-		"image_processing_status":           "ready",
-		"image_processing_error":            nil,
-		"image_processing_owner":            nil,
-		"image_processing_lease_expires_at": nil,
 	}
 	if _, err := docRef.Set(request.Context(), receiptPayload); err != nil {
 		s.writeErr(writer, err)
@@ -384,167 +365,6 @@ func (s *apiServer) finalizeSignedUpload(writer http.ResponseWriter, request *ht
 		return
 	}
 	writeJSON(writer, http.StatusCreated, receiptRecordFromMap(docRef.ID, receiptPayload))
-}
-
-func (s *apiServer) createReceipt(writer http.ResponseWriter, request *http.Request, user *verifiedUser) {
-	ownerEmail := strings.TrimSpace(user.Email)
-	if ownerEmail == "" {
-		writeJSONError(writer, http.StatusUnauthorized, "OAuth token is missing an email address")
-		return
-	}
-	if _, err := s.ensureWithinLimit(ownerEmail); err != nil {
-		s.writeErr(writer, err)
-		return
-	}
-	if err := request.ParseMultipartForm(32 << 20); err != nil {
-		writeJSONError(writer, http.StatusBadRequest, "invalid multipart form")
-		return
-	}
-	file, header, err := request.FormFile("file")
-	if err != nil {
-		writeJSONError(writer, http.StatusBadRequest, "file is required")
-		return
-	}
-	defer file.Close()
-
-	contentType := strings.TrimSpace(header.Header.Get("Content-Type"))
-	if err := ensureImage(contentType); err != nil {
-		s.writeErr(writer, err)
-		return
-	}
-	now := time.Now().UTC()
-	docRef := s.receipts.NewDoc()
-	rawStoragePath := buildStorageKeyForOwner(ownerEmail, header.Filename)
-	if err := s.uploadRawImageStream(request.Context(), file, rawStoragePath, contentType); err != nil {
-		s.writeErr(writer, err)
-		return
-	}
-	imageURL, err := s.signedImageURL(request.Context(), rawStoragePath)
-	if err != nil {
-		s.writeErr(writer, err)
-		return
-	}
-	payload := map[string]interface{}{
-		"vendor":                            firstFormString(request.FormValue("vendor")),
-		"subtotal":                          firstFormFloat(request.FormValue("subtotal")),
-		"tax":                               firstFormFloat(request.FormValue("tax")),
-		"total":                             firstFormFloat(request.FormValue("total")),
-		"category":                          firstFormString(request.FormValue("category")),
-		"purchase_date":                     firstFormString(request.FormValue("purchase_date")),
-		"image_url":                         imageURL,
-		"storage_path":                      rawStoragePath,
-		"raw_storage_path":                  rawStoragePath,
-		"items":                             []map[string]interface{}{},
-		"extracted_text":                    "",
-		"extracted_fields":                  map[string]interface{}{},
-		"created_at":                        now,
-		"owner_email":                       ownerEmail,
-		"processing_status":                 "processing",
-		"processing_owner":                  s.workerID,
-		"processing_lease_expires_at":       time.Now().UTC().Add(s.cfg.receiptWorkerLease),
-		"processing_error":                  nil,
-		"processing_started_at":             time.Now().UTC(),
-		"processing_attempts":               1,
-		"image_processing_status":           "ready",
-		"image_processing_error":            nil,
-		"image_processing_owner":            nil,
-		"image_processing_lease_expires_at": nil,
-	}
-	if _, err := docRef.Set(request.Context(), payload); err != nil {
-		_ = s.bucket.Object(rawStoragePath).Delete(request.Context())
-		s.writeErr(writer, err)
-		return
-	}
-	job := receiptJob{
-		ID:             docRef.ID,
-		OwnerEmail:     ownerEmail,
-		RawStoragePath: rawStoragePath,
-	}
-	s.processClaimedReceiptJob(request.Context(), job)
-	updated, err := s.receipts.Doc(docRef.ID).Get(request.Context())
-	if err == nil && updated.Exists() {
-		updatedData := updated.Data()
-		updatedData["image_url"] = imageURL
-		writeJSON(writer, http.StatusCreated, receiptRecordFromMap(docRef.ID, updatedData))
-		return
-	}
-	writeJSON(writer, http.StatusCreated, receiptRecordFromMap(docRef.ID, payload))
-}
-
-func (s *apiServer) updateReceipt(writer http.ResponseWriter, request *http.Request, user *verifiedUser, receiptID string) {
-	defer request.Body.Close()
-	var payload map[string]json.RawMessage
-	decoder := json.NewDecoder(request.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&payload); err != nil {
-		writeJSONError(writer, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	existing, err := s.getOwnedReceipt(request.Context(), receiptID, user.Email)
-	if err != nil {
-		s.writeErr(writer, err)
-		return
-	}
-	updateData := map[string]interface{}{}
-
-	if raw, ok := payload["vendor"]; ok {
-		updateData["vendor"] = parseNullableString(raw)
-	}
-	if raw, ok := payload["subtotal"]; ok {
-		updateData["subtotal"] = parseNullableFloat(raw)
-	}
-	if raw, ok := payload["tax"]; ok {
-		updateData["tax"] = parseNullableFloat(raw)
-	}
-	if raw, ok := payload["total"]; ok {
-		updateData["total"] = parseNullableFloat(raw)
-	}
-	if raw, ok := payload["category"]; ok {
-		updateData["category"] = parseNullableString(raw)
-	}
-	if raw, ok := payload["purchase_date"]; ok {
-		updateData["purchase_date"] = parseNullableString(raw)
-	}
-
-	if raw, ok := payload["items"]; ok {
-		items, err := parseReceiptItems(raw)
-		if err != nil {
-			writeJSONError(writer, http.StatusBadRequest, err.Error())
-			return
-		}
-		itemsPayload := itemsToMap(items)
-		updateData["items"] = itemsPayload
-		subtotalCandidate := existingFloatPtr(existing["subtotal"])
-		if rawSubtotal, hasSubtotal := updateData["subtotal"]; hasSubtotal {
-			subtotalCandidate = valueFloatPtr(rawSubtotal)
-		}
-		validation := validateSubtotalAgainstItems(subtotalCandidate, itemsPayload)
-		updateData["subtotal"] = validation.Subtotal
-		extractedFields := cloneMap(existing["extracted_fields"])
-		extractedFields["validation"] = validation.Info
-		aiSuggestions := cloneMap(extractedFields["ai_suggestions"])
-		aiSuggestions["items"] = itemsPayload
-		extractedFields["ai_suggestions"] = aiSuggestions
-		updateData["extracted_fields"] = extractedFields
-	}
-
-	if len(updateData) == 0 {
-		s.attachSignedImageURL(request.Context(), existing)
-		writeJSON(writer, http.StatusOK, receiptRecordFromMap(receiptID, existing))
-		return
-	}
-
-	if _, err := s.receipts.Doc(receiptID).Set(request.Context(), updateData, fs.MergeAll); err != nil {
-		s.writeErr(writer, err)
-		return
-	}
-	updated, err := s.getOwnedReceipt(request.Context(), receiptID, user.Email)
-	if err != nil {
-		s.writeErr(writer, err)
-		return
-	}
-	s.attachSignedImageURL(request.Context(), updated)
-	writeJSON(writer, http.StatusOK, receiptRecordFromMap(receiptID, updated))
 }
 
 func (s *apiServer) deleteReceipt(writer http.ResponseWriter, request *http.Request, user *verifiedUser, receiptID string) {
@@ -682,144 +502,10 @@ func (s *apiServer) categoryNames(ctx context.Context, ownerEmail string) ([]str
 	return names, nil
 }
 
-func (s *apiServer) uploadRawImageStream(ctx context.Context, data io.Reader, destination string, contentType string) error {
-	objWriter := s.bucket.Object(destination).NewWriter(ctx)
-	if strings.TrimSpace(contentType) == "" {
-		contentType = "application/octet-stream"
-	}
-	objWriter.ContentType = contentType
-	if _, err := io.Copy(objWriter, data); err != nil {
-		_ = objWriter.Close()
-		return fmt.Errorf("failed to upload original image: %w", err)
-	}
-	if err := objWriter.Close(); err != nil {
-		return fmt.Errorf("failed to upload original image: %w", err)
-	}
-	return nil
-}
-
 type receiptJob struct {
 	ID             string
 	OwnerEmail     string
 	RawStoragePath string
-}
-
-func (s *apiServer) startReceiptWorker() {
-	go func() {
-		ticker := time.NewTicker(s.cfg.receiptWorkerPoll)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-s.workerStop:
-				return
-			default:
-			}
-			for i := 0; i < 3; i++ {
-				job, ok, err := s.claimNextReceiptJob(context.Background())
-				if err != nil {
-					break
-				}
-				if !ok {
-					break
-				}
-				s.processClaimedReceiptJob(context.Background(), job)
-			}
-			select {
-			case <-s.workerStop:
-				return
-			case <-s.workerWake:
-			case <-ticker.C:
-			}
-		}
-	}()
-}
-
-func (s *apiServer) wakeReceiptWorker() {
-	select {
-	case s.workerWake <- struct{}{}:
-	default:
-	}
-}
-
-func (s *apiServer) claimNextReceiptJob(ctx context.Context) (receiptJob, bool, error) {
-	now := time.Now().UTC()
-	queued, err := s.receipts.Where("processing_status", "==", "queued").Limit(25).Documents(ctx).GetAll()
-	if err != nil {
-		return receiptJob{}, false, err
-	}
-	for _, snapshot := range queued {
-		job, ok, err := s.tryClaimReceiptJob(ctx, snapshot.Ref, now)
-		if err != nil {
-			return receiptJob{}, false, err
-		}
-		if ok {
-			return job, true, nil
-		}
-	}
-
-	stale, err := s.receipts.Where("processing_status", "==", "processing").Limit(25).Documents(ctx).GetAll()
-	if err != nil {
-		return receiptJob{}, false, err
-	}
-	for _, snapshot := range stale {
-		job, ok, err := s.tryClaimReceiptJob(ctx, snapshot.Ref, now)
-		if err != nil {
-			return receiptJob{}, false, err
-		}
-		if ok {
-			return job, true, nil
-		}
-	}
-	return receiptJob{}, false, nil
-}
-
-func (s *apiServer) tryClaimReceiptJob(ctx context.Context, ref *fs.DocumentRef, now time.Time) (receiptJob, bool, error) {
-	var claimed receiptJob
-	err := s.firestore.RunTransaction(ctx, func(ctx context.Context, tx *fs.Transaction) error {
-		snapshot, err := tx.Get(ref)
-		if err != nil || !snapshot.Exists() {
-			return err
-		}
-		data := snapshot.Data()
-		status := fallbackString(data["processing_status"], "")
-		lease := timeValue(data["processing_lease_expires_at"])
-		if status != "queued" && !(status == "processing" && (lease == nil || !lease.After(now))) {
-			return nil
-		}
-		ownerEmail := strings.TrimSpace(stringValue(data["owner_email"]))
-		rawStoragePath := strings.TrimSpace(stringValue(data["raw_storage_path"]))
-		if rawStoragePath == "" {
-			rawStoragePath = strings.TrimSpace(stringValue(data["storage_path"]))
-		}
-		if ownerEmail == "" || rawStoragePath == "" {
-			return nil
-		}
-		claimed = receiptJob{
-			ID:             ref.ID,
-			OwnerEmail:     ownerEmail,
-			RawStoragePath: rawStoragePath,
-		}
-		tx.Set(ref, map[string]interface{}{
-			"processing_status":                 "processing",
-			"processing_owner":                  s.workerID,
-			"processing_error":                  nil,
-			"processing_lease_expires_at":       now.Add(s.cfg.receiptWorkerLease),
-			"processing_started_at":             now,
-			"processing_attempts":               fs.Increment(1),
-			"image_processing_status":           "ready",
-			"image_processing_error":            nil,
-			"image_processing_owner":            nil,
-			"image_processing_lease_expires_at": nil,
-		}, fs.MergeAll)
-		return nil
-	})
-	if err != nil {
-		return receiptJob{}, false, err
-	}
-	if claimed.ID == "" {
-		return receiptJob{}, false, nil
-	}
-	return claimed, true, nil
 }
 
 func (s *apiServer) processClaimedReceiptJob(ctx context.Context, job receiptJob) {
@@ -869,15 +555,6 @@ func (s *apiServer) processOCRForJob(ctx context.Context, job receiptJob) {
 		"items":                             itemsPayload,
 		"extracted_text":                    ocrRes.Text,
 		"extracted_fields":                  extractedFields,
-		"processing_status":                 "ready",
-		"processing_owner":                  s.workerID,
-		"processing_error":                  nil,
-		"processing_lease_expires_at":       nil,
-		"processed_at":                      time.Now().UTC(),
-		"image_processing_status":           "ready",
-		"image_processing_error":            nil,
-		"image_processing_owner":            nil,
-		"image_processing_lease_expires_at": nil,
 	}
 	// Expose extracted data as soon as OCR completes.
 	if _, err := s.receipts.Doc(job.ID).Set(ctx, ocrReadyUpdate, fs.MergeAll); err != nil {
@@ -887,16 +564,11 @@ func (s *apiServer) processOCRForJob(ctx context.Context, job receiptJob) {
 }
 
 func (s *apiServer) markReceiptProcessingFailed(ctx context.Context, receiptID string, err error) {
+	extractedFields := map[string]interface{}{
+		"ocr_error": err.Error(),
+	}
 	if _, updateErr := s.receipts.Doc(receiptID).Set(ctx, map[string]interface{}{
-		"processing_status":                 "failed",
-		"processing_owner":                  s.workerID,
-		"processing_error":                  err.Error(),
-		"processing_lease_expires_at":       nil,
-		"processed_at":                      time.Now().UTC(),
-		"image_processing_status":           "failed",
-		"image_processing_error":            err.Error(),
-		"image_processing_owner":            s.workerID,
-		"image_processing_lease_expires_at": nil,
+		"extracted_fields": extractedFields,
 	}, fs.MergeAll); updateErr != nil {
 	}
 }
@@ -1213,10 +885,6 @@ func receiptRecordFromMap(id string, payload map[string]interface{}) receiptReco
 		ExtractedText:         stringFromAny(payload["extracted_text"]),
 		ExtractedFields:       cloneMap(payload["extracted_fields"]),
 		CreatedAt:             timeFromAny(payload["created_at"]),
-		ProcessingStatus:      fallbackString(payload["processing_status"], "ready"),
-		ProcessingError:       valueStringPtr(payload["processing_error"]),
-		ImageProcessingStatus: fallbackString(payload["image_processing_status"], "ready"),
-		ImageProcessingError:  valueStringPtr(payload["image_processing_error"]),
 	}
 }
 
@@ -1377,34 +1045,6 @@ func cloneMap(value interface{}) map[string]interface{} {
 		cloned[key] = entry
 	}
 	return cloned
-}
-
-func firstFormString(value string) *string {
-	text := strings.TrimSpace(value)
-	if text == "" {
-		return nil
-	}
-	return &text
-}
-
-func firstFormFloat(value string) *float64 {
-	text := strings.TrimSpace(value)
-	if text == "" {
-		return nil
-	}
-	parsed, err := strconv.ParseFloat(text, 64)
-	if err != nil {
-		return nil
-	}
-	rounded := roundMoney(parsed)
-	return &rounded
-}
-
-func subtotalValueOrOCR(formValue *float64, ocrValue *float64) *float64 {
-	if formValue != nil {
-		return formValue
-	}
-	return ocrValue
 }
 
 func roundMoney(value float64) float64 {

@@ -16,7 +16,6 @@ import (
 	fs "cloud.google.com/go/firestore"
 	"cloud.google.com/go/storage"
 	"google.golang.org/api/idtoken"
-	"google.golang.org/api/iterator"
 )
 
 type config struct {
@@ -43,17 +42,6 @@ type verifiedUser struct {
 	Sub   string `json:"sub"`
 	Email string `json:"email"`
 	Name  string `json:"name,omitempty"`
-}
-
-type categoryPayload struct {
-	Name        *string `json:"name"`
-	Description *string `json:"description"`
-}
-
-type categoryRecord struct {
-	ID          string  `json:"id"`
-	Name        string  `json:"name"`
-	Description *string `json:"description"`
 }
 
 type apiServer struct {
@@ -87,8 +75,6 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", server.handleHealthz)
-	mux.HandleFunc("/categories", server.handleCategories)
-	mux.HandleFunc("/categories/", server.handleCategoryByID)
 	mux.HandleFunc("/receipts", server.handleReceipts)
 	mux.HandleFunc("/receipts/", server.handleReceiptByID)
 	mux.HandleFunc("/billing", server.handleBilling)
@@ -216,42 +202,6 @@ func (s *apiServer) handleHealthz(writer http.ResponseWriter, request *http.Requ
 	writeJSON(writer, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (s *apiServer) handleCategories(writer http.ResponseWriter, request *http.Request) {
-	user, ok := s.authenticateRequest(writer, request)
-	if !ok {
-		return
-	}
-	switch request.Method {
-	case http.MethodGet:
-		s.listCategories(writer, request, user)
-	case http.MethodPost:
-		s.createCategory(writer, request, user)
-	default:
-		writeJSONError(writer, http.StatusMethodNotAllowed, "Method not allowed")
-	}
-}
-
-func (s *apiServer) handleCategoryByID(writer http.ResponseWriter, request *http.Request) {
-	user, ok := s.authenticateRequest(writer, request)
-	if !ok {
-		return
-	}
-	categoryID := strings.TrimPrefix(request.URL.Path, "/categories/")
-	categoryID = strings.TrimSpace(categoryID)
-	if categoryID == "" || strings.Contains(categoryID, "/") {
-		writeJSONError(writer, http.StatusNotFound, "Not found")
-		return
-	}
-	switch request.Method {
-	case http.MethodPut:
-		s.updateCategory(writer, request, user, categoryID)
-	case http.MethodDelete:
-		s.deleteCategory(writer, request, user, categoryID)
-	default:
-		writeJSONError(writer, http.StatusMethodNotAllowed, "Method not allowed")
-	}
-}
-
 func (s *apiServer) authenticateRequest(writer http.ResponseWriter, request *http.Request) (*verifiedUser, bool) {
 	if !s.cfg.requireOAuth {
 		writer.Header().Set("WWW-Authenticate", "Bearer")
@@ -313,170 +263,6 @@ func verifyGoogleToken(ctx context.Context, token string, audiences []string, al
 		Email: email,
 		Name:  claimString(payload.Claims, "name"),
 	}, 0, ""
-}
-
-func (s *apiServer) createCategory(writer http.ResponseWriter, request *http.Request, user *verifiedUser) {
-	payload, err := decodeCategoryPayload(request)
-	if err != nil {
-		writeJSONError(writer, http.StatusBadRequest, err.Error())
-		return
-	}
-	ctx := request.Context()
-	doc := s.categories.NewDoc()
-	if _, err := doc.Set(ctx, categoryDocFromPayload(payload, user.Email)); err != nil {
-		writeJSONError(writer, http.StatusInternalServerError, err.Error())
-		return
-	}
-	record, statusCode, message := s.getCategoryRecord(ctx, doc.ID, user.Email)
-	if statusCode != 0 {
-		writeJSONError(writer, statusCode, message)
-		return
-	}
-	writeJSON(writer, http.StatusOK, record)
-}
-
-func (s *apiServer) listCategories(writer http.ResponseWriter, request *http.Request, user *verifiedUser) {
-	iter := s.categories.Where("owner_email", "==", user.Email).Documents(request.Context())
-	defer iter.Stop()
-	records := make([]categoryRecord, 0)
-	for {
-		snapshot, err := iter.Next()
-		if errors.Is(err, iterator.Done) {
-			break
-		}
-		if err != nil {
-			writeJSONError(writer, http.StatusInternalServerError, fmt.Sprintf("Failed to load categories: %v", err))
-			return
-		}
-		record, ok := snapshotToCategoryRecord(snapshot, user.Email)
-		if ok {
-			records = append(records, record)
-		}
-	}
-	writeJSON(writer, http.StatusOK, records)
-}
-
-func (s *apiServer) updateCategory(writer http.ResponseWriter, request *http.Request, user *verifiedUser, categoryID string) {
-	payload, err := decodeCategoryPayload(request)
-	if err != nil {
-		writeJSONError(writer, http.StatusBadRequest, err.Error())
-		return
-	}
-	ctx := request.Context()
-	snapshot, err := s.categories.Doc(categoryID).Get(ctx)
-	if err != nil || !snapshot.Exists() {
-		writeJSONError(writer, http.StatusNotFound, "category not found")
-		return
-	}
-	if !ownsCategory(snapshot.Data(), user.Email) {
-		writeJSONError(writer, http.StatusNotFound, "category not found")
-		return
-	}
-	update := map[string]interface{}{}
-	if payload.Name != nil {
-		update["name"] = strings.TrimSpace(*payload.Name)
-	}
-	if payload.Description != nil {
-		update["description"] = strings.TrimSpace(*payload.Description)
-	}
-	if len(update) > 0 {
-		if _, err := s.categories.Doc(categoryID).Set(ctx, update, fs.MergeAll); err != nil {
-			writeJSONError(writer, http.StatusInternalServerError, err.Error())
-			return
-		}
-	}
-	record, statusCode, message := s.getCategoryRecord(ctx, categoryID, user.Email)
-	if statusCode != 0 {
-		writeJSONError(writer, statusCode, message)
-		return
-	}
-	writeJSON(writer, http.StatusOK, record)
-}
-
-func (s *apiServer) deleteCategory(writer http.ResponseWriter, request *http.Request, user *verifiedUser, categoryID string) {
-	ctx := request.Context()
-	snapshot, err := s.categories.Doc(categoryID).Get(ctx)
-	if err != nil || !snapshot.Exists() {
-		writeJSONError(writer, http.StatusNotFound, "category not found")
-		return
-	}
-	if !ownsCategory(snapshot.Data(), user.Email) {
-		writeJSONError(writer, http.StatusNotFound, "category not found")
-		return
-	}
-	if _, err := s.categories.Doc(categoryID).Delete(ctx); err != nil {
-		writeJSONError(writer, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writer.WriteHeader(http.StatusNoContent)
-}
-
-func (s *apiServer) getCategoryRecord(ctx context.Context, categoryID string, ownerEmail string) (categoryRecord, int, string) {
-	snapshot, err := s.categories.Doc(categoryID).Get(ctx)
-	if err != nil || !snapshot.Exists() {
-		return categoryRecord{}, http.StatusNotFound, "category not found"
-	}
-	record, ok := snapshotToCategoryRecord(snapshot, ownerEmail)
-	if !ok {
-		return categoryRecord{}, http.StatusNotFound, "category not found"
-	}
-	return record, 0, ""
-}
-
-func snapshotToCategoryRecord(snapshot *fs.DocumentSnapshot, ownerEmail string) (categoryRecord, bool) {
-	data := snapshot.Data()
-	if !ownsCategory(data, ownerEmail) {
-		return categoryRecord{}, false
-	}
-	name := strings.TrimSpace(fmt.Sprint(data["name"]))
-	if name == "" {
-		return categoryRecord{}, false
-	}
-	description := strings.TrimSpace(fmt.Sprint(data["description"]))
-	record := categoryRecord{
-		ID:   snapshot.Ref.ID,
-		Name: name,
-	}
-	if description != "" {
-		record.Description = &description
-	}
-	return record, true
-}
-
-func ownsCategory(data map[string]interface{}, ownerEmail string) bool {
-	stored := strings.TrimSpace(fmt.Sprint(data["owner_email"]))
-	return stored != "" && stored == ownerEmail
-}
-
-func categoryDocFromPayload(payload categoryPayload, ownerEmail string) map[string]interface{} {
-	description := ""
-	if payload.Description != nil {
-		description = strings.TrimSpace(*payload.Description)
-	}
-	return map[string]interface{}{
-		"name":        strings.TrimSpace(*payload.Name),
-		"description": description,
-		"owner_email": ownerEmail,
-	}
-}
-
-func decodeCategoryPayload(request *http.Request) (categoryPayload, error) {
-	defer request.Body.Close()
-	decoder := json.NewDecoder(request.Body)
-	decoder.DisallowUnknownFields()
-	var payload categoryPayload
-	if err := decoder.Decode(&payload); err != nil {
-		return categoryPayload{}, fmt.Errorf("invalid request body")
-	}
-	if payload.Name == nil {
-		return categoryPayload{}, fmt.Errorf("name is required")
-	}
-	trimmed := strings.TrimSpace(*payload.Name)
-	if trimmed == "" {
-		return categoryPayload{}, fmt.Errorf("name is required")
-	}
-	payload.Name = &trimmed
-	return payload, nil
 }
 
 func writeJSON(writer http.ResponseWriter, statusCode int, value interface{}) {

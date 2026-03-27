@@ -2,6 +2,11 @@
 
 Lean Go backend for receipt upload finalization, OCR extraction, image URL signing, and Helcim billing actions.
 
+## Related Links
+
+- Frontend repository: [https://github.com/Biddlebaddleboo/receipt-keeper](https://github.com/Biddlebaddleboo/receipt-keeper)
+- AI Receipt Tracker website: [https://ai-receipt-tracker.web.app/](https://ai-receipt-tracker.web.app/)
+
 ## What This Service Does
 
 - Verifies Google OAuth bearer tokens for protected routes.

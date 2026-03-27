@@ -131,19 +131,6 @@ func requestContext() context.Context {
 	return context.Background()
 }
 
-func (s *apiServer) handleReceipts(writer http.ResponseWriter, request *http.Request) {
-	_, ok := s.authenticateRequest(writer, request)
-	if !ok {
-		return
-	}
-	switch request.Method {
-	case http.MethodPost:
-		writeJSONError(writer, http.StatusGone, "Direct multipart upload is disabled. Use signed upload endpoints: POST /receipts/signed-upload then POST /receipts/finalize-upload.")
-	default:
-		writeJSONError(writer, http.StatusMethodNotAllowed, "Method not allowed")
-	}
-}
-
 func (s *apiServer) handleReceiptByID(writer http.ResponseWriter, request *http.Request) {
 	user, ok := s.authenticateRequest(writer, request)
 	if !ok {
@@ -177,20 +164,6 @@ func (s *apiServer) handleReceiptByID(writer http.ResponseWriter, request *http.
 			return
 		}
 		s.signReceiptImage(writer, request, user)
-		return
-	}
-	if strings.HasSuffix(path, "/image") {
-		receiptID := strings.TrimSuffix(path, "/image")
-		receiptID = strings.TrimSuffix(receiptID, "/")
-		if receiptID == "" || strings.Contains(receiptID, "/") {
-			writeJSONError(writer, http.StatusNotFound, "Not found")
-			return
-		}
-		if request.Method != http.MethodGet {
-			writeJSONError(writer, http.StatusMethodNotAllowed, "Method not allowed")
-			return
-		}
-		s.redirectReceiptImage(writer, request, user, receiptID)
 		return
 	}
 	if strings.Contains(path, "/") {
@@ -227,9 +200,6 @@ func (s *apiServer) signReceiptImage(writer http.ResponseWriter, request *http.R
 		return
 	}
 	storagePath := stringFromAny(data["storage_path"])
-	if storagePath == "" {
-		storagePath = stringFromAny(data["raw_storage_path"])
-	}
 	if storagePath == "" {
 		writeJSONError(writer, http.StatusNotFound, "Receipt image not found")
 		return
@@ -326,11 +296,6 @@ func (s *apiServer) finalizeSignedUpload(writer http.ResponseWriter, request *ht
 
 	now := time.Now().UTC()
 	docRef := s.receipts.NewDoc()
-	imageURL, err := s.signedImageURL(request.Context(), storagePath)
-	if err != nil {
-		s.writeErr(writer, err)
-		return
-	}
 	receiptPayload := map[string]interface{}{
 		"vendor":                            normalizeOptionalString(payload.Vendor),
 		"subtotal":                          payload.Subtotal,
@@ -338,9 +303,7 @@ func (s *apiServer) finalizeSignedUpload(writer http.ResponseWriter, request *ht
 		"total":                             payload.Total,
 		"category":                          normalizeOptionalString(payload.Category),
 		"purchase_date":                     normalizeOptionalString(payload.PurchaseDate),
-		"image_url":                         imageURL,
 		"storage_path":                      storagePath,
-		"raw_storage_path":                  storagePath,
 		"items":                             []map[string]interface{}{},
 		"extracted_text":                    "",
 		"extracted_fields":                  map[string]interface{}{},
@@ -352,11 +315,11 @@ func (s *apiServer) finalizeSignedUpload(writer http.ResponseWriter, request *ht
 		return
 	}
 	job := receiptJob{
-		ID:             docRef.ID,
-		OwnerEmail:     ownerEmail,
-		RawStoragePath: storagePath,
+		ID:          docRef.ID,
+		OwnerEmail:  ownerEmail,
+		StoragePath: storagePath,
 	}
-	s.processClaimedReceiptJob(request.Context(), job)
+	s.processReceiptJob(request.Context(), job)
 	updated, err := s.receipts.Doc(docRef.ID).Get(request.Context())
 	if err == nil && updated.Exists() {
 		updatedData := updated.Data()
@@ -364,6 +327,7 @@ func (s *apiServer) finalizeSignedUpload(writer http.ResponseWriter, request *ht
 		writeJSON(writer, http.StatusCreated, receiptRecordFromMap(docRef.ID, updatedData))
 		return
 	}
+	s.attachSignedImageURL(request.Context(), receiptPayload)
 	writeJSON(writer, http.StatusCreated, receiptRecordFromMap(docRef.ID, receiptPayload))
 }
 
@@ -377,42 +341,12 @@ func (s *apiServer) deleteReceipt(writer http.ResponseWriter, request *http.Requ
 		s.writeErr(writer, err)
 		return
 	}
-	rawStoragePath := strings.TrimSpace(stringFromAny(data["raw_storage_path"]))
 	storagePath := strings.TrimSpace(stringFromAny(data["storage_path"]))
 	if storagePath != "" {
 		if err := s.bucket.Object(storagePath).Delete(request.Context()); err != nil && !errors.Is(err, gcs.ErrObjectNotExist) {
 		}
 	}
-	if rawStoragePath != "" && rawStoragePath != storagePath {
-		if err := s.bucket.Object(rawStoragePath).Delete(request.Context()); err != nil && !errors.Is(err, gcs.ErrObjectNotExist) {
-		}
-	}
-	if rawStoragePath != "" {
-		// No AVIF side objects are generated anymore.
-	}
 	writer.WriteHeader(http.StatusNoContent)
-}
-
-func (s *apiServer) redirectReceiptImage(writer http.ResponseWriter, request *http.Request, user *verifiedUser, receiptID string) {
-	data, err := s.getOwnedReceipt(request.Context(), receiptID, user.Email)
-	if err != nil {
-		s.writeErr(writer, err)
-		return
-	}
-	storagePath := stringFromAny(data["storage_path"])
-	if storagePath == "" {
-		storagePath = stringFromAny(data["raw_storage_path"])
-	}
-	if storagePath == "" {
-		writeJSONError(writer, http.StatusNotFound, "Receipt image not available")
-		return
-	}
-	signedURL, err := s.signedImageURL(request.Context(), storagePath)
-	if err != nil {
-		s.writeErr(writer, err)
-		return
-	}
-	http.Redirect(writer, request, signedURL, http.StatusTemporaryRedirect)
 }
 
 func (s *apiServer) getOwnedReceipt(ctx context.Context, receiptID string, ownerEmail string) (map[string]interface{}, error) {
@@ -503,22 +437,18 @@ func (s *apiServer) categoryNames(ctx context.Context, ownerEmail string) ([]str
 }
 
 type receiptJob struct {
-	ID             string
-	OwnerEmail     string
-	RawStoragePath string
+	ID          string
+	OwnerEmail  string
+	StoragePath string
 }
 
-func (s *apiServer) processClaimedReceiptJob(ctx context.Context, job receiptJob) {
-	s.processOCRForJob(ctx, job)
-}
-
-func (s *apiServer) processOCRForJob(ctx context.Context, job receiptJob) {
+func (s *apiServer) processReceiptJob(ctx context.Context, job receiptJob) {
 	categoryOptions, err := s.categoryNames(ctx, job.OwnerEmail)
 	if err != nil {
 		s.markReceiptProcessingFailed(ctx, job.ID, err)
 		return
 	}
-	imageURL, err := s.signedImageURL(ctx, job.RawStoragePath)
+	imageURL, err := s.signedImageURL(ctx, job.StoragePath)
 	if err != nil {
 		s.markReceiptProcessingFailed(ctx, job.ID, err)
 		return
@@ -642,9 +572,6 @@ func (s *apiServer) attachSignedImageURL(ctx context.Context, data map[string]in
 		return
 	}
 	storagePath := stringFromAny(data["storage_path"])
-	if storagePath == "" {
-		storagePath = stringFromAny(data["raw_storage_path"])
-	}
 	if storagePath == "" {
 		return
 	}

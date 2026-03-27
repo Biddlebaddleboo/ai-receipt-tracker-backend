@@ -68,7 +68,6 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", server.handleHealthz)
-	mux.HandleFunc("/receipts", server.handleReceipts)
 	mux.HandleFunc("/receipts/", server.handleReceiptByID)
 	mux.HandleFunc("/billing", server.handleBilling)
 	mux.HandleFunc("/billing/", server.handleBilling)

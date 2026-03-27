@@ -10,7 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
+	"mime"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -84,6 +86,7 @@ type openAIInputContent struct {
 	Type     string `json:"type"`
 	Text     string `json:"text,omitempty"`
 	ImageURL string `json:"image_url,omitempty"`
+	Detail   string `json:"detail,omitempty"`
 }
 
 type openAIResponsesEnvelope struct {
@@ -232,11 +235,14 @@ func (s *apiServer) createSignedUpload(writer http.ResponseWriter, request *http
 	}
 	storagePath := buildStorageKeyForOwner(user.Email, payload.Filename)
 	expiresAt := time.Now().UTC().Add(10 * time.Minute)
-	uploadURL, err := s.bucket.SignedURL(storagePath, &gcs.SignedURLOptions{
-		Scheme:      gcs.SigningSchemeV4,
-		Method:      http.MethodPut,
-		Expires:     expiresAt,
-		ContentType: contentType,
+	postPolicy, err := s.bucket.GenerateSignedPostPolicyV4(storagePath, &gcs.PostPolicyV4Options{
+		Expires: expiresAt,
+		Fields: &gcs.PolicyV4Fields{
+			ContentType: contentType,
+		},
+		Conditions: []gcs.PostPolicyV4Condition{
+			gcs.ConditionContentLengthRange(1, 20*1024*1024),
+		},
 	})
 	if err != nil {
 		s.writeErr(writer, err)
@@ -244,17 +250,24 @@ func (s *apiServer) createSignedUpload(writer http.ResponseWriter, request *http
 	}
 	writeJSON(writer, http.StatusOK, map[string]interface{}{
 		"storage_path": storagePath,
-		"upload_url":   uploadURL,
-		"method":       http.MethodPut,
-		"headers": map[string]string{
-			"Content-Type": contentType,
-		},
-		"expires_at": expiresAt.Format(time.RFC3339),
+		"upload_url":   postPolicy.URL,
+		"method":       http.MethodPost,
+		"form_fields":  postPolicy.Fields,
+		"expires_at":   expiresAt.Format(time.RFC3339),
 	})
 }
 
 func (s *apiServer) finalizeSignedUpload(writer http.ResponseWriter, request *http.Request, user *verifiedUser) {
 	defer request.Body.Close()
+	deleteUploadedObject := func(ctx context.Context, path string) {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			return
+		}
+		if err := s.bucket.Object(path).Delete(ctx); err != nil && !errors.Is(err, gcs.ErrObjectNotExist) {
+			log.Printf("finalize cleanup delete failed storage_path=%s err=%v", path, err)
+		}
+	}
 	var payload finalizeUploadRequest
 	decoder := json.NewDecoder(request.Body)
 	decoder.DisallowUnknownFields()
@@ -273,6 +286,7 @@ func (s *apiServer) finalizeSignedUpload(writer http.ResponseWriter, request *ht
 		return
 	}
 	if _, err := s.ensureWithinLimit(ownerEmail); err != nil {
+		deleteUploadedObject(request.Context(), storagePath)
 		s.writeErr(writer, err)
 		return
 	}
@@ -286,10 +300,12 @@ func (s *apiServer) finalizeSignedUpload(writer http.ResponseWriter, request *ht
 		return
 	}
 	if attrs.Size <= 0 {
+		deleteUploadedObject(request.Context(), storagePath)
 		writeJSONError(writer, http.StatusBadRequest, "uploaded object is empty")
 		return
 	}
 	if err := ensureImage(strings.TrimSpace(attrs.ContentType)); err != nil {
+		deleteUploadedObject(request.Context(), storagePath)
 		s.writeErr(writer, err)
 		return
 	}
@@ -370,8 +386,12 @@ func (s *apiServer) ensureReceiptOwner(data map[string]interface{}, ownerEmail s
 }
 
 func ensureImage(contentType string) error {
-	if !strings.HasPrefix(strings.TrimSpace(contentType), "image/") {
-		return httpError{status: http.StatusBadRequest, detail: "Uploaded file must be an image"}
+	mediaType, _, err := mime.ParseMediaType(strings.TrimSpace(contentType))
+	if err != nil {
+		return httpError{status: http.StatusBadRequest, detail: "Invalid content type"}
+	}
+	if !strings.EqualFold(mediaType, "image/webp") {
+		return httpError{status: http.StatusBadRequest, detail: "Uploaded file must be image/webp"}
 	}
 	return nil
 }
@@ -514,7 +534,7 @@ func (s *apiServer) extractReceiptOCR(ctx context.Context, imageURL string, cate
 				Role: "user",
 				Content: []openAIInputContent{
 					{Type: "input_text", Text: buildOCRPrompt(categoryOptions)},
-					{Type: "input_image", ImageURL: imageURL},
+					{Type: "input_image", ImageURL: imageURL, Detail: "low"},
 				},
 			},
 		},

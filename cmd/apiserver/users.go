@@ -38,10 +38,16 @@ func (s *apiServer) ensureWithinLimit(ownerEmail string) (map[string]interface{}
 	if limit == nil {
 		return userDoc, nil
 	}
+	planLabel := strings.ToLower(strings.TrimSpace(fallbackString(plan["name"], planID)))
+	planIDLower := strings.ToLower(strings.TrimSpace(planID))
 
-	interval := planIntervalValue(plan)
-	switch interval {
-	case "once":
+	// Pro plan has no enforced receipt metadata count checks.
+	if strings.Contains(planLabel, "pro") || planIDLower == "pro" {
+		return userDoc, nil
+	}
+
+	// Free plan: enforce total metadata-count cap across all time.
+	if strings.Contains(planLabel, "free") || planIDLower == "free" || planIDLower == "" {
 		count, err := s.countReceiptsByOwner(ownerEmail, nil, nil)
 		if err != nil {
 			return nil, err
@@ -56,68 +62,88 @@ func (s *apiServer) ensureWithinLimit(ownerEmail string) (map[string]interface{}
 			)
 		}
 		return userDoc, nil
-	case "month":
-		start := timeValue(userDoc["current_period_start"])
-		end := timeValue(userDoc["current_period_end"])
-		if start == nil || end == nil || !now.Before(*end) {
-			newStart, newEnd := periodBounds(now)
-			if userRef != nil {
-				_, err := userRef.Update(
-					requestContext(),
-					[]fs.Update{
-						{Path: "current_period_start", Value: newStart},
-						{Path: "current_period_end", Value: newEnd},
-						{Path: "receipt_count_updated_at", Value: now},
-					},
-				)
-				if err != nil {
-					return nil, err
-				}
-			}
-			userDoc["current_period_start"] = newStart
-			userDoc["current_period_end"] = newEnd
-			start = &newStart
-			end = &newEnd
-		}
-		count, err := s.countReceiptsByOwner(ownerEmail, start, end)
-		if err != nil {
-			return nil, err
-		}
-		if count >= *limit {
-			return nil, paymentRequiredError(
-				fmt.Sprintf(
-					"Plan %s limit reached (%d receipts per month)",
-					fallbackString(plan["name"], fmt.Sprint(plan["plan_id"])),
-					*limit,
-				),
-			)
-		}
-		return userDoc, nil
-	default:
-		return nil, fmt.Errorf("Plan %v has unsupported interval '%s'", plan["plan_id"], interval)
 	}
+
+	// Plus plan (and any non-free/non-pro plans): enforce within current billing period only.
+	start := timeValue(userDoc["current_period_start"])
+	end := timeValue(userDoc["current_period_end"])
+	if start == nil || end == nil || !now.Before(*end) {
+		newStart, newEnd := periodBounds(now)
+		if userRef != nil {
+			_, err := userRef.Update(
+				requestContext(),
+				[]fs.Update{
+					{Path: "current_period_start", Value: newStart},
+					{Path: "current_period_end", Value: newEnd},
+					{Path: "receipt_count_updated_at", Value: now},
+				},
+			)
+			if err != nil {
+				return nil, err
+			}
+		}
+		userDoc["current_period_start"] = newStart
+		userDoc["current_period_end"] = newEnd
+		start = &newStart
+		end = &newEnd
+	}
+	count, err := s.countReceiptsByOwner(ownerEmail, start, end)
+	if err != nil {
+		return nil, err
+	}
+	if count >= *limit {
+		return nil, paymentRequiredError(
+			fmt.Sprintf(
+				"Plan %s limit reached (%d receipts in current billing period)",
+				fallbackString(plan["name"], fmt.Sprint(plan["plan_id"])),
+				*limit,
+			),
+		)
+	}
+	return userDoc, nil
 }
 
 func (s *apiServer) countReceiptsByOwner(ownerEmail string, start *time.Time, end *time.Time) (int, error) {
-	query := s.receipts.Where("owner_email", "==", ownerEmail)
-	if start != nil {
-		query = query.Where("created_at", ">=", *start)
-	}
-	if end != nil {
-		query = query.Where("created_at", "<", *end)
-	}
-	iter := query.Documents(requestContext())
-	defer iter.Stop()
 	count := 0
+
+	shardedQuery := s.receipts.
+		Where(receiptShardSchemaField, "==", receiptShardSchema).
+		Where("owner_email", "==", ownerEmail)
+	shardedIter := shardedQuery.Documents(requestContext())
+	defer shardedIter.Stop()
 	for {
-		_, err := iter.Next()
+		snapshot, err := shardedIter.Next()
 		if err == iterator.Done {
 			break
 		}
 		if err != nil {
 			return 0, err
 		}
-		count++
+		metadataMap, _ := snapshot.Data()[receiptShardMetadataField].(map[string]interface{})
+		if len(metadataMap) == 0 {
+			continue
+		}
+		if start == nil && end == nil {
+			count += len(metadataMap)
+			continue
+		}
+		for _, raw := range metadataMap {
+			metadata, ok := raw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			created := timeValue(metadata["created_at"])
+			if created == nil {
+				continue
+			}
+			if start != nil && created.Before(*start) {
+				continue
+			}
+			if end != nil && !created.Before(*end) {
+				continue
+			}
+			count++
+		}
 	}
 	return count, nil
 }

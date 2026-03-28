@@ -144,7 +144,6 @@ const (
 
 type ownedReceipt struct {
 	Data      map[string]interface{}
-	LegacyRef *fs.DocumentRef
 	DetailRef *fs.DocumentRef
 	ShardRef  *fs.DocumentRef
 }
@@ -411,25 +410,18 @@ func (s *apiServer) deleteReceipt(writer http.ResponseWriter, request *http.Requ
 		s.writeErr(writer, err)
 		return
 	}
-	if receipt.LegacyRef != nil {
-		if _, err := receipt.LegacyRef.Delete(request.Context()); err != nil {
+	if receipt.DetailRef != nil {
+		if _, err := receipt.DetailRef.Delete(request.Context()); err != nil {
 			s.writeErr(writer, err)
 			return
 		}
-	} else {
-		if receipt.DetailRef != nil {
-			if _, err := receipt.DetailRef.Delete(request.Context()); err != nil {
-				s.writeErr(writer, err)
-				return
-			}
-		}
-		if receipt.ShardRef != nil {
-			_, _ = receipt.ShardRef.Update(request.Context(), []fs.Update{
-				{Path: fmt.Sprintf("%s.%s", receiptShardMetadataField, receiptID), Value: fs.Delete},
-				{Path: receiptShardCountField, Value: fs.Increment(-1)},
-				{Path: "updated_at", Value: time.Now().UTC()},
-			})
-		}
+	}
+	if receipt.ShardRef != nil {
+		_, _ = receipt.ShardRef.Update(request.Context(), []fs.Update{
+			{Path: fmt.Sprintf("%s.%s", receiptShardMetadataField, receiptID), Value: fs.Delete},
+			{Path: receiptShardCountField, Value: fs.Increment(-1)},
+			{Path: "updated_at", Value: time.Now().UTC()},
+		})
 	}
 	storagePath := strings.TrimSpace(stringFromAny(receipt.Data["storage_path"]))
 	if storagePath != "" {
@@ -440,19 +432,6 @@ func (s *apiServer) deleteReceipt(writer http.ResponseWriter, request *http.Requ
 }
 
 func (s *apiServer) getOwnedReceipt(ctx context.Context, receiptID string, ownerEmail string) (ownedReceipt, error) {
-	snapshot, err := s.receipts.Doc(receiptID).Get(ctx)
-	if err == nil && snapshot.Exists() {
-		data := snapshot.Data()
-		if stringFromAny(data[receiptShardSchemaField]) != receiptShardSchema {
-			if err := s.ensureReceiptOwner(data, ownerEmail, receiptID); err == nil {
-				return ownedReceipt{
-					Data:      data,
-					LegacyRef: snapshot.Ref,
-				}, nil
-			}
-		}
-	}
-
 	iter := s.receipts.
 		Where(receiptShardSchemaField, "==", receiptShardSchema).
 		Where("owner_email", "==", strings.TrimSpace(ownerEmail)).

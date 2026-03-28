@@ -43,18 +43,18 @@ type receiptItem struct {
 }
 
 type receiptRecord struct {
-	ID                    string                 `json:"id"`
-	Vendor                *string                `json:"vendor,omitempty"`
-	Subtotal              *float64               `json:"subtotal,omitempty"`
-	Tax                   *float64               `json:"tax,omitempty"`
-	Total                 *float64               `json:"total,omitempty"`
-	Category              *string                `json:"category,omitempty"`
-	PurchaseDate          *string                `json:"purchase_date,omitempty"`
-	Items                 []receiptItem          `json:"items"`
-	ImageURL              string                 `json:"image_url"`
-	ExtractedText         string                 `json:"extracted_text"`
-	ExtractedFields       map[string]interface{} `json:"extracted_fields"`
-	CreatedAt             time.Time              `json:"created_at"`
+	ID              string                 `json:"id"`
+	Vendor          *string                `json:"vendor,omitempty"`
+	Subtotal        *float64               `json:"subtotal,omitempty"`
+	Tax             *float64               `json:"tax,omitempty"`
+	Total           *float64               `json:"total,omitempty"`
+	Category        *string                `json:"category,omitempty"`
+	PurchaseDate    *string                `json:"purchase_date,omitempty"`
+	Items           []receiptItem          `json:"items"`
+	ImageURL        string                 `json:"image_url"`
+	ExtractedText   string                 `json:"extracted_text"`
+	ExtractedFields map[string]interface{} `json:"extracted_fields"`
+	CreatedAt       time.Time              `json:"created_at"`
 }
 
 type signedUploadRequest struct {
@@ -131,6 +131,24 @@ type subtotalValidation struct {
 	Info     map[string]interface{}
 }
 
+const (
+	receiptShardSchema        = "receipt_shard"
+	receiptShardSchemaField   = "_schema"
+	receiptShardActiveField   = "active"
+	receiptShardCountField    = "receipt_count"
+	receiptShardIndexField    = "shard_index"
+	receiptShardMetadataField = "receipt_metadata"
+	receiptDetailsSubcollName = "details"
+	receiptShardMaxReceipts   = 2500
+)
+
+type ownedReceipt struct {
+	Data      map[string]interface{}
+	LegacyRef *fs.DocumentRef
+	DetailRef *fs.DocumentRef
+	ShardRef  *fs.DocumentRef
+}
+
 func requestContext() context.Context {
 	return context.Background()
 }
@@ -198,12 +216,12 @@ func (s *apiServer) signReceiptImage(writer http.ResponseWriter, request *http.R
 		writeJSONError(writer, http.StatusBadRequest, "receipt_id is required")
 		return
 	}
-	data, err := s.getOwnedReceipt(request.Context(), receiptID, user.Email)
+	receipt, err := s.getOwnedReceipt(request.Context(), receiptID, user.Email)
 	if err != nil {
 		s.writeErr(writer, err)
 		return
 	}
-	storagePath := stringFromAny(data["storage_path"])
+	storagePath := stringFromAny(receipt.Data["storage_path"])
 	if storagePath == "" {
 		writeJSONError(writer, http.StatusNotFound, "Receipt image not found")
 		return
@@ -318,53 +336,102 @@ func (s *apiServer) finalizeSignedUpload(writer http.ResponseWriter, request *ht
 	}
 
 	now := time.Now().UTC()
-	docRef := s.receipts.NewDoc()
-	receiptPayload := map[string]interface{}{
-		"vendor":                            normalizeOptionalString(payload.Vendor),
-		"subtotal":                          payload.Subtotal,
-		"tax":                               payload.Tax,
-		"total":                             payload.Total,
-		"category":                          normalizeOptionalString(payload.Category),
-		"purchase_date":                     normalizeOptionalString(payload.PurchaseDate),
-		"storage_path":                      storagePath,
-		"items":                             []map[string]interface{}{},
-		"extracted_text":                    "",
-		"extracted_fields":                  map[string]interface{}{},
-		"created_at":                        now,
-		"owner_email":                       ownerEmail,
-	}
-	if _, err := docRef.Set(request.Context(), receiptPayload); err != nil {
-		s.writeErr(writer, err)
-		return
-	}
-	job := receiptJob{
-		ID:          docRef.ID,
-		OwnerEmail:  ownerEmail,
-		StoragePath: storagePath,
-	}
-	s.processReceiptJob(request.Context(), job)
-	updated, err := s.receipts.Doc(docRef.ID).Get(request.Context())
-	if err == nil && updated.Exists() {
-		updatedData := updated.Data()
-		s.attachSignedImageURL(request.Context(), updatedData)
-		writeJSON(writer, http.StatusCreated, receiptRecordFromMap(docRef.ID, updatedData))
-		return
-	}
-	s.attachSignedImageURL(request.Context(), receiptPayload)
-	writeJSON(writer, http.StatusCreated, receiptRecordFromMap(docRef.ID, receiptPayload))
-}
-
-func (s *apiServer) deleteReceipt(writer http.ResponseWriter, request *http.Request, user *verifiedUser, receiptID string) {
-	data, err := s.getOwnedReceipt(request.Context(), receiptID, user.Email)
+	shardRef, err := s.getOrCreateActiveReceiptShard(request.Context(), ownerEmail)
 	if err != nil {
 		s.writeErr(writer, err)
 		return
 	}
-	if _, err := s.receipts.Doc(receiptID).Delete(request.Context()); err != nil {
+	receiptID := s.receipts.NewDoc().ID
+	detailRef := shardRef.Collection(receiptDetailsSubcollName).Doc(receiptID)
+	receiptPayload := map[string]interface{}{
+		"vendor":           normalizeOptionalString(payload.Vendor),
+		"subtotal":         payload.Subtotal,
+		"tax":              payload.Tax,
+		"total":            payload.Total,
+		"category":         normalizeOptionalString(payload.Category),
+		"purchase_date":    normalizeOptionalString(payload.PurchaseDate),
+		"storage_path":     storagePath,
+		"items":            []map[string]interface{}{},
+		"extracted_text":   "",
+		"extracted_fields": map[string]interface{}{},
+		"created_at":       now,
+		"owner_email":      ownerEmail,
+	}
+	summaryPayload := map[string]interface{}{
+		"owner_email":   ownerEmail,
+		"vendor":        receiptPayload["vendor"],
+		"total":         receiptPayload["total"],
+		"purchase_date": receiptPayload["purchase_date"],
+		"category":      receiptPayload["category"],
+		"created_at":    now,
+	}
+	detailPayload := map[string]interface{}{
+		"owner_email":      ownerEmail,
+		"subtotal":         receiptPayload["subtotal"],
+		"tax":              receiptPayload["tax"],
+		"storage_path":     storagePath,
+		"items":            receiptPayload["items"],
+		"extracted_text":   receiptPayload["extracted_text"],
+		"extracted_fields": receiptPayload["extracted_fields"],
+	}
+	batch := s.firestore.Batch()
+	batch.Set(detailRef, detailPayload)
+	batch.Update(shardRef, []fs.Update{
+		{Path: receiptShardCountField, Value: fs.Increment(1)},
+		{Path: fmt.Sprintf("%s.%s", receiptShardMetadataField, receiptID), Value: summaryPayload},
+		{Path: "updated_at", Value: now},
+	})
+	if _, err := batch.Commit(request.Context()); err != nil {
 		s.writeErr(writer, err)
 		return
 	}
-	storagePath := strings.TrimSpace(stringFromAny(data["storage_path"]))
+	job := receiptJob{
+		ID:          receiptID,
+		OwnerEmail:  ownerEmail,
+		StoragePath: storagePath,
+		DetailRef:   detailRef,
+		ShardRef:    shardRef,
+		CreatedAt:   now,
+	}
+	s.processReceiptJob(request.Context(), job)
+	updated, err := s.getOwnedReceipt(request.Context(), receiptID, ownerEmail)
+	if err == nil {
+		updatedData := cloneMap(updated.Data)
+		s.attachSignedImageURL(request.Context(), updatedData)
+		writeJSON(writer, http.StatusCreated, receiptRecordFromMap(receiptID, updatedData))
+		return
+	}
+	s.attachSignedImageURL(request.Context(), receiptPayload)
+	writeJSON(writer, http.StatusCreated, receiptRecordFromMap(receiptID, receiptPayload))
+}
+
+func (s *apiServer) deleteReceipt(writer http.ResponseWriter, request *http.Request, user *verifiedUser, receiptID string) {
+	receipt, err := s.getOwnedReceipt(request.Context(), receiptID, user.Email)
+	if err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+	if receipt.LegacyRef != nil {
+		if _, err := receipt.LegacyRef.Delete(request.Context()); err != nil {
+			s.writeErr(writer, err)
+			return
+		}
+	} else {
+		if receipt.DetailRef != nil {
+			if _, err := receipt.DetailRef.Delete(request.Context()); err != nil {
+				s.writeErr(writer, err)
+				return
+			}
+		}
+		if receipt.ShardRef != nil {
+			_, _ = receipt.ShardRef.Update(request.Context(), []fs.Update{
+				{Path: fmt.Sprintf("%s.%s", receiptShardMetadataField, receiptID), Value: fs.Delete},
+				{Path: receiptShardCountField, Value: fs.Increment(-1)},
+				{Path: "updated_at", Value: time.Now().UTC()},
+			})
+		}
+	}
+	storagePath := strings.TrimSpace(stringFromAny(receipt.Data["storage_path"]))
 	if storagePath != "" {
 		if err := s.bucket.Object(storagePath).Delete(request.Context()); err != nil && !errors.Is(err, gcs.ErrObjectNotExist) {
 		}
@@ -372,16 +439,63 @@ func (s *apiServer) deleteReceipt(writer http.ResponseWriter, request *http.Requ
 	writer.WriteHeader(http.StatusNoContent)
 }
 
-func (s *apiServer) getOwnedReceipt(ctx context.Context, receiptID string, ownerEmail string) (map[string]interface{}, error) {
+func (s *apiServer) getOwnedReceipt(ctx context.Context, receiptID string, ownerEmail string) (ownedReceipt, error) {
 	snapshot, err := s.receipts.Doc(receiptID).Get(ctx)
-	if err != nil || !snapshot.Exists() {
-		return nil, httpError{status: http.StatusNotFound, detail: fmt.Sprintf("Receipt %s not found", receiptID)}
+	if err == nil && snapshot.Exists() {
+		data := snapshot.Data()
+		if stringFromAny(data[receiptShardSchemaField]) != receiptShardSchema {
+			if err := s.ensureReceiptOwner(data, ownerEmail, receiptID); err == nil {
+				return ownedReceipt{
+					Data:      data,
+					LegacyRef: snapshot.Ref,
+				}, nil
+			}
+		}
 	}
-	data := snapshot.Data()
-	if err := s.ensureReceiptOwner(data, ownerEmail, receiptID); err != nil {
-		return nil, err
+
+	iter := s.receipts.
+		Where(receiptShardSchemaField, "==", receiptShardSchema).
+		Where("owner_email", "==", strings.TrimSpace(ownerEmail)).
+		Documents(ctx)
+	defer iter.Stop()
+	for {
+		shardSnapshot, err := iter.Next()
+		if errors.Is(err, iterator.Done) {
+			break
+		}
+		if err != nil {
+			return ownedReceipt{}, err
+		}
+		shardData := shardSnapshot.Data()
+		metadataMap, _ := shardData[receiptShardMetadataField].(map[string]interface{})
+		metadataRaw, ok := metadataMap[receiptID]
+		if !ok {
+			continue
+		}
+		metadata, ok := metadataRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if err := s.ensureReceiptOwner(metadata, ownerEmail, receiptID); err != nil {
+			return ownedReceipt{}, err
+		}
+		detailRef := shardSnapshot.Ref.Collection(receiptDetailsSubcollName).Doc(receiptID)
+		detailSnapshot, err := detailRef.Get(ctx)
+		if err != nil || !detailSnapshot.Exists() {
+			return ownedReceipt{}, httpError{status: http.StatusNotFound, detail: fmt.Sprintf("Receipt %s not found", receiptID)}
+		}
+		detailData := detailSnapshot.Data()
+		data := cloneMap(metadata)
+		for key, value := range detailData {
+			data[key] = value
+		}
+		return ownedReceipt{
+			Data:      data,
+			DetailRef: detailRef,
+			ShardRef:  shardSnapshot.Ref,
+		}, nil
 	}
-	return data, nil
+	return ownedReceipt{}, httpError{status: http.StatusNotFound, detail: fmt.Sprintf("Receipt %s not found", receiptID)}
 }
 
 func (s *apiServer) ensureReceiptOwner(data map[string]interface{}, ownerEmail string, receiptID string) error {
@@ -390,6 +504,97 @@ func (s *apiServer) ensureReceiptOwner(data map[string]interface{}, ownerEmail s
 		return httpError{status: http.StatusNotFound, detail: fmt.Sprintf("Receipt %s not found", receiptID)}
 	}
 	return nil
+}
+
+func (s *apiServer) getOrCreateActiveReceiptShard(ctx context.Context, ownerEmail string) (*fs.DocumentRef, error) {
+	findActive := func() (*fs.DocumentSnapshot, error) {
+		iter := s.receipts.
+			Where(receiptShardSchemaField, "==", receiptShardSchema).
+			Where("owner_email", "==", ownerEmail).
+			Where(receiptShardActiveField, "==", true).
+			Limit(1).
+			Documents(ctx)
+		defer iter.Stop()
+		snapshot, err := iter.Next()
+		if errors.Is(err, iterator.Done) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !snapshot.Exists() {
+			return nil, nil
+		}
+		return snapshot, nil
+	}
+
+	activeSnapshot, err := findActive()
+	if err != nil {
+		return nil, err
+	}
+	if activeSnapshot != nil {
+		count := int64(0)
+		switch typed := activeSnapshot.Data()[receiptShardCountField].(type) {
+		case int64:
+			count = typed
+		case int:
+			count = int64(typed)
+		case float64:
+			count = int64(typed)
+		}
+		if count < receiptShardMaxReceipts {
+			return activeSnapshot.Ref, nil
+		}
+		if _, err := activeSnapshot.Ref.Set(ctx, map[string]interface{}{
+			receiptShardActiveField: false,
+			"updated_at":            time.Now().UTC(),
+		}, fs.MergeAll); err != nil {
+			return nil, err
+		}
+	}
+
+	nextIndex := int64(1)
+	iter := s.receipts.
+		Where(receiptShardSchemaField, "==", receiptShardSchema).
+		Where("owner_email", "==", ownerEmail).
+		Documents(ctx)
+	defer iter.Stop()
+	for {
+		snapshot, iterErr := iter.Next()
+		if errors.Is(iterErr, iterator.Done) {
+			break
+		}
+		if iterErr != nil {
+			return nil, iterErr
+		}
+		index := int64(0)
+		switch typed := snapshot.Data()[receiptShardIndexField].(type) {
+		case int64:
+			index = typed
+		case int:
+			index = int64(typed)
+		case float64:
+			index = int64(typed)
+		}
+		if index >= nextIndex {
+			nextIndex = index + 1
+		}
+	}
+
+	ref := s.receipts.NewDoc()
+	if _, err := ref.Set(ctx, map[string]interface{}{
+		receiptShardSchemaField:   receiptShardSchema,
+		receiptShardActiveField:   true,
+		receiptShardCountField:    int64(0),
+		receiptShardIndexField:    nextIndex,
+		receiptShardMetadataField: map[string]interface{}{},
+		"owner_email":             ownerEmail,
+		"created_at":              time.Now().UTC(),
+		"updated_at":              time.Now().UTC(),
+	}); err != nil {
+		return nil, err
+	}
+	return ref, nil
 }
 
 func ensureImage(contentType string) error {
@@ -434,6 +639,17 @@ func normalizeOptionalString(value *string) interface{} {
 		return nil
 	}
 	return trimmed
+}
+
+func buildReceiptMetadataSummary(ownerEmail string, vendor *string, total *float64, purchaseDate *string, category *string, createdAt time.Time) map[string]interface{} {
+	return map[string]interface{}{
+		"owner_email":   strings.TrimSpace(ownerEmail),
+		"vendor":        normalizeOptionalString(vendor),
+		"total":         total,
+		"purchase_date": normalizeOptionalString(purchaseDate),
+		"category":      normalizeOptionalString(category),
+		"created_at":    createdAt.UTC(),
+	}
 }
 
 func (s *apiServer) categoryNames(ctx context.Context, ownerEmail string) ([]string, error) {
@@ -485,22 +701,25 @@ type receiptJob struct {
 	ID          string
 	OwnerEmail  string
 	StoragePath string
+	DetailRef   *fs.DocumentRef
+	ShardRef    *fs.DocumentRef
+	CreatedAt   time.Time
 }
 
 func (s *apiServer) processReceiptJob(ctx context.Context, job receiptJob) {
 	categoryOptions, err := s.categoryNames(ctx, job.OwnerEmail)
 	if err != nil {
-		s.markReceiptProcessingFailed(ctx, job.ID, err)
+		s.markReceiptProcessingFailed(ctx, job, err)
 		return
 	}
 	imageURL, err := s.signedImageURL(ctx, job.StoragePath)
 	if err != nil {
-		s.markReceiptProcessingFailed(ctx, job.ID, err)
+		s.markReceiptProcessingFailed(ctx, job, err)
 		return
 	}
 	ocrRes, err := s.extractReceiptOCR(ctx, imageURL, categoryOptions)
 	if err != nil {
-		s.markReceiptProcessingFailed(ctx, job.ID, err)
+		s.markReceiptProcessingFailed(ctx, job, err)
 		return
 	}
 
@@ -520,32 +739,68 @@ func (s *apiServer) processReceiptJob(ctx context.Context, job receiptJob) {
 		},
 		"validation": validation.Info,
 	}
-	ocrReadyUpdate := map[string]interface{}{
-		"vendor":                            ocrRes.Vendor,
-		"subtotal":                          validation.Subtotal,
-		"tax":                               ocrRes.Tax,
-		"total":                             ocrRes.Total,
-		"category":                          ocrRes.Category,
-		"purchase_date":                     ocrRes.PurchaseDate,
-		"items":                             itemsPayload,
-		"extracted_text":                    ocrRes.Text,
-		"extracted_fields":                  extractedFields,
+	detailUpdate := map[string]interface{}{
+		"owner_email":      ownerEmailOrFallback(job.OwnerEmail),
+		"subtotal":         validation.Subtotal,
+		"tax":              ocrRes.Tax,
+		"items":            itemsPayload,
+		"extracted_text":   ocrRes.Text,
+		"extracted_fields": extractedFields,
 	}
 	// Expose extracted data as soon as OCR completes.
-	if _, err := s.receipts.Doc(job.ID).Set(ctx, ocrReadyUpdate, fs.MergeAll); err != nil {
-		s.markReceiptProcessingFailed(ctx, job.ID, err)
+	if job.DetailRef != nil && job.ShardRef != nil {
+		batch := s.firestore.Batch()
+		batch.Set(job.DetailRef, detailUpdate, fs.MergeAll)
+		createdAt := job.CreatedAt
+		if createdAt.IsZero() {
+			createdAt = time.Now().UTC()
+		}
+		batch.Update(job.ShardRef, []fs.Update{
+			{Path: fmt.Sprintf("%s.%s", receiptShardMetadataField, job.ID), Value: buildReceiptMetadataSummary(job.OwnerEmail, ocrRes.Vendor, ocrRes.Total, ocrRes.PurchaseDate, ocrRes.Category, createdAt)},
+			{Path: "updated_at", Value: time.Now().UTC()},
+		})
+		if _, err := batch.Commit(ctx); err != nil {
+			s.markReceiptProcessingFailed(ctx, job, err)
+			return
+		}
+		return
+	}
+	if _, err := s.receipts.Doc(job.ID).Set(ctx, map[string]interface{}{
+		"vendor":           ocrRes.Vendor,
+		"subtotal":         validation.Subtotal,
+		"tax":              ocrRes.Tax,
+		"total":            ocrRes.Total,
+		"category":         ocrRes.Category,
+		"purchase_date":    ocrRes.PurchaseDate,
+		"items":            itemsPayload,
+		"extracted_text":   ocrRes.Text,
+		"extracted_fields": extractedFields,
+	}, fs.MergeAll); err != nil {
+		s.markReceiptProcessingFailed(ctx, job, err)
 		return
 	}
 }
 
-func (s *apiServer) markReceiptProcessingFailed(ctx context.Context, receiptID string, err error) {
+func (s *apiServer) markReceiptProcessingFailed(ctx context.Context, job receiptJob, err error) {
 	extractedFields := map[string]interface{}{
 		"ocr_error": err.Error(),
 	}
-	if _, updateErr := s.receipts.Doc(receiptID).Set(ctx, map[string]interface{}{
+	if job.DetailRef != nil {
+		if _, updateErr := job.DetailRef.Set(ctx, map[string]interface{}{
+			"owner_email":      ownerEmailOrFallback(job.OwnerEmail),
+			"extracted_fields": extractedFields,
+		}, fs.MergeAll); updateErr != nil {
+		}
+		return
+	}
+	if _, updateErr := s.receipts.Doc(job.ID).Set(ctx, map[string]interface{}{
 		"extracted_fields": extractedFields,
 	}, fs.MergeAll); updateErr != nil {
 	}
+}
+
+func ownerEmailOrFallback(ownerEmail string) string {
+	return strings.TrimSpace(ownerEmail)
 }
 
 func (s *apiServer) extractReceiptOCR(ctx context.Context, imageURL string, categoryOptions []string) (ocrResult, error) {
@@ -845,18 +1100,18 @@ func validateSubtotalAgainstItems(subtotal *float64, items []map[string]interfac
 
 func receiptRecordFromMap(id string, payload map[string]interface{}) receiptRecord {
 	return receiptRecord{
-		ID:                    id,
-		Vendor:                valueStringPtr(payload["vendor"]),
-		Subtotal:              existingFloatOrZeroPtr(payload["subtotal"]),
-		Tax:                   existingFloatOrZeroPtr(payload["tax"]),
-		Total:                 existingFloatOrZeroPtr(payload["total"]),
-		Category:              valueStringPtr(payload["category"]),
-		PurchaseDate:          valueStringPtr(payload["purchase_date"]),
-		Items:                 receiptItemsFromAny(payload["items"]),
-		ImageURL:              stringFromAny(payload["image_url"]),
-		ExtractedText:         stringFromAny(payload["extracted_text"]),
-		ExtractedFields:       cloneMap(payload["extracted_fields"]),
-		CreatedAt:             timeFromAny(payload["created_at"]),
+		ID:              id,
+		Vendor:          valueStringPtr(payload["vendor"]),
+		Subtotal:        existingFloatOrZeroPtr(payload["subtotal"]),
+		Tax:             existingFloatOrZeroPtr(payload["tax"]),
+		Total:           existingFloatOrZeroPtr(payload["total"]),
+		Category:        valueStringPtr(payload["category"]),
+		PurchaseDate:    valueStringPtr(payload["purchase_date"]),
+		Items:           receiptItemsFromAny(payload["items"]),
+		ImageURL:        stringFromAny(payload["image_url"]),
+		ExtractedText:   stringFromAny(payload["extracted_text"]),
+		ExtractedFields: cloneMap(payload["extracted_fields"]),
+		CreatedAt:       timeFromAny(payload["created_at"]),
 	}
 }
 

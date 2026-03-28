@@ -15,6 +15,7 @@ import (
 	"mime"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -448,18 +449,36 @@ func (s *apiServer) categoryNames(ctx context.Context, ownerEmail string) ([]str
 		if err != nil {
 			return nil, err
 		}
-		name := strings.TrimSpace(stringFromAny(snapshot.Data()["name"]))
-		if name == "" {
-			continue
+		data := snapshot.Data()
+		for _, name := range categoryNamesFromMapValue(data["categories"]) {
+			key := strings.ToLower(name)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			names = append(names, name)
 		}
-		key := strings.ToLower(name)
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		names = append(names, name)
 	}
 	return names, nil
+}
+
+func categoryNamesFromMapValue(value interface{}) []string {
+	categories, ok := value.(map[string]interface{})
+	if !ok || len(categories) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(categories))
+	for name := range categories {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			continue
+		}
+		names = append(names, trimmed)
+	}
+	sort.Slice(names, func(i int, j int) bool {
+		return strings.ToLower(names[i]) < strings.ToLower(names[j])
+	})
+	return names
 }
 
 type receiptJob struct {

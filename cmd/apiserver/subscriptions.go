@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -53,7 +52,6 @@ func (s *apiServer) applySubscriptionPayload(ownerEmail string, payload map[stri
 	if _, err := docRef.Set(requestContext(), update, fs.MergeAll); err != nil {
 		return "", err
 	}
-	log.Printf("apply_subscription_payload owner=%s doc_id=%s stored_plan_id=%s", ownerEmail, docRef.ID, stringValue(plan["plan_id"]))
 	return stringValue(plan["plan_id"]), nil
 }
 
@@ -113,20 +111,6 @@ func (s *apiServer) findOwnerByCustomerCode(customerCode string) string {
 		return ""
 	}
 	return strings.TrimSpace(stringValue(snapshot.Data()["owner_email"]))
-}
-
-func (s *apiServer) setOwnerCustomerCode(ownerEmail, customerCode string) error {
-	normalized := strings.TrimSpace(customerCode)
-	if normalized == "" {
-		return httpError{status: http.StatusBadRequest, detail: "customerCode is required"}
-	}
-	docRef := s.getOrCreateUserRef(ownerEmail)
-	_, err := docRef.Set(requestContext(), map[string]interface{}{
-		"owner_email":              ownerEmail,
-		"helcim_customer_code":     normalized,
-		"customer_code_updated_at": time.Now().UTC(),
-	}, fs.MergeAll)
-	return err
 }
 
 func (s *apiServer) storePaymentMethodRegistration(ownerEmail, customerCode, cardToken string, transactionID *int, approvedAt *time.Time) error {
@@ -218,17 +202,6 @@ func firstPaymentPlanEntry(payload interface{}) (map[string]interface{}, bool) {
 	}
 	first, ok := data[0].(map[string]interface{})
 	return first, ok
-}
-
-func toQueryMap(values map[string][]string) map[string][]string {
-	result := map[string][]string{}
-	for key, entries := range values {
-		if len(entries) == 0 {
-			continue
-		}
-		result[key] = append([]string{}, entries...)
-	}
-	return result
 }
 
 func iterateDocs(iter *fs.DocumentIterator) ([]*fs.DocumentSnapshot, error) {

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -83,7 +82,6 @@ func (c *helcimClient) request(method, path string, query map[string][]string, p
 		req.Header.Set("Idempotency-Key", idempotencyKey)
 	}
 
-	log.Printf("helcim_request method=%s path=%s payload=%v idempotency_key=%s", method, path, payload, idempotencyKey)
 	client := &http.Client{Timeout: c.timeout}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -97,7 +95,6 @@ func (c *helcimClient) request(method, path string, query map[string][]string, p
 	}
 	rawText := strings.TrimSpace(string(raw))
 	if resp.StatusCode >= 400 {
-		log.Printf("helcim_http_error method=%s path=%s status=%d body=%s", method, path, resp.StatusCode, rawText)
 		if rawText == "" {
 			return nil, httpError{status: resp.StatusCode, detail: fmt.Sprintf("Helcim API request failed (%d)", resp.StatusCode)}
 		}
@@ -107,7 +104,6 @@ func (c *helcimClient) request(method, path string, query map[string][]string, p
 		}
 		return nil, helcimHTTPError{status: resp.StatusCode, detail: rawText}
 	}
-	log.Printf("helcim_response method=%s path=%s status=%d body=%s", method, path, resp.StatusCode, rawText)
 	if rawText == "" {
 		return map[string]interface{}{}, nil
 	}

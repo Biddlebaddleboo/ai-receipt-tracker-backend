@@ -1,6 +1,6 @@
 # Receipt Scanner Backend (Go)
 
-Lean Go backend for receipt upload finalization, OCR extraction, image URL signing, and Helcim billing actions.
+Lean Go backend for receipt upload finalization, OCR extraction, image URL signing, and the remaining Helcim approval/activation flows.
 
 ## Related Links
 
@@ -14,7 +14,7 @@ Lean Go backend for receipt upload finalization, OCR extraction, image URL signi
 - Finalizes uploaded receipts and stores metadata in Firestore.
 - Runs OCR using OpenAI (image is sent as a short-lived signed URL, not file bytes through backend).
 - Signs receipt image URLs on demand.
-- Handles Helcim subscription-related server flows.
+- Handles the Helcim approval callback and subscription activation.
 
 ## Current Architecture
 
@@ -54,14 +54,6 @@ Lean Go backend for receipt upload finalization, OCR extraction, image URL signi
 
 #### Billing
 
-- `POST /billing/notify`
-- `POST /billing/helcim/customer-code`
-- `GET /billing/helcim/subscriptions`
-- `POST /billing/helcim/subscriptions`
-- `PATCH /billing/helcim/subscriptions`
-- `GET /billing/helcim/subscriptions/{subscription_id}`
-- `DELETE /billing/helcim/subscriptions/{subscription_id}`
-- `POST /billing/helcim/subscriptions/{subscription_id}/sync`
 - `POST /billing/subscriptions/activate`
 
 ## Required Environment Variables
@@ -91,7 +83,7 @@ Helcim:
 - `HELCIM_API_BASE_URL` (default `https://api.helcim.com/v2`)
 - `HELCIM_TIMEOUT_SECONDS` (default `20`)
 - `HELCIM_USER_AGENT` (default `ai-receipt-tracker-backend/1.0`)
-- `HELCIM_APPROVAL_SECRET` (optional)
+- `HELCIM_APPROVAL_SECRET` (optional, used to protect the approval callback)
 
 ## Local Run
 

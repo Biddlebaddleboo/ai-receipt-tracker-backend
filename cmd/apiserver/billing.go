@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -34,21 +33,6 @@ func (s *apiServer) handleBilling(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 	switch {
-	case path == "/notify" && request.Method == http.MethodPost:
-		s.handleBillingNotify(writer, request, user.Email)
-	case path == "/helcim/customer-code" && request.Method == http.MethodPost:
-		s.handleSetCustomerCode(writer, request, user.Email)
-	case path == "/helcim/subscriptions" && request.Method == http.MethodGet:
-		s.forwardHelcimQuery(writer, request, http.MethodGet, "subscriptions")
-	case path == "/helcim/subscriptions" && request.Method == http.MethodPost:
-		s.forwardHelcimPayload(writer, request, http.MethodPost, "subscriptions", "")
-	case path == "/helcim/subscriptions" && request.Method == http.MethodPatch:
-		s.forwardHelcimPayload(writer, request, http.MethodPatch, "subscriptions", "")
-	case strings.HasPrefix(path, "/helcim/subscriptions/") && strings.HasSuffix(path, "/sync") && request.Method == http.MethodPost:
-		id := strings.TrimSuffix(strings.TrimPrefix(path, "/helcim/subscriptions/"), "/sync")
-		s.syncSubscriptionToUser(writer, request, user.Email, id)
-	case strings.HasPrefix(path, "/helcim/subscriptions/"):
-		s.handleHelcimSubscriptionByID(writer, request, strings.TrimPrefix(path, "/helcim/subscriptions/"))
 	case path == "/subscriptions/activate" && request.Method == http.MethodPost:
 		s.activateSubscription(writer, request, user.Email)
 	default:
@@ -65,34 +49,6 @@ func (s *apiServer) handlePublicBillingCallback(writer http.ResponseWriter, requ
 	default:
 		writeJSONError(writer, http.StatusMethodNotAllowed, "Method not allowed")
 	}
-}
-
-func (s *apiServer) handleBillingNotify(writer http.ResponseWriter, request *http.Request, ownerEmail string) {
-	payload, err := decodeJSONMapBody(request)
-	if err != nil {
-		writeJSONError(writer, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	planID, err := s.applySubscriptionPayload(ownerEmail, payload)
-	if err != nil {
-		s.writeErr(writer, err)
-		return
-	}
-	writeJSON(writer, http.StatusOK, map[string]interface{}{"status": "ok", "plan_id": planID})
-}
-
-func (s *apiServer) handleSetCustomerCode(writer http.ResponseWriter, request *http.Request, ownerEmail string) {
-	payload, err := decodeJSONMapBody(request)
-	if err != nil {
-		writeJSONError(writer, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	customerCode := strings.TrimSpace(stringValue(payload["customerCode"]))
-	if err := s.setOwnerCustomerCode(ownerEmail, customerCode); err != nil {
-		s.writeErr(writer, err)
-		return
-	}
-	writeJSON(writer, http.StatusOK, map[string]string{"status": "ok", "owner_email": ownerEmail})
 }
 
 func (s *apiServer) handleHelcimApprovalLanding(writer http.ResponseWriter, request *http.Request) {
@@ -147,52 +103,6 @@ func (s *apiServer) handleHelcimApproval(writer http.ResponseWriter, request *ht
 	result["owner_email"] = ownerEmail
 	result["payment_method_saved"] = paymentMethodSaved
 	writeJSON(writer, http.StatusOK, result)
-}
-
-func (s *apiServer) handleHelcimSubscriptionByID(writer http.ResponseWriter, request *http.Request, rawID string) {
-	id, err := strconv.Atoi(strings.TrimSpace(rawID))
-	if err != nil {
-		writeJSONError(writer, http.StatusNotFound, "Not found")
-		return
-	}
-	path := fmt.Sprintf("subscriptions/%d", id)
-	switch request.Method {
-	case http.MethodGet:
-		s.forwardHelcimQuery(writer, request, http.MethodGet, path)
-	case http.MethodDelete:
-		resp, err := s.helcim.request(http.MethodDelete, path, nil, nil, "")
-		if err != nil {
-			s.writeErr(writer, err)
-			return
-		}
-		writeJSON(writer, http.StatusOK, resp)
-	default:
-		writeJSONError(writer, http.StatusMethodNotAllowed, "Method not allowed")
-	}
-}
-
-func (s *apiServer) syncSubscriptionToUser(writer http.ResponseWriter, request *http.Request, ownerEmail string, rawID string) {
-	id, err := strconv.Atoi(strings.TrimSpace(rawID))
-	if err != nil {
-		writeJSONError(writer, http.StatusNotFound, "Not found")
-		return
-	}
-	resp, err := s.helcim.request(http.MethodGet, fmt.Sprintf("subscriptions/%d", id), nil, nil, "")
-	if err != nil {
-		s.writeErr(writer, err)
-		return
-	}
-	respMap, ok := resp.(map[string]interface{})
-	if !ok {
-		writeJSONError(writer, http.StatusBadGateway, "Unexpected Helcim subscription response format")
-		return
-	}
-	planID, err := s.applySubscriptionPayload(ownerEmail, respMap)
-	if err != nil {
-		s.writeErr(writer, err)
-		return
-	}
-	writeJSON(writer, http.StatusOK, map[string]interface{}{"status": "ok", "plan_id": planID, "subscription_id": id})
 }
 
 func (s *apiServer) activateSubscription(writer http.ResponseWriter, request *http.Request, ownerEmail string) {
@@ -265,29 +175,6 @@ func (s *apiServer) activateSubscription(writer http.ResponseWriter, request *ht
 		"plan_name":    plan["name"],
 		"subscription": respMap,
 	})
-}
-
-func (s *apiServer) forwardHelcimPayload(writer http.ResponseWriter, request *http.Request, method string, path string, idempotency string) {
-	payload, err := decodeJSONAnyBody(request)
-	if err != nil {
-		writeJSONError(writer, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	resp, err := s.helcim.request(method, path, nil, payload, idempotency)
-	if err != nil {
-		s.writeErr(writer, err)
-		return
-	}
-	writeJSON(writer, http.StatusOK, resp)
-}
-
-func (s *apiServer) forwardHelcimQuery(writer http.ResponseWriter, request *http.Request, method string, path string) {
-	resp, err := s.helcim.request(method, path, toQueryMap(request.URL.Query()), nil, "")
-	if err != nil {
-		s.writeErr(writer, err)
-		return
-	}
-	writeJSON(writer, http.StatusOK, resp)
 }
 
 func (s *apiServer) processApprovalPayload(payload map[string]interface{}) (map[string]interface{}, error) {
@@ -497,25 +384,4 @@ func isoTimeOrNil(value *time.Time) interface{} {
 		return nil
 	}
 	return value.Format(time.RFC3339)
-}
-
-func decodeJSONMapBody(request *http.Request) (map[string]interface{}, error) {
-	defer request.Body.Close()
-	var payload map[string]interface{}
-	if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
-		return nil, err
-	}
-	if payload == nil {
-		payload = map[string]interface{}{}
-	}
-	return payload, nil
-}
-
-func decodeJSONAnyBody(request *http.Request) (interface{}, error) {
-	defer request.Body.Close()
-	var payload interface{}
-	if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
-		return nil, err
-	}
-	return payload, nil
 }

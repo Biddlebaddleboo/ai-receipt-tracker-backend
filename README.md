@@ -1,6 +1,6 @@
 # Receipt Scanner Backend (Go)
 
-Lean Go backend for receipt upload finalization, OCR extraction, image URL signing, and the remaining Helcim approval/activation flows.
+Lean Go backend for receipt upload finalization, OCR extraction, image URL signing, read-only AI receipt access, and the remaining Helcim approval/activation flows.
 
 ## Related Links
 
@@ -9,7 +9,9 @@ Lean Go backend for receipt upload finalization, OCR extraction, image URL signi
 
 ## What This Service Does
 
-- Verifies Google OAuth bearer tokens for protected routes.
+- Verifies Google OAuth bearer tokens for protected app routes.
+- Generates and revokes one server-owned, read-only AI receipt access token per user.
+- Stores only the AI token secret hash in the server-only `ai_access_tokens` Firestore collection.
 - Issues signed Google Cloud Storage upload URLs.
 - Finalizes uploaded receipts and stores metadata in Firestore.
 - Runs OCR using OpenAI (image is sent as a short-lived signed URL, not file bytes through backend).
@@ -35,6 +37,17 @@ Lean Go backend for receipt upload finalization, OCR extraction, image URL signi
 
 ### Authenticated (Google ID token bearer)
 
+#### AI access management
+
+- `GET /ai-access/token`
+  - Returns whether an AI access token exists plus its non-secret prefix and creation time.
+- `POST /ai-access/token`
+  - Replaces any existing AI token and returns the new plaintext token once.
+- `DELETE /ai-access/token`
+  - Revokes the active AI token.
+
+The frontend must use these backend endpoints for AI token management. It does not read or write `ai_access_tokens` directly and requires no additional Firestore client permissions.
+
 #### Receipts
 
 - `POST /receipts/signed-upload`
@@ -55,6 +68,17 @@ Lean Go backend for receipt upload finalization, OCR extraction, image URL signi
 #### Billing
 
 - `POST /billing/subscriptions/activate`
+
+### Read-only AI token bearer
+
+These routes accept only an AI access token created through `/ai-access/token`. AI tokens are not accepted by existing receipt write, billing, or account-management routes.
+
+- `GET /ai/receipts`
+  - Returns receipt summary metadata for the token owner.
+- `GET /ai/receipts/{receipt_id}`
+  - Returns the full structured receipt record for the token owner.
+- `GET /ai/receipts/{receipt_id}/image`
+  - Returns a fresh 10-minute signed GCS image URL for that receipt.
 
 ## Required Environment Variables
 
@@ -107,6 +131,7 @@ go test ./...
 
 ## Notes
 
-- Receipt metadata reads are expected to come directly from Firestore client-side.
+- Normal receipt metadata reads are expected to come directly from Firestore client-side; AI access is the exception and stays backend-owned.
 - The backend does not persist long-lived signed image URLs in Firestore; URLs are generated on demand.
 - `storage_path` is the single source-of-truth storage field for receipts.
+- AI access tokens are read-only and cannot authenticate existing write or billing routes.

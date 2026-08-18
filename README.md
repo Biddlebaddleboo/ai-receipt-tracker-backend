@@ -21,7 +21,7 @@ Lean Go backend for receipt upload finalization, OCR extraction, image URL signi
 
 ## Current Architecture
 
-- Runtime: Go (`cmd/apiserver`)
+- Runtime: Go 1.25 (`cmd/apiserver`)
 - Database: Firestore
 - Object storage: Google Cloud Storage
 - OCR: OpenAI Responses API
@@ -124,10 +124,13 @@ go run .
 
 ## Build/Test
 
+Use Go 1.25 or newer, then from the repo root:
+
 ```powershell
 cd cmd\apiserver
 $env:GOCACHE="C:\Users\John\Desktop\Receipt Scanner\.gocache"
 $env:GOMODCACHE="C:\Users\John\Desktop\Receipt Scanner\.gopath\pkg\mod"
+go mod tidy
 go test ./...
 ```
 

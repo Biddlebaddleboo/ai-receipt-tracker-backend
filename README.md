@@ -130,7 +130,6 @@ Use Go 1.25 or newer, then from the repo root:
 cd cmd\apiserver
 $env:GOCACHE="C:\Users\John\Desktop\Receipt Scanner\.gocache"
 $env:GOMODCACHE="C:\Users\John\Desktop\Receipt Scanner\.gopath\pkg\mod"
-go mod tidy
 go test ./...
 ```
 

@@ -1,4 +1,4 @@
-FROM golang:1.23-bookworm AS go-api-build
+FROM golang:1.25-bookworm AS go-api-build
 
 WORKDIR /src/cmd/apiserver
 

@@ -268,16 +268,10 @@ func (s *apiServer) handleAIReceiptByID(writer http.ResponseWriter, request *htt
 		writeJSONError(writer, http.StatusNotFound, "Receipt image not found")
 		return
 	}
-	imageURL, err := s.signedImageURL(request.Context(), storagePath)
-	if err != nil {
+	if err := s.writeAIReceiptImageAsJPEG(writer, request.Context(), storagePath); err != nil {
 		s.writeErr(writer, err)
 		return
 	}
-	writeJSON(writer, http.StatusOK, map[string]interface{}{
-		"receipt_id": receiptID,
-		"image_url":  imageURL,
-		"expires_at": time.Now().UTC().Add(10 * time.Minute).Format(time.RFC3339),
-	})
 }
 
 func (s *apiServer) listAIReceiptSummaries(ctx context.Context, ownerEmail string) ([]aiReceiptSummary, error) {

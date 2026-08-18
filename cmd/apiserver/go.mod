@@ -6,6 +6,7 @@ require (
 	cloud.google.com/go/firestore v1.17.0
 	cloud.google.com/go/storage v1.43.0
 	github.com/google/uuid v1.6.0
+	golang.org/x/image v0.19.0
 	google.golang.org/api v0.196.0
 )
 

@@ -68,6 +68,9 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", server.handleHealthz)
+	mux.HandleFunc("/ai-access/token", server.handleAIAccessToken)
+	mux.HandleFunc("/ai/receipts", server.handleAIReceipts)
+	mux.HandleFunc("/ai/receipts/", server.handleAIReceiptByID)
 	mux.HandleFunc("/receipts/", server.handleReceiptByID)
 	mux.HandleFunc("/billing", server.handleBilling)
 	mux.HandleFunc("/billing/", server.handleBilling)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -26,12 +27,12 @@ type verifiedAIUser struct {
 }
 
 type aiReceiptSummary struct {
-	ID           string  `json:"id"`
-	Vendor       *string `json:"vendor,omitempty"`
+	ID           string   `json:"id"`
+	Vendor       *string  `json:"vendor,omitempty"`
 	Total        *float64 `json:"total,omitempty"`
-	Category     *string `json:"category,omitempty"`
-	PurchaseDate *string `json:"purchase_date,omitempty"`
-	CreatedAt    string  `json:"created_at,omitempty"`
+	Category     *string  `json:"category,omitempty"`
+	PurchaseDate *string  `json:"purchase_date,omitempty"`
+	CreatedAt    string   `json:"created_at,omitempty"`
 	sortTime     time.Time
 }
 
@@ -135,12 +136,11 @@ func (s *apiServer) revokeAIAccessToken(writer http.ResponseWriter, request *htt
 	writer.WriteHeader(http.StatusNoContent)
 }
 
-func (s *apiServer) findAIAccessTokenByOwner(ctx interface{ Done() <-chan struct{} }, ownerEmail string) (*fs.DocumentSnapshot, error) {
-	// Kept as a narrow wrapper so token lifecycle stays server-owned.
+func (s *apiServer) findAIAccessTokenByOwner(ctx context.Context, ownerEmail string) (*fs.DocumentSnapshot, error) {
 	iter := s.firestore.Collection(aiAccessTokensCollection).
 		Where("owner_email", "==", strings.TrimSpace(ownerEmail)).
 		Limit(1).
-		Documents(requestContext())
+		Documents(ctx)
 	defer iter.Stop()
 	snapshot, err := iter.Next()
 	if errors.Is(err, iterator.Done) {
@@ -152,10 +152,10 @@ func (s *apiServer) findAIAccessTokenByOwner(ctx interface{ Done() <-chan struct
 	return snapshot, nil
 }
 
-func (s *apiServer) listAIAccessTokensByOwner(ctx interface{ Done() <-chan struct{} }, ownerEmail string) ([]*fs.DocumentSnapshot, error) {
+func (s *apiServer) listAIAccessTokensByOwner(ctx context.Context, ownerEmail string) ([]*fs.DocumentSnapshot, error) {
 	iter := s.firestore.Collection(aiAccessTokensCollection).
 		Where("owner_email", "==", strings.TrimSpace(ownerEmail)).
-		Documents(requestContext())
+		Documents(ctx)
 	defer iter.Stop()
 	result := make([]*fs.DocumentSnapshot, 0, 1)
 	for {
@@ -280,11 +280,11 @@ func (s *apiServer) handleAIReceiptByID(writer http.ResponseWriter, request *htt
 	})
 }
 
-func (s *apiServer) listAIReceiptSummaries(ctx interface{ Done() <-chan struct{} }, ownerEmail string) ([]aiReceiptSummary, error) {
+func (s *apiServer) listAIReceiptSummaries(ctx context.Context, ownerEmail string) ([]aiReceiptSummary, error) {
 	iter := s.receipts.
 		Where(receiptShardSchemaField, "==", receiptShardSchema).
 		Where("owner_email", "==", strings.TrimSpace(ownerEmail)).
-		Documents(requestContext())
+		Documents(ctx)
 	defer iter.Stop()
 
 	result := make([]aiReceiptSummary, 0)

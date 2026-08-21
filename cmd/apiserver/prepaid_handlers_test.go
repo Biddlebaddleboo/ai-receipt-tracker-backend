@@ -21,6 +21,14 @@ type prepaidCardDetailResponse struct {
 	Card       prepaidCardRecord `json:"card"`
 }
 
+type prepaidImageResponse struct {
+	PurchaseID string `json:"purchase_id"`
+	CardID     string `json:"card_id"`
+	ImageType  string `json:"image_type"`
+	ImageURL   string `json:"image_url"`
+	ExpiresAt  string `json:"expires_at"`
+}
+
 func TestPrepaidTrackerEnabledHandlerForbidsMissingMalformedOrFalse(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -337,6 +345,145 @@ func TestPrepaidCardDetailResponseHasNoStore(t *testing.T) {
 	}
 }
 
+func TestPrepaidCardImageSigning(t *testing.T) {
+	tests := []struct {
+		name             string
+		ownerEmail       string
+		path             string
+		wantStatus       int
+		wantSignedPath   string
+		configureRecord  func() prepaidPurchaseRecord
+		configureSigning func(storagePath string) (string, error)
+	}{
+		{
+			name:           "owner can obtain package image url",
+			ownerEmail:     "owner@example.com",
+			path:           "/prepaid/purchases/purchase-1/cards/card-1/package-image",
+			wantStatus:     http.StatusOK,
+			wantSignedPath: ownerStoragePrefix("owner@example.com") + "prepaid/package/card-1.webp",
+		},
+		{
+			name:           "owner can obtain opened card image url",
+			ownerEmail:     "owner@example.com",
+			path:           "/prepaid/purchases/purchase-1/cards/card-1/opened-card-image",
+			wantStatus:     http.StatusOK,
+			wantSignedPath: ownerStoragePrefix("owner@example.com") + "prepaid/opened/card-1.webp",
+		},
+		{
+			name:       "another user cannot obtain package image url",
+			ownerEmail: "other@example.com",
+			path:       "/prepaid/purchases/purchase-1/cards/card-1/package-image",
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "another user cannot obtain opened card image url",
+			ownerEmail: "other@example.com",
+			path:       "/prepaid/purchases/purchase-1/cards/card-1/opened-card-image",
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "missing image path returns not found",
+			ownerEmail: "owner@example.com",
+			path:       "/prepaid/purchases/purchase-1/cards/card-1/package-image",
+			wantStatus: http.StatusNotFound,
+			configureRecord: func() prepaidPurchaseRecord {
+				record := fixturePrepaidPurchase()
+				record.Cards[0].PackageImageStoragePath = ""
+				return record
+			},
+		},
+		{
+			name:       "missing gcs object returns not found",
+			ownerEmail: "owner@example.com",
+			path:       "/prepaid/purchases/purchase-1/cards/card-1/package-image",
+			wantStatus: http.StatusNotFound,
+			configureSigning: func(string) (string, error) {
+				return "", httpError{status: http.StatusNotFound, detail: "Image not found"}
+			},
+		},
+		{
+			name:       "another card does not receive card image url",
+			ownerEmail: "owner@example.com",
+			path:       "/prepaid/purchases/purchase-1/cards/card-2/package-image",
+			wantStatus: http.StatusNotFound,
+			configureRecord: func() prepaidPurchaseRecord {
+				record := fixturePrepaidPurchase()
+				record.Cards = append(record.Cards, prepaidCardRecord{
+					ID:                "card-2",
+					ActivationBarcode: "999999999999999999999999999999",
+					VanillaSerial:     "99999999999",
+					State:             "active",
+				})
+				return record
+			},
+		},
+		{
+			name:       "another purchase does not receive card image url",
+			ownerEmail: "owner@example.com",
+			path:       "/prepaid/purchases/purchase-2/cards/card-1/package-image",
+			wantStatus: http.StatusNotFound,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			record := fixturePrepaidPurchase()
+			if tc.configureRecord != nil {
+				record = tc.configureRecord()
+			}
+			signedPaths := make([]string, 0)
+			server := newPrepaidTestServer(t, tc.ownerEmail, map[string]interface{}{"prepaid_tracker_enabled": true})
+			prepaidGetPurchaseOverride = func(_ *apiServer, _ context.Context, purchaseID string, ownerEmail string) (prepaidPurchaseRecord, error) {
+				if ownerEmail != "owner@example.com" || purchaseID != "purchase-1" {
+					return prepaidPurchaseRecord{}, httpError{status: http.StatusNotFound, detail: "Prepaid purchase not found"}
+				}
+				return record, nil
+			}
+			signedImageURLOverride = func(_ context.Context, storagePath string) (string, error) {
+				signedPaths = append(signedPaths, storagePath)
+				if tc.configureSigning != nil {
+					return tc.configureSigning(storagePath)
+				}
+				return "https://signed.example/" + storagePath, nil
+			}
+
+			rec := performPrepaidRequest(t, server, http.MethodGet, tc.path, nil)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("expected status %d, got %d with body %s", tc.wantStatus, rec.Code, rec.Body.String())
+			}
+			if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+				t.Fatalf("expected Cache-Control no-store, got %q", got)
+			}
+			if tc.wantSignedPath == "" {
+				if len(signedPaths) > 0 && tc.configureSigning == nil {
+					t.Fatalf("expected no signed path, got %v", signedPaths)
+				}
+				var response map[string]interface{}
+				if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+					t.Fatalf("decode error response: %v", err)
+				}
+				if _, exists := response["image_url"]; exists {
+					t.Fatalf("expected no image_url, got %v", response["image_url"])
+				}
+				return
+			}
+			if len(signedPaths) != 1 || signedPaths[0] != tc.wantSignedPath {
+				t.Fatalf("expected signed path %q, got %v", tc.wantSignedPath, signedPaths)
+			}
+			var response prepaidImageResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if response.ImageURL == "" {
+				t.Fatal("expected image_url")
+			}
+			if response.CardID != "card-1" || response.PurchaseID != "purchase-1" {
+				t.Fatalf("unexpected response identifiers: %+v", response)
+			}
+		})
+	}
+}
+
 func newPrepaidTestServer(t *testing.T, email string, userDoc map[string]interface{}) *apiServer {
 	server := &apiServer{
 		cfg: config{
@@ -376,24 +523,27 @@ func performPrepaidRequest(t *testing.T, server *apiServer, method, path string,
 }
 
 func fixturePrepaidPurchase() prepaidPurchaseRecord {
+	ownerPrefix := ownerStoragePrefix("owner@example.com")
 	return prepaidPurchaseRecord{
 		ID:             "purchase-1",
 		OwnerEmail:     "owner@example.com",
 		SalesReceiptID: "receipt-1",
 		ActivationReceipts: []prepaidActivationReceipt{
-			{ID: "activation-1", StoragePath: "receipts/owner/prepaid/activation/1.webp"},
+			{ID: "activation-1", StoragePath: ownerPrefix + "prepaid/activation/1.webp"},
 		},
 		Cards: []prepaidCardRecord{
 			{
-				ID:                "card-1",
-				ActivationBarcode: "123456789012345678901234567890",
-				VanillaSerial:     "12345678901",
-				PAN:               "1234567890123456",
-				Expiry:            "12/29",
-				CVV:               "123",
-				Last4:             "3456",
-				DetailsCaptured:   true,
-				State:             "active",
+				ID:                         "card-1",
+				ActivationBarcode:          "123456789012345678901234567890",
+				VanillaSerial:              "12345678901",
+				PAN:                        "1234567890123456",
+				Expiry:                     "12/29",
+				CVV:                        "123",
+				Last4:                      "3456",
+				DetailsCaptured:            true,
+				State:                      "active",
+				PackageImageStoragePath:    ownerPrefix + "prepaid/package/card-1.webp",
+				OpenedCardImageStoragePath: ownerPrefix + "prepaid/opened/card-1.webp",
 			},
 		},
 		ActiveCardCount:   1,

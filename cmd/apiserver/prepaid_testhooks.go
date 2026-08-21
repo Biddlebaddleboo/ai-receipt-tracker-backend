@@ -29,6 +29,8 @@ var prepaidUpdateCardOverride func(s *apiServer, ctx context.Context, user *veri
 
 var prepaidArchiveCardOverride func(s *apiServer, ctx context.Context, user *verifiedUser, purchaseID string, cardID string) (prepaidPurchaseRecord, error)
 
+var signedImageURLOverride func(ctx context.Context, storagePath string) (string, error)
+
 func resetPrepaidTestOverrides() {
 	verifyGoogleTokenOverride = nil
 	prepaidFindOrChooseUserDocOverride = nil
@@ -41,6 +43,7 @@ func resetPrepaidTestOverrides() {
 	prepaidGetCardDetailOverride = nil
 	prepaidUpdateCardOverride = nil
 	prepaidArchiveCardOverride = nil
+	signedImageURLOverride = nil
 }
 
 func prepaidUnauthorized(detail string) httpError {

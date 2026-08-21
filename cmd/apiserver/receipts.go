@@ -837,6 +837,19 @@ func (s *apiServer) extractReceiptOCR(ctx context.Context, imageURL string, cate
 }
 
 func (s *apiServer) signedImageURL(ctx context.Context, storagePath string) (string, error) {
+	storagePath = strings.TrimSpace(storagePath)
+	if storagePath == "" {
+		return "", httpError{status: http.StatusNotFound, detail: "Image not found"}
+	}
+	if signedImageURLOverride != nil {
+		return signedImageURLOverride(ctx, storagePath)
+	}
+	if _, err := s.bucket.Object(storagePath).Attrs(ctx); err != nil {
+		if errors.Is(err, gcs.ErrObjectNotExist) {
+			return "", httpError{status: http.StatusNotFound, detail: "Image not found"}
+		}
+		return "", err
+	}
 	expiresAt := time.Now().UTC().Add(10 * time.Minute)
 	url, err := s.bucket.SignedURL(storagePath, &gcs.SignedURLOptions{
 		Scheme:  gcs.SigningSchemeV4,

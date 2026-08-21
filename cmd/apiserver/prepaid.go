@@ -196,6 +196,10 @@ func (s *apiServer) handlePrepaidPurchasePath(writer http.ResponseWriter, reques
 		s.updatePrepaidCard(writer, request, user, purchaseID, strings.TrimSpace(parts[2]))
 	case len(parts) == 4 && parts[1] == "activation-receipts" && parts[3] == "image" && request.Method == http.MethodGet:
 		s.signPrepaidActivationReceiptImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]))
+	case len(parts) == 4 && parts[1] == "cards" && parts[3] == "package-image" && request.Method == http.MethodGet:
+		s.signPrepaidCardImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]), prepaidImagePackage)
+	case len(parts) == 4 && parts[1] == "cards" && parts[3] == "opened-card-image" && request.Method == http.MethodGet:
+		s.signPrepaidCardImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]), prepaidImageOpenedCard)
 	case len(parts) == 4 && parts[1] == "cards" && parts[3] == "archive" && request.Method == http.MethodPost:
 		s.archivePrepaidCard(writer, request, user, purchaseID, strings.TrimSpace(parts[2]))
 	default:
@@ -466,6 +470,54 @@ func (s *apiServer) signPrepaidActivationReceiptImage(writer http.ResponseWriter
 		"image_url":             imageURL,
 		"expires_at":            time.Now().UTC().Add(10 * time.Minute).Format(time.RFC3339),
 	})
+}
+
+func (s *apiServer) signPrepaidCardImage(writer http.ResponseWriter, request *http.Request, user *verifiedUser, purchaseID string, cardID string, imageType prepaidImageType) {
+	record, err := s.prepaidPurchaseRecordForImage(request.Context(), purchaseID, user.Email)
+	if err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+	storagePath := ""
+	for _, card := range record.Cards {
+		if strings.TrimSpace(card.ID) != cardID {
+			continue
+		}
+		switch imageType {
+		case prepaidImagePackage:
+			storagePath = strings.TrimSpace(card.PackageImageStoragePath)
+		case prepaidImageOpenedCard:
+			storagePath = strings.TrimSpace(card.OpenedCardImageStoragePath)
+		}
+		break
+	}
+	if storagePath == "" || !prepaidStoragePathBelongsToOwner(user.Email, storagePath) {
+		writeJSONError(writer, http.StatusNotFound, "Card image not found")
+		return
+	}
+	imageURL, err := s.signedImageURL(request.Context(), storagePath)
+	if err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, map[string]interface{}{
+		"purchase_id": purchaseID,
+		"card_id":     cardID,
+		"image_type":  string(imageType),
+		"image_url":   imageURL,
+		"expires_at":  time.Now().UTC().Add(10 * time.Minute).Format(time.RFC3339),
+	})
+}
+
+func (s *apiServer) prepaidPurchaseRecordForImage(ctx context.Context, purchaseID string, ownerEmail string) (prepaidPurchaseRecord, error) {
+	if prepaidGetPurchaseOverride != nil {
+		return prepaidGetPurchaseOverride(s, ctx, purchaseID, ownerEmail)
+	}
+	snapshot, err := s.getOwnedPrepaidPurchase(ctx, purchaseID, ownerEmail)
+	if err != nil {
+		return prepaidPurchaseRecord{}, err
+	}
+	return prepaidPurchaseFromSnapshot(snapshot), nil
 }
 
 func (s *apiServer) addPrepaidCard(writer http.ResponseWriter, request *http.Request, user *verifiedUser, purchaseID string) {

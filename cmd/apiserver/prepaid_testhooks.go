@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	fs "cloud.google.com/go/firestore"
+	gcs "cloud.google.com/go/storage"
 )
 
 var verifyGoogleTokenOverride func(ctx context.Context, token string, audiences []string, allowedDomains []string) (*verifiedUser, int, string)
@@ -39,6 +40,12 @@ var prepaidArchiveCardOverride func(s *apiServer, ctx context.Context, user *ver
 
 var signedImageURLOverride func(ctx context.Context, storagePath string) (string, error)
 
+var receiptObjectAttrsOverride func(ctx context.Context, storagePath string) (*gcs.ObjectAttrs, error)
+
+var receiptStoragePathUpdateOverride func(ctx context.Context, receipt ownedReceipt, storagePath string) error
+
+var receiptDeleteObjectOverride func(ctx context.Context, storagePath string) error
+
 func resetPrepaidTestOverrides() {
 	verifyGoogleTokenOverride = nil
 	prepaidFindOrChooseUserDocOverride = nil
@@ -56,6 +63,9 @@ func resetPrepaidTestOverrides() {
 	prepaidUpdateCardOverride = nil
 	prepaidArchiveCardOverride = nil
 	signedImageURLOverride = nil
+	receiptObjectAttrsOverride = nil
+	receiptStoragePathUpdateOverride = nil
+	receiptDeleteObjectOverride = nil
 }
 
 func prepaidUnauthorized(detail string) httpError {

@@ -187,6 +187,15 @@ func (s *apiServer) handleReceiptByID(writer http.ResponseWriter, request *http.
 		s.signReceiptImage(writer, request, user)
 		return
 	}
+	parts := strings.Split(path, "/")
+	if len(parts) == 2 && parts[1] == "replace-image" {
+		if request.Method != http.MethodPost {
+			writeJSONError(writer, http.StatusMethodNotAllowed, "Method not allowed")
+			return
+		}
+		s.replaceReceiptImage(writer, request, user, strings.TrimSpace(parts[0]))
+		return
+	}
 	if strings.Contains(path, "/") {
 		writeJSONError(writer, http.StatusNotFound, "Not found")
 		return
@@ -235,6 +244,122 @@ func (s *apiServer) signReceiptImage(writer http.ResponseWriter, request *http.R
 		"image_url":  imageURL,
 		"expires_at": time.Now().UTC().Add(10 * time.Minute).Format(time.RFC3339),
 	})
+}
+
+type replaceReceiptImageRequest struct {
+	StoragePath string `json:"storage_path"`
+}
+
+// replaceReceiptImage swaps only the storage_path on an owned receipt. The
+// uploaded replacement is validated before the Firestore update, and any
+// pre-swap failure removes that replacement so an abandoned upload is not
+// retained. OCR/finalization is intentionally not involved in this path.
+func (s *apiServer) replaceReceiptImage(writer http.ResponseWriter, request *http.Request, user *verifiedUser, receiptID string) {
+	writer.Header().Set("Cache-Control", "no-store")
+	defer request.Body.Close()
+	if strings.TrimSpace(receiptID) == "" {
+		writeJSONError(writer, http.StatusNotFound, "Receipt not found")
+		return
+	}
+
+	var payload replaceReceiptImageRequest
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		writeJSONError(writer, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	newStoragePath := strings.TrimSpace(payload.StoragePath)
+	ownerPrefix := ownerStoragePrefix(user.Email)
+	if newStoragePath == "" {
+		writeJSONError(writer, http.StatusBadRequest, "storage_path is required")
+		return
+	}
+	if !strings.HasPrefix(newStoragePath, ownerPrefix) {
+		writeJSONError(writer, http.StatusForbidden, "storage_path does not belong to the authenticated user")
+		return
+	}
+
+	cleanupReplacement := func() {
+		if err := s.deleteReceiptStorageObject(request.Context(), newStoragePath); err != nil && !errors.Is(err, gcs.ErrObjectNotExist) {
+			log.Printf("replace cleanup delete failed storage_path=%s err=%v", newStoragePath, err)
+		}
+	}
+
+	receipt, err := s.getOwnedReceipt(request.Context(), receiptID, user.Email)
+	if err != nil {
+		cleanupReplacement()
+		s.writeErr(writer, err)
+		return
+	}
+	attrs, err := s.receiptObjectAttrs(request.Context(), newStoragePath)
+	if err != nil {
+		cleanupReplacement()
+		if errors.Is(err, gcs.ErrObjectNotExist) {
+			writeJSONError(writer, http.StatusNotFound, "replacement image not found")
+			return
+		}
+		s.writeErr(writer, err)
+		return
+	}
+	if attrs == nil || attrs.Size <= 0 {
+		cleanupReplacement()
+		writeJSONError(writer, http.StatusBadRequest, "replacement image is empty")
+		return
+	}
+	if err := ensureImage(strings.TrimSpace(attrs.ContentType)); err != nil {
+		cleanupReplacement()
+		s.writeErr(writer, err)
+		return
+	}
+
+	oldStoragePath := strings.TrimSpace(stringFromAny(receipt.Data["storage_path"]))
+	if err := s.updateReceiptStoragePath(request.Context(), receipt, newStoragePath); err != nil {
+		cleanupReplacement()
+		s.writeErr(writer, err)
+		return
+	}
+
+	oldDeleteError := ""
+	if oldStoragePath != "" && oldStoragePath != newStoragePath {
+		if err := s.deleteReceiptStorageObject(request.Context(), oldStoragePath); err != nil && !errors.Is(err, gcs.ErrObjectNotExist) {
+			oldDeleteError = err.Error()
+			log.Printf("replace old image delete failed receipt_id=%s storage_path=%s err=%v", receiptID, oldStoragePath, err)
+		}
+	}
+	response := map[string]interface{}{
+		"receipt_id":   receiptID,
+		"storage_path": newStoragePath,
+	}
+	if oldDeleteError != "" {
+		response["old_image_delete_error"] = oldDeleteError
+	}
+	writeJSON(writer, http.StatusOK, response)
+}
+
+func (s *apiServer) receiptObjectAttrs(ctx context.Context, storagePath string) (*gcs.ObjectAttrs, error) {
+	if receiptObjectAttrsOverride != nil {
+		return receiptObjectAttrsOverride(ctx, storagePath)
+	}
+	return s.bucket.Object(storagePath).Attrs(ctx)
+}
+
+func (s *apiServer) updateReceiptStoragePath(ctx context.Context, receipt ownedReceipt, storagePath string) error {
+	if receiptStoragePathUpdateOverride != nil {
+		return receiptStoragePathUpdateOverride(ctx, receipt, storagePath)
+	}
+	if receipt.DetailRef == nil {
+		return fmt.Errorf("receipt detail reference is missing")
+	}
+	_, err := receipt.DetailRef.Update(ctx, []fs.Update{{Path: "storage_path", Value: storagePath}})
+	return err
+}
+
+func (s *apiServer) deleteReceiptStorageObject(ctx context.Context, storagePath string) error {
+	if receiptDeleteObjectOverride != nil {
+		return receiptDeleteObjectOverride(ctx, storagePath)
+	}
+	return s.bucket.Object(storagePath).Delete(ctx)
 }
 
 func (s *apiServer) createSignedUpload(writer http.ResponseWriter, request *http.Request, user *verifiedUser) {

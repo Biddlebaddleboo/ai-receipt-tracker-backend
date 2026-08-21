@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	fs "cloud.google.com/go/firestore"
@@ -27,6 +28,11 @@ type prepaidImageResponse struct {
 	ImageType  string `json:"image_type"`
 	ImageURL   string `json:"image_url"`
 	ExpiresAt  string `json:"expires_at"`
+}
+
+type prepaidSearchResponse struct {
+	Results []prepaidSearchResult `json:"results"`
+	Count   int                   `json:"count"`
 }
 
 func TestPrepaidTrackerEnabledHandlerForbidsMissingMalformedOrFalse(t *testing.T) {
@@ -342,6 +348,121 @@ func TestPrepaidCardDetailResponseHasNoStore(t *testing.T) {
 	rec := performPrepaidRequest(t, server, http.MethodGet, "/prepaid/purchases/purchase-1/cards/card-1", nil)
 	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("expected Cache-Control no-store, got %q", got)
+	}
+}
+
+func TestPrepaidSearch(t *testing.T) {
+	ownerPurchase := fixturePrepaidPurchase()
+	ownerPurchase.Cards[0].ActivationBarcode = "111111111111111111111111111111"
+	matchingPurchase := fixturePrepaidPurchase()
+	matchingPurchase.ID = "purchase-2"
+	matchingCard := matchingPurchase.Cards[0]
+	matchingCard.ID = "card-2"
+	matchingCard.PAN = "9999999999993456"
+	matchingCard.Last4 = "3456"
+	matchingCard.ActivationBarcode = "222222222222222222222222222222"
+	matchingDenomination := 50.0
+	matchingCard.Denomination = &matchingDenomination
+	matchingPurchase.Cards = []prepaidCardRecord{matchingCard}
+	foreignPurchase := fixturePrepaidPurchase()
+	foreignPurchase.ID = "purchase-foreign"
+	foreignPurchase.OwnerEmail = "other@example.com"
+
+	searchPurchases := []prepaidPurchaseRecord{ownerPurchase, matchingPurchase, foreignPurchase}
+	tests := []struct {
+		name             string
+		ownerEmail       string
+		value            string
+		wantStatus       int
+		wantCount        int
+		wantCardIDs      []string
+		wantNoCredential bool
+	}{
+		{
+			name:             "exact PAN returns correct card",
+			ownerEmail:       "owner@example.com",
+			value:            "1234567890123456",
+			wantStatus:       http.StatusOK,
+			wantCount:        1,
+			wantCardIDs:      []string{"card-1"},
+			wantNoCredential: true,
+		},
+		{
+			name:             "last4 returns all matching cards",
+			ownerEmail:       "owner@example.com",
+			value:            "3456",
+			wantStatus:       http.StatusOK,
+			wantCount:        2,
+			wantCardIDs:      []string{"card-1", "card-2"},
+			wantNoCredential: true,
+		},
+		{
+			name:             "formatted PAN is normalized",
+			ownerEmail:       "owner@example.com",
+			value:            "1234-5678 9012-3456",
+			wantStatus:       http.StatusOK,
+			wantCount:        1,
+			wantCardIDs:      []string{"card-1"},
+			wantNoCredential: true,
+		},
+		{
+			name:       "no match returns empty result set",
+			ownerEmail: "owner@example.com",
+			value:      "0000",
+			wantStatus: http.StatusOK,
+			wantCount:  0,
+		},
+		{
+			name:       "invalid length is rejected",
+			ownerEmail: "owner@example.com",
+			value:      "12345",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "another user receives no cards",
+			ownerEmail: "another@example.com",
+			value:      "3456",
+			wantStatus: http.StatusOK,
+			wantCount:  0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newPrepaidTestServer(t, tc.ownerEmail, map[string]interface{}{"prepaid_tracker_enabled": true})
+			prepaidSearchPurchasesOverride = func(_ *apiServer, _ context.Context, _ string) ([]prepaidPurchaseRecord, error) {
+				return searchPurchases, nil
+			}
+			rec := performPrepaidRequest(t, server, http.MethodPost, "/prepaid/search", map[string]string{"value": tc.value})
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("expected status %d, got %d with body %s", tc.wantStatus, rec.Code, rec.Body.String())
+			}
+			if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+				t.Fatalf("expected Cache-Control no-store, got %q", got)
+			}
+			if tc.wantStatus != http.StatusOK {
+				return
+			}
+			var response prepaidSearchResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if response.Count != tc.wantCount || len(response.Results) != tc.wantCount {
+				t.Fatalf("expected %d results, got count=%d results=%d", tc.wantCount, response.Count, len(response.Results))
+			}
+			for index, expectedCardID := range tc.wantCardIDs {
+				if response.Results[index].CardID != expectedCardID {
+					t.Fatalf("expected result %d card %q, got %q", index, expectedCardID, response.Results[index].CardID)
+				}
+			}
+			if tc.wantNoCredential {
+				for _, credential := range []string{"1234567890123456", "9999999999993456", `"cvv"`, `"expiry"`} {
+					if strings.Contains(rec.Body.String(), credential) {
+						t.Fatalf("search response exposed credential %q: %s", credential, rec.Body.String())
+					}
+				}
+			}
+		})
 	}
 }
 

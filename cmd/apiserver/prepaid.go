@@ -113,6 +113,25 @@ type prepaidExtractRequest struct {
 	StoragePath string `json:"storage_path"`
 }
 
+type prepaidSearchRequest struct {
+	Value string `json:"value"`
+}
+
+type prepaidSearchResult struct {
+	PurchaseID             string   `json:"purchase_id"`
+	CardID                 string   `json:"card_id"`
+	Last4                  string   `json:"last4"`
+	Denomination           *float64 `json:"denomination,omitempty"`
+	State                  string   `json:"state"`
+	ActivationBarcode      string   `json:"activation_barcode"`
+	VanillaSerial          string   `json:"vanilla_serial"`
+	SalesReceiptID         string   `json:"sales_receipt_id"`
+	ActivationReceiptCount int      `json:"activation_receipt_count"`
+	DetailsCaptured        bool     `json:"details_captured"`
+	CreatedAt              string   `json:"created_at,omitempty"`
+	UpdatedAt              string   `json:"updated_at,omitempty"`
+}
+
 type prepaidPackageExtraction struct {
 	ActivationBarcode string   `json:"activation_barcode"`
 	SerialNumber      string   `json:"serial_number"`
@@ -148,6 +167,8 @@ func (s *apiServer) handlePrepaid(writer http.ResponseWriter, request *http.Requ
 		s.extractPrepaidPackageImage(writer, request, user)
 	case path == "opened-card-extract" && request.Method == http.MethodPost:
 		s.extractPrepaidOpenedCardImage(writer, request, user)
+	case path == "search" && request.Method == http.MethodPost:
+		s.searchPrepaidCards(writer, request, user)
 	case path == "purchases" && request.Method == http.MethodGet:
 		s.listPrepaidPurchases(writer, request, user)
 	case path == "purchases" && request.Method == http.MethodPost:
@@ -306,6 +327,87 @@ func (s *apiServer) listPrepaidPurchases(writer http.ResponseWriter, request *ht
 		"purchases": purchases,
 		"count":     len(purchases),
 	})
+}
+
+func (s *apiServer) searchPrepaidCards(writer http.ResponseWriter, request *http.Request, user *verifiedUser) {
+	defer request.Body.Close()
+	var payload prepaidSearchRequest
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		writeJSONError(writer, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	searchValue := digitsOnly(payload.Value)
+	if len(searchValue) != 4 && len(searchValue) != 16 {
+		writeJSONError(writer, http.StatusBadRequest, "value must contain exactly 4 or 16 digits")
+		return
+	}
+
+	purchases, err := s.prepaidPurchasesForSearch(request.Context(), user.Email)
+	if err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+	results := make([]prepaidSearchResult, 0)
+	for _, purchase := range purchases {
+		if strings.TrimSpace(purchase.OwnerEmail) != strings.TrimSpace(user.Email) {
+			continue
+		}
+		for _, card := range purchase.Cards {
+			cardLast4 := prepaidCardLast4(card)
+			matches := len(searchValue) == 16 && digitsOnly(card.PAN) == searchValue
+			if len(searchValue) == 4 {
+				matches = cardLast4 == searchValue
+			}
+			if !matches {
+				continue
+			}
+			results = append(results, prepaidSearchResult{
+				PurchaseID:             purchase.ID,
+				CardID:                 card.ID,
+				Last4:                  cardLast4,
+				Denomination:           card.Denomination,
+				State:                  fallbackString(card.State, "active"),
+				ActivationBarcode:      card.ActivationBarcode,
+				VanillaSerial:          card.VanillaSerial,
+				SalesReceiptID:         purchase.SalesReceiptID,
+				ActivationReceiptCount: len(purchase.ActivationReceipts),
+				DetailsCaptured:        prepaidDetailsCaptured(card.PAN, card.Expiry, card.CVV),
+				CreatedAt:              card.CreatedAt,
+				UpdatedAt:              card.UpdatedAt,
+			})
+		}
+	}
+	writeJSON(writer, http.StatusOK, map[string]interface{}{
+		"results": results,
+		"count":   len(results),
+	})
+}
+
+func (s *apiServer) prepaidPurchasesForSearch(ctx context.Context, ownerEmail string) ([]prepaidPurchaseRecord, error) {
+	if prepaidSearchPurchasesOverride != nil {
+		return prepaidSearchPurchasesOverride(s, ctx, ownerEmail)
+	}
+	if prepaidListPurchasesOverride != nil {
+		return prepaidListPurchasesOverride(s, ctx, ownerEmail, "all")
+	}
+	iter := s.firestore.Collection(prepaidPurchasesCollection).
+		Where("owner_email", "==", strings.TrimSpace(ownerEmail)).
+		Documents(ctx)
+	defer iter.Stop()
+
+	purchases := make([]prepaidPurchaseRecord, 0)
+	for {
+		snapshot, err := iter.Next()
+		if err == iterator.Done {
+			return purchases, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		purchases = append(purchases, prepaidPurchaseFromSnapshot(snapshot))
+	}
 }
 
 func (s *apiServer) getPrepaidPurchase(writer http.ResponseWriter, request *http.Request, user *verifiedUser, purchaseID string) {
@@ -1164,6 +1266,13 @@ func last4(value string) string {
 		return ""
 	}
 	return digits[len(digits)-4:]
+}
+
+func prepaidCardLast4(card prepaidCardRecord) string {
+	if derived := last4(card.PAN); derived != "" {
+		return derived
+	}
+	return last4(card.Last4)
 }
 
 func prepaidStoragePathBelongsToOwner(ownerEmail string, storagePath string) bool {

@@ -72,6 +72,8 @@ func main() {
 	mux.HandleFunc("/ai/receipts", server.handleAIReceipts)
 	mux.HandleFunc("/ai/receipts/", server.handleAIReceiptByID)
 	mux.HandleFunc("/receipts/", server.handleReceiptByID)
+	mux.HandleFunc("/prepaid", server.handlePrepaid)
+	mux.HandleFunc("/prepaid/", server.handlePrepaid)
 	mux.HandleFunc("/billing", server.handleBilling)
 	mux.HandleFunc("/billing/", server.handleBilling)
 	mux.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {

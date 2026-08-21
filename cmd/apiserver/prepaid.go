@@ -841,6 +841,7 @@ func (s *apiServer) normalizePrepaidCardUpdate(ctx context.Context, ownerEmail s
 		return nil, httpError{status: http.StatusBadRequest, detail: "card details must be confirmed before saving"}
 	}
 	update := map[string]interface{}{}
+	newPANProvided := false
 	if input.Denomination != nil {
 		update["denomination"] = input.Denomination
 	}
@@ -848,6 +849,7 @@ func (s *apiServer) normalizePrepaidCardUpdate(ctx context.Context, ownerEmail s
 		if !prepaidDigits16.MatchString(pan) {
 			return nil, httpError{status: http.StatusBadRequest, detail: "pan must be exactly 16 digits"}
 		}
+		newPANProvided = true
 		update["pan"] = pan
 		update["last4"] = last4(pan)
 		update["details_captured"] = true
@@ -880,9 +882,11 @@ func (s *apiServer) normalizePrepaidCardUpdate(ctx context.Context, ownerEmail s
 		}
 		update["opened_card_image_storage_path"] = openedPath
 	}
-	if pan := stringFromAny(existing["pan"]); strings.TrimSpace(pan) != "" {
-		update["last4"] = last4(pan)
-		update["details_captured"] = true
+	if !newPANProvided {
+		if pan := stringFromAny(existing["pan"]); strings.TrimSpace(pan) != "" {
+			update["last4"] = last4(pan)
+			update["details_captured"] = true
+		}
 	}
 	if expiry := stringFromAny(existing["expiry"]); strings.TrimSpace(expiry) != "" {
 		update["details_captured"] = true

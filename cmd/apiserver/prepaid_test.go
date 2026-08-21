@@ -92,6 +92,38 @@ func TestNormalizePrepaidCardUpdatePreservesBarcodeSerial(t *testing.T) {
 	}
 }
 
+func TestNormalizePrepaidCardUpdateUsesNewPANLast4(t *testing.T) {
+	server := &apiServer{}
+	now := time.Now().UTC()
+	update, err := server.normalizePrepaidCardUpdate(requestContext(), "owner@example.com", prepaidCardInput{
+		PAN:       "1234567890122222",
+		Confirmed: true,
+	}, now, map[string]interface{}{
+		"pan":                "1234567890121111",
+		"last4":              "1111",
+		"activation_barcode": "123456789012345678901234567890",
+		"vanilla_serial":     "12345678901",
+	})
+	if err != nil {
+		t.Fatalf("unexpected update error: %v", err)
+	}
+	if update["pan"] != "1234567890122222" {
+		t.Fatalf("expected new pan update, got %v", update["pan"])
+	}
+	if update["last4"] != "2222" {
+		t.Fatalf("expected last4 from new pan, got %v", update["last4"])
+	}
+	if _, ok := update["activation_barcode"]; ok {
+		t.Fatal("update should not overwrite activation_barcode")
+	}
+	if _, ok := update["vanilla_serial"]; ok {
+		t.Fatal("update should not overwrite vanilla_serial")
+	}
+	if detailsCaptured, ok := update["details_captured"].(bool); !ok || !detailsCaptured {
+		t.Fatalf("expected details_captured to remain true, got %v", update["details_captured"])
+	}
+}
+
 func TestRedactPrepaidCardsRemovesPANAndCVV(t *testing.T) {
 	cards := []prepaidCardRecord{{
 		ID:                "card-1",

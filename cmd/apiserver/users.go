@@ -171,6 +171,9 @@ func (s *apiServer) getOrCreateUser(ownerEmail string, now time.Time) (*fs.Docum
 }
 
 func (s *apiServer) findOrChooseUserDoc(ownerEmail string) (*fs.DocumentRef, map[string]interface{}) {
+	if prepaidFindOrChooseUserDocOverride != nil {
+		return prepaidFindOrChooseUserDocOverride(s, ownerEmail)
+	}
 	iter := s.users.Where("owner_email", "==", ownerEmail).Documents(requestContext())
 	defer iter.Stop()
 	candidates := make([]userDocCandidate, 0)

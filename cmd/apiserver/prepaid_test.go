@@ -77,7 +77,7 @@ func TestNormalizePrepaidCardUpdatePreservesBarcodeSerial(t *testing.T) {
 		Expiry:    "12/29",
 		CVV:       "123",
 		Confirmed: true,
-	}, now)
+	}, now, map[string]interface{}{})
 	if err != nil {
 		t.Fatalf("unexpected update error: %v", err)
 	}

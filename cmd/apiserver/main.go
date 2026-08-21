@@ -215,7 +215,16 @@ func (s *apiServer) authenticateRequest(writer http.ResponseWriter, request *htt
 		writeJSONError(writer, http.StatusUnauthorized, "Missing bearer token")
 		return nil, false
 	}
-	user, statusCode, message := verifyGoogleToken(request.Context(), token, s.cfg.oauthClientIDs, s.cfg.oauthAllowedDomain)
+	var (
+		user       *verifiedUser
+		statusCode int
+		message    string
+	)
+	if verifyGoogleTokenOverride != nil {
+		user, statusCode, message = verifyGoogleTokenOverride(request.Context(), token, s.cfg.oauthClientIDs, s.cfg.oauthAllowedDomain)
+	} else {
+		user, statusCode, message = verifyGoogleToken(request.Context(), token, s.cfg.oauthClientIDs, s.cfg.oauthAllowedDomain)
+	}
 	if statusCode != 0 {
 		if statusCode == http.StatusUnauthorized {
 			writer.Header().Set("WWW-Authenticate", "Bearer")

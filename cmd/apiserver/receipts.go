@@ -432,6 +432,9 @@ func (s *apiServer) deleteReceipt(writer http.ResponseWriter, request *http.Requ
 }
 
 func (s *apiServer) getOwnedReceipt(ctx context.Context, receiptID string, ownerEmail string) (ownedReceipt, error) {
+	if prepaidGetOwnedReceiptOverride != nil {
+		return prepaidGetOwnedReceiptOverride(s, ctx, receiptID, ownerEmail)
+	}
 	iter := s.receipts.
 		Where(receiptShardSchemaField, "==", receiptShardSchema).
 		Where("owner_email", "==", strings.TrimSpace(ownerEmail)).

@@ -259,6 +259,22 @@ func (s *apiServer) listPrepaidPurchases(writer http.ResponseWriter, request *ht
 		writeJSONError(writer, http.StatusBadRequest, "state must be active, archived, or all")
 		return
 	}
+	if prepaidListPurchasesOverride != nil {
+		purchases, err := prepaidListPurchasesOverride(s, request.Context(), user.Email, state)
+		if err != nil {
+			s.writeErr(writer, err)
+			return
+		}
+		for index := range purchases {
+			purchases[index].Cards = filterPrepaidCards(purchases[index].Cards, state)
+			purchases[index].Cards = redactPrepaidCards(purchases[index].Cards)
+		}
+		writeJSON(writer, http.StatusOK, map[string]interface{}{
+			"purchases": purchases,
+			"count":     len(purchases),
+		})
+		return
+	}
 	iter := s.firestore.Collection(prepaidPurchasesCollection).
 		Where("owner_email", "==", strings.TrimSpace(user.Email)).
 		Documents(request.Context())
@@ -289,6 +305,16 @@ func (s *apiServer) listPrepaidPurchases(writer http.ResponseWriter, request *ht
 }
 
 func (s *apiServer) getPrepaidPurchase(writer http.ResponseWriter, request *http.Request, user *verifiedUser, purchaseID string) {
+	if prepaidGetPurchaseOverride != nil {
+		record, err := prepaidGetPurchaseOverride(s, request.Context(), purchaseID, user.Email)
+		if err != nil {
+			s.writeErr(writer, err)
+			return
+		}
+		record.Cards = redactPrepaidCards(record.Cards)
+		writeJSON(writer, http.StatusOK, record)
+		return
+	}
 	snapshot, err := s.getOwnedPrepaidPurchase(request.Context(), purchaseID, user.Email)
 	if err != nil {
 		s.writeErr(writer, err)
@@ -311,6 +337,16 @@ func (s *apiServer) createPrepaidPurchase(writer http.ResponseWriter, request *h
 	salesReceiptID := strings.TrimSpace(payload.SalesReceiptID)
 	if salesReceiptID == "" {
 		writeJSONError(writer, http.StatusBadRequest, "sales_receipt_id is required")
+		return
+	}
+	if prepaidCreatePurchaseOverride != nil {
+		record, err := prepaidCreatePurchaseOverride(s, request.Context(), user, payload)
+		if err != nil {
+			s.writeErr(writer, err)
+			return
+		}
+		record.Cards = redactPrepaidCards(record.Cards)
+		writeJSON(writer, http.StatusCreated, record)
 		return
 	}
 	if _, err := s.getOwnedReceipt(request.Context(), salesReceiptID, user.Email); err != nil {
@@ -348,7 +384,9 @@ func (s *apiServer) createPrepaidPurchase(writer http.ResponseWriter, request *h
 		s.writeErr(writer, err)
 		return
 	}
-	writeJSON(writer, http.StatusCreated, prepaidPurchaseFromSnapshot(snapshot))
+	record := prepaidPurchaseFromSnapshot(snapshot)
+	record.Cards = redactPrepaidCards(record.Cards)
+	writeJSON(writer, http.StatusCreated, record)
 }
 
 func (s *apiServer) addPrepaidActivationReceipt(writer http.ResponseWriter, request *http.Request, user *verifiedUser, purchaseID string) {
@@ -358,6 +396,16 @@ func (s *apiServer) addPrepaidActivationReceipt(writer http.ResponseWriter, requ
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&payload); err != nil {
 		writeJSONError(writer, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if prepaidAddActivationReceiptOverride != nil {
+		record, err := prepaidAddActivationReceiptOverride(s, request.Context(), user, purchaseID, payload)
+		if err != nil {
+			s.writeErr(writer, err)
+			return
+		}
+		record.Cards = redactPrepaidCards(record.Cards)
+		writeJSON(writer, http.StatusCreated, record)
 		return
 	}
 	snapshot, err := s.getOwnedPrepaidPurchase(request.Context(), purchaseID, user.Email)
@@ -385,7 +433,9 @@ func (s *apiServer) addPrepaidActivationReceipt(writer http.ResponseWriter, requ
 		s.writeErr(writer, err)
 		return
 	}
-	writeJSON(writer, http.StatusCreated, prepaidPurchaseFromSnapshot(updated))
+	record := prepaidPurchaseFromSnapshot(updated)
+	record.Cards = redactPrepaidCards(record.Cards)
+	writeJSON(writer, http.StatusCreated, record)
 }
 
 func (s *apiServer) signPrepaidActivationReceiptImage(writer http.ResponseWriter, request *http.Request, user *verifiedUser, purchaseID string, activationReceiptID string) {
@@ -427,6 +477,16 @@ func (s *apiServer) addPrepaidCard(writer http.ResponseWriter, request *http.Req
 		writeJSONError(writer, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	if prepaidAddCardOverride != nil {
+		record, err := prepaidAddCardOverride(s, request.Context(), user, purchaseID, payload)
+		if err != nil {
+			s.writeErr(writer, err)
+			return
+		}
+		record.Cards = redactPrepaidCards(record.Cards)
+		writeJSON(writer, http.StatusCreated, record)
+		return
+	}
 	snapshot, err := s.getOwnedPrepaidPurchase(request.Context(), purchaseID, user.Email)
 	if err != nil {
 		s.writeErr(writer, err)
@@ -454,10 +514,24 @@ func (s *apiServer) addPrepaidCard(writer http.ResponseWriter, request *http.Req
 		s.writeErr(writer, err)
 		return
 	}
-	writeJSON(writer, http.StatusCreated, prepaidPurchaseFromSnapshot(updated))
+	record := prepaidPurchaseFromSnapshot(updated)
+	record.Cards = redactPrepaidCards(record.Cards)
+	writeJSON(writer, http.StatusCreated, record)
 }
 
 func (s *apiServer) getPrepaidCardDetail(writer http.ResponseWriter, request *http.Request, user *verifiedUser, purchaseID string, cardID string) {
+	if prepaidGetCardDetailOverride != nil {
+		card, err := prepaidGetCardDetailOverride(s, request.Context(), user, purchaseID, cardID)
+		if err != nil {
+			s.writeErr(writer, err)
+			return
+		}
+		writeJSON(writer, http.StatusOK, map[string]interface{}{
+			"purchase_id": purchaseID,
+			"card":        card,
+		})
+		return
+	}
 	snapshot, err := s.getOwnedPrepaidPurchase(request.Context(), purchaseID, user.Email)
 	if err != nil {
 		s.writeErr(writer, err)
@@ -485,6 +559,16 @@ func (s *apiServer) updatePrepaidCard(writer http.ResponseWriter, request *http.
 		writeJSONError(writer, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	if prepaidUpdateCardOverride != nil {
+		record, err := prepaidUpdateCardOverride(s, request.Context(), user, purchaseID, cardID, payload)
+		if err != nil {
+			s.writeErr(writer, err)
+			return
+		}
+		record.Cards = redactPrepaidCards(record.Cards)
+		writeJSON(writer, http.StatusOK, record)
+		return
+	}
 	snapshot, err := s.getOwnedPrepaidPurchase(request.Context(), purchaseID, user.Email)
 	if err != nil {
 		s.writeErr(writer, err)
@@ -504,7 +588,7 @@ func (s *apiServer) updatePrepaidCard(writer http.ResponseWriter, request *http.
 		for key, value := range card {
 			merged[key] = value
 		}
-		update, err := s.normalizePrepaidCardUpdate(request.Context(), user.Email, payload, now)
+		update, err := s.normalizePrepaidCardUpdate(request.Context(), user.Email, payload, now, card)
 		if err != nil {
 			s.writeErr(writer, err)
 			return
@@ -539,6 +623,16 @@ func (s *apiServer) updatePrepaidCard(writer http.ResponseWriter, request *http.
 }
 
 func (s *apiServer) archivePrepaidCard(writer http.ResponseWriter, request *http.Request, user *verifiedUser, purchaseID string, cardID string) {
+	if prepaidArchiveCardOverride != nil {
+		record, err := prepaidArchiveCardOverride(s, request.Context(), user, purchaseID, cardID)
+		if err != nil {
+			s.writeErr(writer, err)
+			return
+		}
+		record.Cards = redactPrepaidCards(record.Cards)
+		writeJSON(writer, http.StatusOK, record)
+		return
+	}
 	snapshot, err := s.getOwnedPrepaidPurchase(request.Context(), purchaseID, user.Email)
 	if err != nil {
 		s.writeErr(writer, err)
@@ -649,7 +743,7 @@ func (s *apiServer) getOwnedPrepaidPurchase(ctx context.Context, purchaseID stri
 	if err != nil || !snapshot.Exists() {
 		return nil, httpError{status: http.StatusNotFound, detail: "Prepaid purchase not found"}
 	}
-	if strings.TrimSpace(stringFromAny(snapshot.Data()["owner_email"])) != strings.TrimSpace(ownerEmail) {
+	if !prepaidPurchaseBelongsToOwner(snapshot.Data(), ownerEmail) {
 		return nil, httpError{status: http.StatusNotFound, detail: "Prepaid purchase not found"}
 	}
 	return snapshot, nil
@@ -742,44 +836,62 @@ func (s *apiServer) normalizePrepaidCardInput(ctx context.Context, ownerEmail st
 	return card, nil
 }
 
-func (s *apiServer) normalizePrepaidCardUpdate(ctx context.Context, ownerEmail string, input prepaidCardInput, now time.Time) (map[string]interface{}, error) {
+func (s *apiServer) normalizePrepaidCardUpdate(ctx context.Context, ownerEmail string, input prepaidCardInput, now time.Time, existing map[string]interface{}) (map[string]interface{}, error) {
 	if !input.Confirmed {
 		return nil, httpError{status: http.StatusBadRequest, detail: "card details must be confirmed before saving"}
 	}
-	card, err := s.normalizePrepaidCardInput(ctx, ownerEmail, input, now, false)
-	if err != nil {
-		return nil, err
+	update := map[string]interface{}{}
+	if input.Denomination != nil {
+		update["denomination"] = input.Denomination
 	}
-	delete(card, "id")
-	delete(card, "state")
-	delete(card, "created_at")
-	if strings.TrimSpace(input.ActivationBarcode) == "" {
-		delete(card, "activation_barcode")
+	if pan := digitsOnly(input.PAN); pan != "" {
+		if !prepaidDigits16.MatchString(pan) {
+			return nil, httpError{status: http.StatusBadRequest, detail: "pan must be exactly 16 digits"}
+		}
+		update["pan"] = pan
+		update["last4"] = last4(pan)
+		update["details_captured"] = true
 	}
-	if strings.TrimSpace(input.VanillaSerial) == "" && strings.TrimSpace(input.SerialNumber) == "" {
-		delete(card, "vanilla_serial")
+	if expiry := normalizePrepaidExpiry(input.Expiry); strings.TrimSpace(input.Expiry) != "" {
+		if expiry == "" {
+			return nil, httpError{status: http.StatusBadRequest, detail: "expiry must be MM/YY or YYYY-MM"}
+		}
+		update["expiry"] = expiry
+		update["details_captured"] = true
 	}
-	if input.Denomination == nil {
-		delete(card, "denomination")
+	if cvv := digitsOnly(input.CVV); cvv != "" {
+		if !prepaidCVV.MatchString(cvv) {
+			return nil, httpError{status: http.StatusBadRequest, detail: "cvv must be 3 or 4 digits"}
+		}
+		update["cvv"] = cvv
+		update["details_captured"] = true
 	}
-	if strings.TrimSpace(input.PAN) == "" {
-		delete(card, "pan")
+	packagePath := strings.TrimSpace(input.PackageImageStoragePath)
+	if packagePath != "" {
+		if !prepaidStoragePathBelongsToOwner(ownerEmail, packagePath) {
+			return nil, httpError{status: http.StatusForbidden, detail: "storage_path does not belong to the authenticated user"}
+		}
+		update["package_image_storage_path"] = packagePath
 	}
-	if strings.TrimSpace(input.CVV) == "" {
-		delete(card, "cvv")
+	openedPath := strings.TrimSpace(input.OpenedCardImageStoragePath)
+	if openedPath != "" {
+		if !prepaidStoragePathBelongsToOwner(ownerEmail, openedPath) {
+			return nil, httpError{status: http.StatusForbidden, detail: "storage_path does not belong to the authenticated user"}
+		}
+		update["opened_card_image_storage_path"] = openedPath
 	}
-	if strings.TrimSpace(input.Expiry) == "" {
-		delete(card, "expiry")
+	if pan := stringFromAny(existing["pan"]); strings.TrimSpace(pan) != "" {
+		update["last4"] = last4(pan)
+		update["details_captured"] = true
 	}
-	if strings.TrimSpace(input.PackageImageStoragePath) == "" {
-		delete(card, "package_image_storage_path")
+	if expiry := stringFromAny(existing["expiry"]); strings.TrimSpace(expiry) != "" {
+		update["details_captured"] = true
 	}
-	if strings.TrimSpace(input.OpenedCardImageStoragePath) == "" {
-		delete(card, "opened_card_image_storage_path")
+	if cvv := stringFromAny(existing["cvv"]); strings.TrimSpace(cvv) != "" {
+		update["details_captured"] = true
 	}
-	card["updated_at"] = now
-	card["extraction_status"] = "confirmed"
-	return card, nil
+	update["updated_at"] = now
+	return update, nil
 }
 
 func (s *apiServer) ensurePrepaidUploadedImage(ctx context.Context, ownerEmail string, storagePath string) error {
@@ -976,6 +1088,14 @@ func prepaidTrackerEnabled(userDoc map[string]interface{}) bool {
 	}
 	enabled, _ := userDoc["prepaid_tracker_enabled"].(bool)
 	return enabled
+}
+
+func prepaidPurchaseBelongsToOwner(data map[string]interface{}, ownerEmail string) bool {
+	if data == nil {
+		return false
+	}
+	stored := strings.TrimSpace(stringFromAny(data["owner_email"]))
+	return stored != "" && stored == strings.TrimSpace(ownerEmail)
 }
 
 func prepaidDetailsCaptured(pan string, expiry string, cvv string) bool {

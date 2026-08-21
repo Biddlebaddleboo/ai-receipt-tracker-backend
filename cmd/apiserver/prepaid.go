@@ -67,6 +67,8 @@ type prepaidCardRecord struct {
 	PAN                        string   `json:"pan,omitempty"`
 	Expiry                     string   `json:"expiry,omitempty"`
 	CVV                        string   `json:"cvv,omitempty"`
+	Last4                      string   `json:"last4,omitempty"`
+	DetailsCaptured            bool     `json:"details_captured"`
 	State                      string   `json:"state"`
 	ArchivedAt                 string   `json:"archived_at,omitempty"`
 	PackageImageStoragePath    string   `json:"package_image_storage_path,omitempty"`
@@ -167,8 +169,7 @@ func (s *apiServer) authorizePrepaidUser(writer http.ResponseWriter, request *ht
 		writeJSONError(writer, http.StatusForbidden, "Prepaid tracker is not enabled")
 		return nil, nil, nil, false
 	}
-	enabled, _ := userDoc["prepaid_tracker_enabled"].(bool)
-	if !enabled {
+	if !prepaidTrackerEnabled(userDoc) {
 		writeJSONError(writer, http.StatusForbidden, "Prepaid tracker is not enabled")
 		return nil, nil, nil, false
 	}
@@ -189,8 +190,12 @@ func (s *apiServer) handlePrepaidPurchasePath(writer http.ResponseWriter, reques
 		s.addPrepaidActivationReceipt(writer, request, user, purchaseID)
 	case len(parts) == 2 && parts[1] == "cards" && request.Method == http.MethodPost:
 		s.addPrepaidCard(writer, request, user, purchaseID)
+	case len(parts) == 3 && parts[1] == "cards" && request.Method == http.MethodGet:
+		s.getPrepaidCardDetail(writer, request, user, purchaseID, strings.TrimSpace(parts[2]))
 	case len(parts) == 3 && parts[1] == "cards" && request.Method == http.MethodPatch:
 		s.updatePrepaidCard(writer, request, user, purchaseID, strings.TrimSpace(parts[2]))
+	case len(parts) == 4 && parts[1] == "activation-receipts" && parts[3] == "image" && request.Method == http.MethodGet:
+		s.signPrepaidActivationReceiptImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]))
 	case len(parts) == 4 && parts[1] == "cards" && parts[3] == "archive" && request.Method == http.MethodPost:
 		s.archivePrepaidCard(writer, request, user, purchaseID, strings.TrimSpace(parts[2]))
 	default:
@@ -271,6 +276,7 @@ func (s *apiServer) listPrepaidPurchases(writer http.ResponseWriter, request *ht
 		}
 		record := prepaidPurchaseFromSnapshot(snapshot)
 		record.Cards = filterPrepaidCards(record.Cards, state)
+		record.Cards = redactPrepaidCards(record.Cards)
 		if state != "all" && len(record.Cards) == 0 {
 			continue
 		}
@@ -288,7 +294,9 @@ func (s *apiServer) getPrepaidPurchase(writer http.ResponseWriter, request *http
 		s.writeErr(writer, err)
 		return
 	}
-	writeJSON(writer, http.StatusOK, prepaidPurchaseFromSnapshot(snapshot))
+	record := prepaidPurchaseFromSnapshot(snapshot)
+	record.Cards = redactPrepaidCards(record.Cards)
+	writeJSON(writer, http.StatusOK, record)
 }
 
 func (s *apiServer) createPrepaidPurchase(writer http.ResponseWriter, request *http.Request, user *verifiedUser) {
@@ -380,6 +388,36 @@ func (s *apiServer) addPrepaidActivationReceipt(writer http.ResponseWriter, requ
 	writeJSON(writer, http.StatusCreated, prepaidPurchaseFromSnapshot(updated))
 }
 
+func (s *apiServer) signPrepaidActivationReceiptImage(writer http.ResponseWriter, request *http.Request, user *verifiedUser, purchaseID string, activationReceiptID string) {
+	snapshot, err := s.getOwnedPrepaidPurchase(request.Context(), purchaseID, user.Email)
+	if err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+	receipts := prepaidActivationReceiptsFromAny(snapshot.Data()["activation_receipts"])
+	storagePath := ""
+	for _, receipt := range receipts {
+		if strings.TrimSpace(receipt.ID) == activationReceiptID {
+			storagePath = strings.TrimSpace(receipt.StoragePath)
+			break
+		}
+	}
+	if storagePath == "" || !prepaidStoragePathBelongsToOwner(user.Email, storagePath) {
+		writeJSONError(writer, http.StatusNotFound, "Activation receipt not found")
+		return
+	}
+	imageURL, err := s.signedImageURL(request.Context(), storagePath)
+	if err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, map[string]interface{}{
+		"activation_receipt_id": activationReceiptID,
+		"image_url":             imageURL,
+		"expires_at":            time.Now().UTC().Add(10 * time.Minute).Format(time.RFC3339),
+	})
+}
+
 func (s *apiServer) addPrepaidCard(writer http.ResponseWriter, request *http.Request, user *verifiedUser, purchaseID string) {
 	defer request.Body.Close()
 	var payload prepaidCardInput
@@ -417,6 +455,25 @@ func (s *apiServer) addPrepaidCard(writer http.ResponseWriter, request *http.Req
 		return
 	}
 	writeJSON(writer, http.StatusCreated, prepaidPurchaseFromSnapshot(updated))
+}
+
+func (s *apiServer) getPrepaidCardDetail(writer http.ResponseWriter, request *http.Request, user *verifiedUser, purchaseID string, cardID string) {
+	snapshot, err := s.getOwnedPrepaidPurchase(request.Context(), purchaseID, user.Email)
+	if err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+	cards := prepaidCardsFromAny(snapshot.Data()["cards"])
+	for _, card := range cards {
+		if strings.TrimSpace(card.ID) == cardID {
+			writeJSON(writer, http.StatusOK, map[string]interface{}{
+				"purchase_id": purchaseID,
+				"card":        card,
+			})
+			return
+		}
+	}
+	writeJSONError(writer, http.StatusNotFound, "Card not found")
 }
 
 func (s *apiServer) updatePrepaidCard(writer http.ResponseWriter, request *http.Request, user *verifiedUser, purchaseID string, cardID string) {
@@ -476,7 +533,9 @@ func (s *apiServer) updatePrepaidCard(writer http.ResponseWriter, request *http.
 		s.writeErr(writer, err)
 		return
 	}
-	writeJSON(writer, http.StatusOK, prepaidPurchaseFromSnapshot(updated))
+	record := prepaidPurchaseFromSnapshot(updated)
+	record.Cards = redactPrepaidCards(record.Cards)
+	writeJSON(writer, http.StatusOK, record)
 }
 
 func (s *apiServer) archivePrepaidCard(writer http.ResponseWriter, request *http.Request, user *verifiedUser, purchaseID string, cardID string) {
@@ -518,7 +577,9 @@ func (s *apiServer) archivePrepaidCard(writer http.ResponseWriter, request *http
 		s.writeErr(writer, err)
 		return
 	}
-	writeJSON(writer, http.StatusOK, prepaidPurchaseFromSnapshot(updated))
+	record := prepaidPurchaseFromSnapshot(updated)
+	record.Cards = redactPrepaidCards(record.Cards)
+	writeJSON(writer, http.StatusOK, record)
 }
 
 func (s *apiServer) extractPrepaidPackageImage(writer http.ResponseWriter, request *http.Request, user *verifiedUser) {
@@ -726,7 +787,7 @@ func (s *apiServer) ensurePrepaidUploadedImage(ctx context.Context, ownerEmail s
 	if storagePath == "" {
 		return httpError{status: http.StatusBadRequest, detail: "storage_path is required"}
 	}
-	if !strings.HasPrefix(storagePath, ownerStoragePrefix(ownerEmail)) {
+	if !prepaidStoragePathBelongsToOwner(ownerEmail, storagePath) {
 		return httpError{status: http.StatusForbidden, detail: "storage_path does not belong to the authenticated user"}
 	}
 	attrs, err := s.bucket.Object(storagePath).Attrs(ctx)
@@ -882,6 +943,8 @@ func prepaidCardsFromAny(value interface{}) []prepaidCardRecord {
 			PAN:                        stringFromAny(data["pan"]),
 			Expiry:                     stringFromAny(data["expiry"]),
 			CVV:                        stringFromAny(data["cvv"]),
+			Last4:                      last4(stringFromAny(data["pan"])),
+			DetailsCaptured:            prepaidDetailsCaptured(stringFromAny(data["pan"]), stringFromAny(data["expiry"]), stringFromAny(data["cvv"])),
 			State:                      fallbackString(data["state"], "active"),
 			ArchivedAt:                 isoString(data["archived_at"]),
 			PackageImageStoragePath:    stringFromAny(data["package_image_storage_path"]),
@@ -892,6 +955,43 @@ func prepaidCardsFromAny(value interface{}) []prepaidCardRecord {
 		})
 	}
 	return result
+}
+
+func redactPrepaidCards(cards []prepaidCardRecord) []prepaidCardRecord {
+	result := make([]prepaidCardRecord, 0, len(cards))
+	for _, card := range cards {
+		card.Last4 = last4(card.PAN)
+		card.DetailsCaptured = prepaidDetailsCaptured(card.PAN, card.Expiry, card.CVV)
+		card.PAN = ""
+		card.Expiry = ""
+		card.CVV = ""
+		result = append(result, card)
+	}
+	return result
+}
+
+func prepaidTrackerEnabled(userDoc map[string]interface{}) bool {
+	if userDoc == nil {
+		return false
+	}
+	enabled, _ := userDoc["prepaid_tracker_enabled"].(bool)
+	return enabled
+}
+
+func prepaidDetailsCaptured(pan string, expiry string, cvv string) bool {
+	return strings.TrimSpace(pan) != "" || strings.TrimSpace(expiry) != "" || strings.TrimSpace(cvv) != ""
+}
+
+func last4(value string) string {
+	digits := digitsOnly(value)
+	if len(digits) < 4 {
+		return ""
+	}
+	return digits[len(digits)-4:]
+}
+
+func prepaidStoragePathBelongsToOwner(ownerEmail string, storagePath string) bool {
+	return strings.HasPrefix(strings.TrimSpace(storagePath), ownerStoragePrefix(ownerEmail))
 }
 
 func filterPrepaidCards(cards []prepaidCardRecord, state string) []prepaidCardRecord {

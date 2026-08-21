@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -132,6 +133,14 @@ type prepaidSearchResult struct {
 	UpdatedAt              string   `json:"updated_at,omitempty"`
 }
 
+type prepaidCleanupSummary struct {
+	PackageImagesDeleted           int `json:"package_images_deleted"`
+	OpenedCardImagesDeleted        int `json:"opened_card_images_deleted"`
+	ActivationReceiptImagesDeleted int `json:"activation_receipt_images_deleted"`
+	SalesReceiptsPreserved         int `json:"sales_receipts_preserved"`
+	ImageDeletionFailures          int `json:"image_deletion_failures"`
+}
+
 type prepaidPackageExtraction struct {
 	ActivationBarcode string   `json:"activation_barcode"`
 	SerialNumber      string   `json:"serial_number"`
@@ -169,6 +178,8 @@ func (s *apiServer) handlePrepaid(writer http.ResponseWriter, request *http.Requ
 		s.extractPrepaidOpenedCardImage(writer, request, user)
 	case path == "search" && request.Method == http.MethodPost:
 		s.searchPrepaidCards(writer, request, user)
+	case path == "cleanup-archived-images" && request.Method == http.MethodPost:
+		s.cleanupArchivedPrepaidImages(writer, request, user)
 	case path == "purchases" && request.Method == http.MethodGet:
 		s.listPrepaidPurchases(writer, request, user)
 	case path == "purchases" && request.Method == http.MethodPost:
@@ -383,6 +394,196 @@ func (s *apiServer) searchPrepaidCards(writer http.ResponseWriter, request *http
 		"results": results,
 		"count":   len(results),
 	})
+}
+
+func (s *apiServer) cleanupArchivedPrepaidImages(writer http.ResponseWriter, request *http.Request, user *verifiedUser) {
+	defer request.Body.Close()
+	summary := prepaidCleanupSummary{}
+
+	if prepaidCleanupPurchasesOverride != nil {
+		purchases, err := prepaidCleanupPurchasesOverride(s, request.Context(), user.Email)
+		if err != nil {
+			s.writeErr(writer, err)
+			return
+		}
+		for _, purchase := range purchases {
+			if !prepaidPurchaseBelongsToOwner(map[string]interface{}{"owner_email": purchase.OwnerEmail}, user.Email) {
+				continue
+			}
+			updated, changed, err := s.cleanupArchivedPrepaidPurchase(request.Context(), purchase, &summary)
+			if err != nil {
+				s.writeErr(writer, err)
+				return
+			}
+			if changed && prepaidCleanupSavePurchaseOverride != nil {
+				if err := prepaidCleanupSavePurchaseOverride(s, request.Context(), updated); err != nil {
+					s.writeErr(writer, err)
+					return
+				}
+			}
+		}
+		writeJSON(writer, http.StatusOK, summary)
+		return
+	}
+
+	iter := s.firestore.Collection(prepaidPurchasesCollection).
+		Where("owner_email", "==", strings.TrimSpace(user.Email)).
+		Documents(request.Context())
+	defer iter.Stop()
+	for {
+		snapshot, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			s.writeErr(writer, err)
+			return
+		}
+		purchase := prepaidPurchaseFromSnapshot(snapshot)
+		updated, changed, err := s.cleanupArchivedPrepaidPurchase(request.Context(), purchase, &summary)
+		if err != nil {
+			s.writeErr(writer, err)
+			return
+		}
+		if changed {
+			if err := s.savePrepaidCleanupSnapshot(request.Context(), snapshot, updated); err != nil {
+				s.writeErr(writer, err)
+				return
+			}
+		}
+	}
+
+	writeJSON(writer, http.StatusOK, summary)
+}
+
+func (s *apiServer) cleanupArchivedPrepaidPurchase(ctx context.Context, purchase prepaidPurchaseRecord, summary *prepaidCleanupSummary) (prepaidPurchaseRecord, bool, error) {
+	updated := purchase
+	updated.Cards = append([]prepaidCardRecord(nil), purchase.Cards...)
+	updated.ActivationReceipts = append([]prepaidActivationReceipt(nil), purchase.ActivationReceipts...)
+	changed := false
+
+	if strings.TrimSpace(purchase.SalesReceiptID) != "" {
+		summary.SalesReceiptsPreserved++
+	}
+
+	for index := range updated.Cards {
+		if strings.ToLower(strings.TrimSpace(updated.Cards[index].State)) != "archived" {
+			continue
+		}
+		card := &updated.Cards[index]
+		if path := strings.TrimSpace(card.PackageImageStoragePath); path != "" {
+			if err := s.deletePrepaidImage(ctx, purchase.OwnerEmail, path); err != nil {
+				summary.ImageDeletionFailures++
+			} else {
+				card.PackageImageStoragePath = ""
+				summary.PackageImagesDeleted++
+				changed = true
+			}
+		}
+		if path := strings.TrimSpace(card.OpenedCardImageStoragePath); path != "" {
+			if err := s.deletePrepaidImage(ctx, purchase.OwnerEmail, path); err != nil {
+				summary.ImageDeletionFailures++
+			} else {
+				card.OpenedCardImageStoragePath = ""
+				summary.OpenedCardImagesDeleted++
+				changed = true
+			}
+		}
+	}
+
+	allCardsArchived := len(updated.Cards) > 0
+	for _, card := range updated.Cards {
+		if strings.ToLower(strings.TrimSpace(card.State)) != "archived" {
+			allCardsArchived = false
+			break
+		}
+	}
+	if allCardsArchived {
+		for index := range updated.ActivationReceipts {
+			receipt := &updated.ActivationReceipts[index]
+			if path := strings.TrimSpace(receipt.StoragePath); path != "" {
+				if err := s.deletePrepaidImage(ctx, purchase.OwnerEmail, path); err != nil {
+					summary.ImageDeletionFailures++
+				} else {
+					receipt.StoragePath = ""
+					summary.ActivationReceiptImagesDeleted++
+					changed = true
+				}
+			}
+		}
+	}
+
+	return updated, changed, nil
+}
+
+func (s *apiServer) deletePrepaidImage(ctx context.Context, ownerEmail string, storagePath string) error {
+	storagePath = strings.TrimSpace(storagePath)
+	if storagePath == "" {
+		return nil
+	}
+	if !prepaidStoragePathBelongsToOwner(ownerEmail, storagePath) {
+		return httpError{status: http.StatusForbidden, detail: "storage_path does not belong to the authenticated user"}
+	}
+	if prepaidDeleteObjectOverride != nil {
+		err := prepaidDeleteObjectOverride(s, ctx, storagePath)
+		if errors.Is(err, gcs.ErrObjectNotExist) {
+			return nil
+		}
+		return err
+	}
+	if s.bucket == nil {
+		return fmt.Errorf("prepaid storage bucket is unavailable")
+	}
+	err := s.bucket.Object(storagePath).Delete(ctx)
+	if errors.Is(err, gcs.ErrObjectNotExist) {
+		return nil
+	}
+	return err
+}
+
+func (s *apiServer) savePrepaidCleanupSnapshot(ctx context.Context, snapshot *fs.DocumentSnapshot, updated prepaidPurchaseRecord) error {
+	data := snapshot.Data()
+	cards, ok := data["cards"].([]interface{})
+	if !ok {
+		return fmt.Errorf("prepaid purchase cards have an invalid format")
+	}
+	for _, rawCard := range cards {
+		cardData, ok := rawCard.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		cardID := strings.TrimSpace(stringFromAny(cardData["id"]))
+		for _, updatedCard := range updated.Cards {
+			if strings.TrimSpace(updatedCard.ID) != cardID {
+				continue
+			}
+			cardData["package_image_storage_path"] = updatedCard.PackageImageStoragePath
+			cardData["opened_card_image_storage_path"] = updatedCard.OpenedCardImageStoragePath
+			break
+		}
+	}
+	if receipts, ok := data["activation_receipts"].([]interface{}); ok {
+		for _, rawReceipt := range receipts {
+			receiptData, ok := rawReceipt.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			receiptID := strings.TrimSpace(stringFromAny(receiptData["id"]))
+			for _, updatedReceipt := range updated.ActivationReceipts {
+				if strings.TrimSpace(updatedReceipt.ID) != receiptID {
+					continue
+				}
+				receiptData["storage_path"] = updatedReceipt.StoragePath
+				break
+			}
+		}
+	}
+	_, err := snapshot.Ref.Set(ctx, map[string]interface{}{
+		"cards":               cards,
+		"activation_receipts": data["activation_receipts"],
+		"updated_at":          time.Now().UTC(),
+	}, fs.MergeAll)
+	return err
 }
 
 func (s *apiServer) prepaidPurchasesForSearch(ctx context.Context, ownerEmail string) ([]prepaidPurchaseRecord, error) {

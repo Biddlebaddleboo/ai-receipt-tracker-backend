@@ -17,6 +17,12 @@ var prepaidListPurchasesOverride func(s *apiServer, ctx context.Context, ownerEm
 
 var prepaidSearchPurchasesOverride func(s *apiServer, ctx context.Context, ownerEmail string) ([]prepaidPurchaseRecord, error)
 
+var prepaidCleanupPurchasesOverride func(s *apiServer, ctx context.Context, ownerEmail string) ([]prepaidPurchaseRecord, error)
+
+var prepaidCleanupSavePurchaseOverride func(s *apiServer, ctx context.Context, purchase prepaidPurchaseRecord) error
+
+var prepaidDeleteObjectOverride func(s *apiServer, ctx context.Context, storagePath string) error
+
 var prepaidGetPurchaseOverride func(s *apiServer, ctx context.Context, purchaseID string, ownerEmail string) (prepaidPurchaseRecord, error)
 
 var prepaidCreatePurchaseOverride func(s *apiServer, ctx context.Context, user *verifiedUser, payload prepaidCreatePurchaseRequest) (prepaidPurchaseRecord, error)
@@ -39,6 +45,9 @@ func resetPrepaidTestOverrides() {
 	prepaidGetOwnedReceiptOverride = nil
 	prepaidListPurchasesOverride = nil
 	prepaidSearchPurchasesOverride = nil
+	prepaidCleanupPurchasesOverride = nil
+	prepaidCleanupSavePurchaseOverride = nil
+	prepaidDeleteObjectOverride = nil
 	prepaidGetPurchaseOverride = nil
 	prepaidCreatePurchaseOverride = nil
 	prepaidAddActivationReceiptOverride = nil

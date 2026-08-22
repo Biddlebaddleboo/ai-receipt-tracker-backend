@@ -32,6 +32,7 @@ type aiReceiptSummary struct {
 	Total        *float64 `json:"total,omitempty"`
 	Category     *string  `json:"category,omitempty"`
 	PurchaseDate *string  `json:"purchase_date,omitempty"`
+	InvoiceID    *string  `json:"invoice_id,omitempty"`
 	CreatedAt    string   `json:"created_at,omitempty"`
 	sortTime     time.Time
 }
@@ -310,6 +311,7 @@ func (s *apiServer) listAIReceiptSummaries(ctx context.Context, ownerEmail strin
 				Total:        existingFloatPtr(metadata["total"]),
 				Category:     valueStringPtr(metadata["category"]),
 				PurchaseDate: valueStringPtr(metadata["purchase_date"]),
+				InvoiceID:    valueStringPtr(metadata["invoice_id"]),
 				CreatedAt:    createdText,
 				sortTime:     created,
 			})

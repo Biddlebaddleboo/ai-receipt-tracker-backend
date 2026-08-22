@@ -50,6 +50,7 @@ type receiptRecord struct {
 	Total           *float64               `json:"total,omitempty"`
 	Category        *string                `json:"category,omitempty"`
 	PurchaseDate    *string                `json:"purchase_date,omitempty"`
+	InvoiceID       *string                `json:"invoice_id,omitempty"`
 	Items           []receiptItem          `json:"items"`
 	ImageURL        string                 `json:"image_url"`
 	ExtractedText   string                 `json:"extracted_text"`
@@ -70,6 +71,7 @@ type finalizeUploadRequest struct {
 	Total        *float64 `json:"total"`
 	Category     *string  `json:"category"`
 	PurchaseDate *string  `json:"purchase_date"`
+	InvoiceID    *string  `json:"invoice_id"`
 }
 
 type openAIResponsesRequest struct {
@@ -123,6 +125,7 @@ type ocrResult struct {
 	Total        *float64  `json:"total,omitempty"`
 	Category     *string   `json:"category,omitempty"`
 	PurchaseDate *string   `json:"purchase_date,omitempty"`
+	InvoiceID    *string   `json:"invoice_id,omitempty"`
 	Items        []ocrItem `json:"items"`
 }
 
@@ -474,6 +477,7 @@ func (s *apiServer) finalizeSignedUpload(writer http.ResponseWriter, request *ht
 		"total":            payload.Total,
 		"category":         normalizeOptionalString(payload.Category),
 		"purchase_date":    normalizeOptionalString(payload.PurchaseDate),
+		"invoice_id":       normalizeOptionalString(payload.InvoiceID),
 		"storage_path":     storagePath,
 		"items":            []map[string]interface{}{},
 		"extracted_text":   "",
@@ -487,6 +491,7 @@ func (s *apiServer) finalizeSignedUpload(writer http.ResponseWriter, request *ht
 		"total":         receiptPayload["total"],
 		"purchase_date": receiptPayload["purchase_date"],
 		"category":      receiptPayload["category"],
+		"invoice_id":    receiptPayload["invoice_id"],
 		"created_at":    now,
 	}
 	detailPayload := map[string]interface{}{
@@ -497,6 +502,7 @@ func (s *apiServer) finalizeSignedUpload(writer http.ResponseWriter, request *ht
 		"items":            receiptPayload["items"],
 		"extracted_text":   receiptPayload["extracted_text"],
 		"extracted_fields": receiptPayload["extracted_fields"],
+		"invoice_id":       receiptPayload["invoice_id"],
 	}
 	batch := s.firestore.Batch()
 	batch.Set(detailRef, detailPayload)
@@ -748,13 +754,14 @@ func normalizeOptionalString(value *string) interface{} {
 	return trimmed
 }
 
-func buildReceiptMetadataSummary(ownerEmail string, vendor *string, total *float64, purchaseDate *string, category *string, createdAt time.Time) map[string]interface{} {
+func buildReceiptMetadataSummary(ownerEmail string, vendor *string, total *float64, purchaseDate *string, category *string, invoiceID *string, createdAt time.Time) map[string]interface{} {
 	return map[string]interface{}{
 		"owner_email":   strings.TrimSpace(ownerEmail),
 		"vendor":        normalizeOptionalString(vendor),
 		"total":         total,
 		"purchase_date": normalizeOptionalString(purchaseDate),
 		"category":      normalizeOptionalString(category),
+		"invoice_id":    normalizeOptionalString(invoiceID),
 		"created_at":    createdAt.UTC(),
 	}
 }
@@ -842,6 +849,7 @@ func (s *apiServer) processReceiptJob(ctx context.Context, job receiptJob) {
 			"total":         ocrRes.Total,
 			"category":      ocrRes.Category,
 			"purchase_date": ocrRes.PurchaseDate,
+			"invoice_id":    ocrRes.InvoiceID,
 			"items":         itemsPayload,
 		},
 		"validation": validation.Info,
@@ -853,6 +861,7 @@ func (s *apiServer) processReceiptJob(ctx context.Context, job receiptJob) {
 		"items":            itemsPayload,
 		"extracted_text":   ocrRes.Text,
 		"extracted_fields": extractedFields,
+		"invoice_id":       ocrRes.InvoiceID,
 	}
 	// Expose extracted data as soon as OCR completes.
 	if job.DetailRef != nil && job.ShardRef != nil {
@@ -863,7 +872,7 @@ func (s *apiServer) processReceiptJob(ctx context.Context, job receiptJob) {
 			createdAt = time.Now().UTC()
 		}
 		batch.Update(job.ShardRef, []fs.Update{
-			{Path: fmt.Sprintf("%s.%s", receiptShardMetadataField, job.ID), Value: buildReceiptMetadataSummary(job.OwnerEmail, ocrRes.Vendor, ocrRes.Total, ocrRes.PurchaseDate, ocrRes.Category, createdAt)},
+			{Path: fmt.Sprintf("%s.%s", receiptShardMetadataField, job.ID), Value: buildReceiptMetadataSummary(job.OwnerEmail, ocrRes.Vendor, ocrRes.Total, ocrRes.PurchaseDate, ocrRes.Category, ocrRes.InvoiceID, createdAt)},
 			{Path: "updated_at", Value: time.Now().UTC()},
 		})
 		if _, err := batch.Commit(ctx); err != nil {
@@ -879,6 +888,7 @@ func (s *apiServer) processReceiptJob(ctx context.Context, job receiptJob) {
 		"total":            ocrRes.Total,
 		"category":         ocrRes.Category,
 		"purchase_date":    ocrRes.PurchaseDate,
+		"invoice_id":       ocrRes.InvoiceID,
 		"items":            itemsPayload,
 		"extracted_text":   ocrRes.Text,
 		"extracted_fields": extractedFields,
@@ -1003,7 +1013,11 @@ func (s *apiServer) attachSignedImageURL(ctx context.Context, data map[string]in
 func buildOCRPrompt(categoryOptions []string) string {
 	prompt := "Extract the readable text from this receipt image and summarize the line items and totals. " +
 		"After the summary, output a JSON object with the following keys: `vendor`, `subtotal`, `tax`, `total`, " +
-		"`category`, `purchase_date`, and `items`. The `items` array should include objects with `name`, `quantity`, " +
+		"`category`, `purchase_date`, `invoice_id`, and `items`. For `invoice_id`, extract only a clearly labelled " +
+		"merchant-issued identifier such as Invoice #, Invoice ID, Receipt #, Transaction ID, Transaction #, Order #, " +
+		"Reference #, Bill #, or an obviously equivalent label. Preserve it exactly as printed, including letters, " +
+		"dashes, and leading zeros; do not invent or infer one, and use null when no clear identifier is present. " +
+		"The `items` array should include objects with `name`, `quantity`, " +
 		"and `price`. Ensure the `subtotal` equals the sum of each item's `quantity` multiplied by its `price`; if you " +
 		"can't confirm a value, set it to null. Do not add any explanation outside the JSON object."
 	if len(categoryOptions) == 0 {
@@ -1040,6 +1054,7 @@ func readStructuredFields(rawText string, categoryOptions []string) ocrResult {
 		category = validateReceiptCategory(category, categoryOptions)
 	}
 	purchaseDate := normalizeString(firstPresent(payload, "purchase_date", "transaction_date", "date"))
+	invoiceID := normalizeMerchantIdentifier(firstPresent(payload, "invoice_id", "merchant_invoice_id", "transaction_id", "receipt_number", "order_number", "reference_number", "bill_number"))
 	items := extractReceiptItems(payload)
 	return ocrResult{
 		Text:         rawText,
@@ -1049,6 +1064,7 @@ func readStructuredFields(rawText string, categoryOptions []string) ocrResult {
 		Total:        total,
 		Category:     category,
 		PurchaseDate: purchaseDate,
+		InvoiceID:    invoiceID,
 		Items:        items,
 	}
 }
@@ -1227,6 +1243,7 @@ func receiptRecordFromMap(id string, payload map[string]interface{}) receiptReco
 		Total:           existingFloatOrZeroPtr(payload["total"]),
 		Category:        valueStringPtr(payload["category"]),
 		PurchaseDate:    valueStringPtr(payload["purchase_date"]),
+		InvoiceID:       valueStringPtr(payload["invoice_id"]),
 		Items:           receiptItemsFromAny(payload["items"]),
 		ImageURL:        stringFromAny(payload["image_url"]),
 		ExtractedText:   stringFromAny(payload["extracted_text"]),
@@ -1298,6 +1315,20 @@ func normalizeString(value interface{}) *string {
 		return nil
 	}
 	return &text
+}
+
+// Merchant identifiers must come back as strings so leading zeroes and
+// punctuation are never lost through numeric coercion.
+func normalizeMerchantIdentifier(value interface{}) *string {
+	text, ok := value.(string)
+	if !ok {
+		return nil
+	}
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return nil
+	}
+	return &trimmed
 }
 
 func normalizeAmount(value interface{}) *float64 {

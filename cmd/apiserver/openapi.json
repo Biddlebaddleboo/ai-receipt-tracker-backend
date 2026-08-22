@@ -348,6 +348,10 @@
           "invoice_id": {
             "type": "string"
           },
+          "image_grayscale": {
+            "type": "boolean",
+            "description": "True when the stored receipt image was captured or converted in grayscale. Omitted for colour images."
+          },
           "items": {
             "type": "array",
             "items": {

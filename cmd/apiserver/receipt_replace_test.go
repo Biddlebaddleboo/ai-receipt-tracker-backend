@@ -157,3 +157,14 @@ func TestReplaceReceiptImageTreatsMissingReplacementAsNotFound(t *testing.T) {
 		t.Fatalf("expected missing replacement cleanup, got %v", deletedPaths)
 	}
 }
+
+func TestReceiptRecordFromMapPreservesOptionalImageGrayscale(t *testing.T) {
+	record := receiptRecordFromMap("receipt-1", map[string]interface{}{"image_grayscale": true})
+	if !record.ImageGrayscale {
+		t.Fatal("expected grayscale metadata to be exposed when enabled")
+	}
+	colourRecord := receiptRecordFromMap("receipt-2", map[string]interface{}{})
+	if colourRecord.ImageGrayscale {
+		t.Fatal("expected absent grayscale metadata to remain colour/default")
+	}
+}

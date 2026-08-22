@@ -51,6 +51,7 @@ type receiptRecord struct {
 	Category        *string                `json:"category,omitempty"`
 	PurchaseDate    *string                `json:"purchase_date,omitempty"`
 	InvoiceID       *string                `json:"invoice_id,omitempty"`
+	ImageGrayscale  bool                   `json:"image_grayscale,omitempty"`
 	Items           []receiptItem          `json:"items"`
 	ImageURL        string                 `json:"image_url"`
 	ExtractedText   string                 `json:"extracted_text"`
@@ -64,14 +65,15 @@ type signedUploadRequest struct {
 }
 
 type finalizeUploadRequest struct {
-	StoragePath  string   `json:"storage_path"`
-	Vendor       *string  `json:"vendor"`
-	Subtotal     *float64 `json:"subtotal"`
-	Tax          *float64 `json:"tax"`
-	Total        *float64 `json:"total"`
-	Category     *string  `json:"category"`
-	PurchaseDate *string  `json:"purchase_date"`
-	InvoiceID    *string  `json:"invoice_id"`
+	StoragePath    string   `json:"storage_path"`
+	Vendor         *string  `json:"vendor"`
+	Subtotal       *float64 `json:"subtotal"`
+	Tax            *float64 `json:"tax"`
+	Total          *float64 `json:"total"`
+	Category       *string  `json:"category"`
+	PurchaseDate   *string  `json:"purchase_date"`
+	InvoiceID      *string  `json:"invoice_id"`
+	ImageGrayscale *bool    `json:"image_grayscale"`
 }
 
 type openAIResponsesRequest struct {
@@ -250,7 +252,8 @@ func (s *apiServer) signReceiptImage(writer http.ResponseWriter, request *http.R
 }
 
 type replaceReceiptImageRequest struct {
-	StoragePath string `json:"storage_path"`
+	StoragePath    string `json:"storage_path"`
+	ImageGrayscale *bool  `json:"image_grayscale"`
 }
 
 // replaceReceiptImage swaps only the storage_path on an owned receipt. The
@@ -317,7 +320,7 @@ func (s *apiServer) replaceReceiptImage(writer http.ResponseWriter, request *htt
 	}
 
 	oldStoragePath := strings.TrimSpace(stringFromAny(receipt.Data["storage_path"]))
-	if err := s.updateReceiptStoragePath(request.Context(), receipt, newStoragePath); err != nil {
+	if err := s.updateReceiptStoragePathWithColorMode(request.Context(), receipt, receiptID, newStoragePath, payload.ImageGrayscale); err != nil {
 		cleanupReplacement()
 		s.writeErr(writer, err)
 		return
@@ -348,13 +351,35 @@ func (s *apiServer) receiptObjectAttrs(ctx context.Context, storagePath string) 
 }
 
 func (s *apiServer) updateReceiptStoragePath(ctx context.Context, receipt ownedReceipt, storagePath string) error {
+	return s.updateReceiptStoragePathWithColorMode(ctx, receipt, "", storagePath, nil)
+}
+
+func (s *apiServer) updateReceiptStoragePathWithColorMode(ctx context.Context, receipt ownedReceipt, receiptID string, storagePath string, imageGrayscale *bool) error {
 	if receiptStoragePathUpdateOverride != nil {
 		return receiptStoragePathUpdateOverride(ctx, receipt, storagePath)
 	}
 	if receipt.DetailRef == nil {
 		return fmt.Errorf("receipt detail reference is missing")
 	}
-	_, err := receipt.DetailRef.Update(ctx, []fs.Update{{Path: "storage_path", Value: storagePath}})
+	detailUpdates := []fs.Update{{Path: "storage_path", Value: storagePath}}
+	shardUpdates := make([]fs.Update, 0, 1)
+	if imageGrayscale != nil {
+		if *imageGrayscale {
+			detailUpdates = append(detailUpdates, fs.Update{Path: "image_grayscale", Value: true})
+			shardUpdates = append(shardUpdates, fs.Update{FieldPath: fs.FieldPath{receiptShardMetadataField, receiptID, "image_grayscale"}, Value: true})
+		} else {
+			detailUpdates = append(detailUpdates, fs.Update{Path: "image_grayscale", Value: fs.Delete})
+			shardUpdates = append(shardUpdates, fs.Update{FieldPath: fs.FieldPath{receiptShardMetadataField, receiptID, "image_grayscale"}, Value: fs.Delete})
+		}
+	}
+	if receipt.ShardRef != nil && len(shardUpdates) > 0 {
+		batch := s.firestore.Batch()
+		batch.Update(receipt.DetailRef, detailUpdates)
+		batch.Update(receipt.ShardRef, shardUpdates)
+		_, err := batch.Commit(ctx)
+		return err
+	}
+	_, err := receipt.DetailRef.Update(ctx, detailUpdates)
 	return err
 }
 
@@ -485,6 +510,9 @@ func (s *apiServer) finalizeSignedUpload(writer http.ResponseWriter, request *ht
 		"created_at":       now,
 		"owner_email":      ownerEmail,
 	}
+	if payload.ImageGrayscale != nil && *payload.ImageGrayscale {
+		receiptPayload["image_grayscale"] = true
+	}
 	summaryPayload := map[string]interface{}{
 		"owner_email":   ownerEmail,
 		"vendor":        receiptPayload["vendor"],
@@ -493,6 +521,9 @@ func (s *apiServer) finalizeSignedUpload(writer http.ResponseWriter, request *ht
 		"category":      receiptPayload["category"],
 		"invoice_id":    receiptPayload["invoice_id"],
 		"created_at":    now,
+	}
+	if receiptPayload["image_grayscale"] == true {
+		summaryPayload["image_grayscale"] = true
 	}
 	detailPayload := map[string]interface{}{
 		"owner_email":      ownerEmail,
@@ -503,6 +534,9 @@ func (s *apiServer) finalizeSignedUpload(writer http.ResponseWriter, request *ht
 		"extracted_text":   receiptPayload["extracted_text"],
 		"extracted_fields": receiptPayload["extracted_fields"],
 		"invoice_id":       receiptPayload["invoice_id"],
+	}
+	if receiptPayload["image_grayscale"] == true {
+		detailPayload["image_grayscale"] = true
 	}
 	batch := s.firestore.Batch()
 	batch.Set(detailRef, detailPayload)
@@ -516,12 +550,13 @@ func (s *apiServer) finalizeSignedUpload(writer http.ResponseWriter, request *ht
 		return
 	}
 	job := receiptJob{
-		ID:          receiptID,
-		OwnerEmail:  ownerEmail,
-		StoragePath: storagePath,
-		DetailRef:   detailRef,
-		ShardRef:    shardRef,
-		CreatedAt:   now,
+		ID:             receiptID,
+		OwnerEmail:     ownerEmail,
+		StoragePath:    storagePath,
+		ImageGrayscale: payload.ImageGrayscale != nil && *payload.ImageGrayscale,
+		DetailRef:      detailRef,
+		ShardRef:       shardRef,
+		CreatedAt:      now,
 	}
 	s.processReceiptJob(request.Context(), job)
 	updated, err := s.getOwnedReceipt(request.Context(), receiptID, ownerEmail)
@@ -812,12 +847,13 @@ func categoryNamesFromMapValue(value interface{}) []string {
 }
 
 type receiptJob struct {
-	ID          string
-	OwnerEmail  string
-	StoragePath string
-	DetailRef   *fs.DocumentRef
-	ShardRef    *fs.DocumentRef
-	CreatedAt   time.Time
+	ID             string
+	OwnerEmail     string
+	StoragePath    string
+	ImageGrayscale bool
+	DetailRef      *fs.DocumentRef
+	ShardRef       *fs.DocumentRef
+	CreatedAt      time.Time
 }
 
 func (s *apiServer) processReceiptJob(ctx context.Context, job receiptJob) {
@@ -871,8 +907,12 @@ func (s *apiServer) processReceiptJob(ctx context.Context, job receiptJob) {
 		if createdAt.IsZero() {
 			createdAt = time.Now().UTC()
 		}
+		metadataSummary := buildReceiptMetadataSummary(job.OwnerEmail, ocrRes.Vendor, ocrRes.Total, ocrRes.PurchaseDate, ocrRes.Category, ocrRes.InvoiceID, createdAt)
+		if job.ImageGrayscale {
+			metadataSummary["image_grayscale"] = true
+		}
 		batch.Update(job.ShardRef, []fs.Update{
-			{Path: fmt.Sprintf("%s.%s", receiptShardMetadataField, job.ID), Value: buildReceiptMetadataSummary(job.OwnerEmail, ocrRes.Vendor, ocrRes.Total, ocrRes.PurchaseDate, ocrRes.Category, ocrRes.InvoiceID, createdAt)},
+			{Path: fmt.Sprintf("%s.%s", receiptShardMetadataField, job.ID), Value: metadataSummary},
 			{Path: "updated_at", Value: time.Now().UTC()},
 		})
 		if _, err := batch.Commit(ctx); err != nil {
@@ -1247,6 +1287,7 @@ func receiptRecordFromMap(id string, payload map[string]interface{}) receiptReco
 		Category:        valueStringPtr(payload["category"]),
 		PurchaseDate:    valueStringPtr(payload["purchase_date"]),
 		InvoiceID:       valueStringPtr(payload["invoice_id"]),
+		ImageGrayscale:  payload["image_grayscale"] == true,
 		Items:           receiptItemsFromAny(payload["items"]),
 		ImageURL:        stringFromAny(payload["image_url"]),
 		ExtractedText:   stringFromAny(payload["extracted_text"]),

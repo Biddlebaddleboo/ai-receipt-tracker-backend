@@ -1,5 +1,5 @@
 {
-  "openapi": "3.0.3",
+  "openapi": "3.1.0",
   "info": {
     "title": "AI Receipt Tracker read-only receipts API",
     "version": "1.0.0",
@@ -64,7 +64,14 @@
         ],
         "parameters": [
           {
-            "$ref": "#/components/parameters/ReceiptID"
+            "name": "receipt_id",
+            "in": "path",
+            "required": true,
+            "description": "The Receipt Keeper receipt ID.",
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
           }
         ],
         "responses": {
@@ -106,7 +113,14 @@
         ],
         "parameters": [
           {
-            "$ref": "#/components/parameters/ReceiptID"
+            "name": "receipt_id",
+            "in": "path",
+            "required": true,
+            "description": "The Receipt Keeper receipt ID.",
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
           }
         ],
         "responses": {
@@ -163,18 +177,6 @@
         "scheme": "bearer",
         "bearerFormat": "rk_ai_<key-id>.<secret>",
         "description": "Use the server-issued AI access token exactly as `Authorization: Bearer rk_ai_<key-id>.<secret>`. Do not use the Google OAuth token or include the token in a URL."
-      }
-    },
-    "parameters": {
-      "ReceiptID": {
-        "name": "receipt_id",
-        "in": "path",
-        "required": true,
-        "description": "The Receipt Keeper receipt ID.",
-        "schema": {
-          "type": "string",
-          "minLength": 1
-        }
       }
     },
     "responses": {

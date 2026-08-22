@@ -34,7 +34,7 @@ Lean Go backend for receipt upload finalization, OCR extraction, image URL signi
 
 - `GET /healthz`
 - `GET /openapi.json`
-  - Public OpenAPI 3.0.3 document for the read-only AI receipt routes. Import this URL into ChatGPT GPT Actions.
+  - Public OpenAPI 3.1.0 document for the read-only AI receipt routes. Import this URL into ChatGPT GPT Actions.
 - `GET /billing/helcim/approval`
 - `POST /billing/helcim/approval`
 

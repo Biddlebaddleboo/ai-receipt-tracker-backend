@@ -26,7 +26,7 @@ func TestOpenAPISpecIsPublicAndContainsOnlyReadOnlyAIReceiptRoutes(t *testing.T)
 	if err := json.Unmarshal(recorder.Body.Bytes(), &document); err != nil {
 		t.Fatalf("invalid OpenAPI JSON: %v", err)
 	}
-	if document.OpenAPI != "3.0.3" {
+	if document.OpenAPI != "3.1.0" {
 		t.Fatalf("unexpected OpenAPI version %q", document.OpenAPI)
 	}
 	expectedPaths := []string{"/ai/receipts", "/ai/receipts/{receipt_id}", "/ai/receipts/{receipt_id}/image"}

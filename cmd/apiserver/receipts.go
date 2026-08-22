@@ -1015,8 +1015,11 @@ func buildOCRPrompt(categoryOptions []string) string {
 		"After the summary, output a JSON object with the following keys: `vendor`, `subtotal`, `tax`, `total`, " +
 		"`category`, `purchase_date`, `invoice_id`, and `items`. For `invoice_id`, extract only a clearly labelled " +
 		"merchant-issued identifier such as Invoice #, Invoice ID, Receipt #, Transaction ID, Transaction #, Order #, " +
-		"Reference #, Bill #, or an obviously equivalent label. Preserve it exactly as printed, including letters, " +
-		"dashes, and leading zeros; do not invent or infer one, and use null when no clear identifier is present. " +
+		"Reference #, Bill #, or an obviously equivalent label. When present, `invoice_id` MUST ALWAYS be a JSON string, " +
+		"even if the merchant identifier consists entirely of digits (never a JSON number). Preserve every character " +
+		"exactly as printed, including letters, dashes, and leading zeros. For example, if the receipt shows " +
+		"`Transaction #: 00123456`, return `{\"invoice_id\": \"00123456\"}`, not `{\"invoice_id\": 123456}`. " +
+		"Do not invent or infer an identifier, and use null when no clear merchant-issued identifier exists. " +
 		"The `items` array should include objects with `name`, `quantity`, " +
 		"and `price`. Ensure the `subtotal` equals the sum of each item's `quantity` multiplied by its `price`; if you " +
 		"can't confirm a value, set it to null. Do not add any explanation outside the JSON object."

@@ -68,6 +68,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", server.handleHealthz)
+	mux.HandleFunc("/openapi.json", server.handleOpenAPI)
 	mux.HandleFunc("/ai-access/token", server.handleAIAccessToken)
 	mux.HandleFunc("/ai/receipts", server.handleAIReceipts)
 	mux.HandleFunc("/ai/receipts/", server.handleAIReceiptByID)

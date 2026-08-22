@@ -5,6 +5,7 @@ WORKDIR /src/cmd/apiserver
 COPY cmd/apiserver/go.mod ./go.mod
 COPY cmd/apiserver/go.sum ./go.sum
 COPY cmd/apiserver/*.go ./
+COPY cmd/apiserver/openapi.json ./openapi.json
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends build-essential && \

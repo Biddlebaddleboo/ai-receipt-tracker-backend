@@ -16,6 +16,7 @@ var ocrSystemPromptPNG []byte
 var ocrSystemPromptDataURL = "data:image/png;base64," + base64.StdEncoding.EncodeToString(ocrSystemPromptPNG)
 
 const ocrCategoryPromptMarker = " Use these categories when guessing the receipt type: "
+const ocrSystemInstruction = "Follow the first image."
 
 type ocrSystemPromptTransport struct {
 	base http.RoundTripper
@@ -39,7 +40,7 @@ func (t *ocrSystemPromptTransport) RoundTrip(request *http.Request) (*http.Respo
 	_ = request.Body.Close()
 
 	var payload openAIResponsesRequest
-	if err := json.Unmarshal(originalBody, &payload); err != nil || !rewriteOCRPromptAsSystemImage(&payload) {
+	if err := json.Unmarshal(originalBody, &payload); err != nil || !rewriteOCRPromptAsUserImage(&payload) {
 		return t.base.RoundTrip(withRequestBody(request, originalBody))
 	}
 
@@ -50,7 +51,7 @@ func (t *ocrSystemPromptTransport) RoundTrip(request *http.Request) (*http.Respo
 	return t.base.RoundTrip(withRequestBody(request, rewrittenBody))
 }
 
-func rewriteOCRPromptAsSystemImage(payload *openAIResponsesRequest) bool {
+func rewriteOCRPromptAsUserImage(payload *openAIResponsesRequest) bool {
 	if payload == nil || len(payload.Input) != 1 || payload.Input[0].Role != "user" {
 		return false
 	}
@@ -71,19 +72,20 @@ func rewriteOCRPromptAsSystemImage(payload *openAIResponsesRequest) bool {
 		return false
 	}
 
-	systemContent := []openAIInputContent{
+	userContent := []openAIInputContent{
 		{Type: "input_image", ImageURL: ocrSystemPromptDataURL, Detail: "low"},
 	}
 	if markerIndex := strings.Index(legacyPrompt, ocrCategoryPromptMarker); markerIndex >= 0 {
 		categoryInstruction := strings.TrimSpace(legacyPrompt[markerIndex+1:])
 		if categoryInstruction != "" {
-			systemContent = append(systemContent, openAIInputContent{Type: "input_text", Text: categoryInstruction})
+			userContent = append(userContent, openAIInputContent{Type: "input_text", Text: categoryInstruction})
 		}
 	}
+	userContent = append(userContent, receiptImages...)
 
 	payload.Input = []openAIInputMessage{
-		{Role: "system", Content: systemContent},
-		{Role: "user", Content: receiptImages},
+		{Role: "system", Content: []openAIInputContent{{Type: "input_text", Text: ocrSystemInstruction}}},
+		{Role: "user", Content: userContent},
 	}
 	return true
 }

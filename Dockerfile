@@ -6,6 +6,7 @@ COPY cmd/apiserver/go.mod ./go.mod
 COPY cmd/apiserver/go.sum ./go.sum
 COPY cmd/apiserver/*.go ./
 COPY cmd/apiserver/openapi.json ./openapi.json
+COPY cmd/apiserver/ocr_prompt.png ./ocr_prompt.png
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends build-essential && \

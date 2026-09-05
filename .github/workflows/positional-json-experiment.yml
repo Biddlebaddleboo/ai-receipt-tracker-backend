@@ -56,7 +56,6 @@ jobs:
               ocrPosPurchaseDate
               ocrPosInvoiceID
               ocrPosItems
-              ocrPosFieldCount
           )
 
           func extractPositionalJSON(rawText string) ([]interface{}, bool) {
@@ -86,12 +85,10 @@ jobs:
                   }
                   return payload[index]
               }
-
               category := normalizeString(at(ocrPosCategory))
               if len(categoryOptions) > 0 {
                   category = validateReceiptCategory(category, categoryOptions)
               }
-
               return ocrResult{
                   Text:         rawText,
                   Vendor:       normalizeString(at(ocrPosVendor)),
@@ -154,15 +151,13 @@ jobs:
           }
 
           func TestReadStructuredFieldsObjectFallback(t *testing.T) {
-              raw := `{"vendor":"Costco","invoice_id":"00123456"}`
-              got := readStructuredFields(raw, nil)
+              got := readStructuredFields(`{"vendor":"Costco","invoice_id":"00123456"}`, nil)
               if got.Vendor == nil || *got.Vendor != "Costco" { t.Fatalf("vendor=%v", got.Vendor) }
               if got.InvoiceID == nil || *got.InvoiceID != "00123456" { t.Fatalf("invoice_id=%v", got.InvoiceID) }
           }
 
           func TestPositionalInvoiceIDLeadingZeros(t *testing.T) {
-              raw := `[null,null,null,null,null,null,"00123456",[]]`
-              got := readStructuredFields(raw, nil)
+              got := readStructuredFields(`[null,null,null,null,null,null,"00123456",[]]`, nil)
               if got.InvoiceID == nil || *got.InvoiceID != "00123456" { t.Fatalf("invoice_id=%v", got.InvoiceID) }
           }
           EOF
@@ -171,14 +166,14 @@ jobs:
           from pathlib import Path
           p = Path('cmd/apiserver/receipts.go')
           s = p.read_text()
-          old = '''func readStructuredFields(rawText string, categoryOptions []string) ocrResult {\n\tpayload := extractJSON(rawText)'''
-          new = '''func readStructuredFields(rawText string, categoryOptions []string) ocrResult {\n\tif payload, ok := extractPositionalJSON(rawText); ok {\n\t\treturn readPositionalStructuredFields(rawText, payload, categoryOptions)\n\t}\n\tpayload := extractJSON(rawText)'''
+          old = 'func readStructuredFields(rawText string, categoryOptions []string) ocrResult {\n\tpayload := extractJSON(rawText)'
+          new = 'func readStructuredFields(rawText string, categoryOptions []string) ocrResult {\n\tif payload, ok := extractPositionalJSON(rawText); ok {\n\t\treturn readPositionalStructuredFields(rawText, payload, categoryOptions)\n\t}\n\tpayload := extractJSON(rawText)'
           if old not in s:
               raise SystemExit('readStructuredFields anchor not found')
           p.write_text(s.replace(old, new, 1))
           PY
 
-      - name: Change OCR prompt to positional JSON
+      - name: Change OCR prompt to compact positional JSON
         shell: bash
         run: |
           set -euo pipefail
@@ -189,14 +184,12 @@ jobs:
           start = s.index('func buildOCRPrompt(categoryOptions []string) string {')
           end = s.index('\nfunc collectOCRText(', start)
           replacement = r'''func buildOCRPrompt(categoryOptions []string) string {
-          	prompt := "Extract the readable text from this receipt image and summarize the line items and totals. " +
-          		"Then output only a positional JSON array in exactly this order: [vendor, subtotal, tax, total, category, purchase_date, invoice_id, items]. " +
-          		"The items value must be an array of positional arrays in exactly this order: [[name, quantity, price], ...]. " +
-          		"For invoice_id, extract only a clearly labelled merchant-issued identifier such as Invoice #, Invoice ID, Receipt #, Transaction ID, Transaction #, Order #, Reference #, Bill #, or an obviously equivalent label. " +
-          		"When present, invoice_id MUST ALWAYS be a JSON string, even if the merchant identifier consists entirely of digits (never a JSON number). Preserve every character exactly as printed, including letters, dashes, and leading zeros. " +
-          		"For example, if the receipt shows `Transaction #: 00123456`, the seventh array value must be `\"00123456\"`, not `123456`. " +
-          		"Do not invent or infer an identifier, and use null when no clear merchant-issued identifier exists. " +
-          		"Ensure subtotal equals the sum of each item's quantity multiplied by its price; if you can't confirm a scalar value, use null. Use [] when there are no confirmable items. Do not add any explanation outside the JSON array."
+          	prompt := "Extract readable receipt text and line items/totals. Output only this positional JSON array: " +
+          		"[vendor,subtotal,tax,total,category,purchase_date,invoice_id,items], where items=[[name,quantity,price],...]. " +
+          		"invoice_id: only a clearly labelled merchant-issued ID such as Invoice #, Invoice ID, Receipt #, Transaction ID, Transaction #, Order #, Reference #, Bill #, or obvious equivalent. " +
+          		"If present, invoice_id MUST ALWAYS be a JSON string even if all digits; preserve exact characters including letters, dashes, and leading zeros. " +
+          		"If `Transaction #: 00123456`, the seventh value must be `\"00123456\"`, not `123456`. Never invent or infer an ID; use null when no clear merchant-issued identifier exists. " +
+          		"subtotal must equal sum(quantity*price). Unknown scalar=null; no confirmable items=[]. JSON only."
           	if len(categoryOptions) == 0 {
           		return prompt
           	}
@@ -205,6 +198,30 @@ jobs:
           		". If none match, use null for the category position."
           }'''
           p.write_text(s[:start] + replacement + s[end:])
+          PY
+
+      - name: Update prompt tests for positional schema
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('cmd/apiserver/openai_prompt_image_test.go')
+          s = p.read_text()
+          s = s.replace(
+              'Use these categories when guessing the receipt type: Meals, Office. If none match, respond with null for the `category` key.',
+              'Use these categories when guessing the receipt type: Meals, Office. If none match, use null for the category position.'
+          )
+          p.write_text(s)
+
+          p = Path('cmd/apiserver/receipt_invoice_test.go')
+          s = p.read_text()
+          old = '''\tfor _, phrase := range []string{\n\t\t"`invoice_id` MUST ALWAYS be a JSON string",\n\t\t"even if the merchant identifier consists entirely of digits",\n\t\t"`Transaction #: 00123456`",\n\t\t"`{\\\"invoice_id\\\": \\\"00123456\\\"}`",\n\t\t"not `{\\\"invoice_id\\\": 123456}`",\n\t\t"use null when no clear merchant-issued identifier exists",\n\t} {'''
+          new = '''\tfor _, phrase := range []string{\n\t\t"invoice_id MUST ALWAYS be a JSON string",\n\t\t"even if all digits",\n\t\t"`Transaction #: 00123456`",\n\t\t"seventh value must be `\\\"00123456\\\"`",\n\t\t"not `123456`",\n\t\t"use null when no clear merchant-issued identifier exists",\n\t} {'''
+          if old not in s:
+              raise SystemExit('invoice prompt test anchor not found')
+          p.write_text(s.replace(old, new, 1))
           PY
 
       - name: Add positional prompt generator
@@ -223,19 +240,16 @@ jobs:
           MARGIN = 1
           LINE_SPACING = 1
           PROMPT = (
-              "Extract the readable text from this receipt image and summarize the line items and totals. "
-              "Then output only a positional JSON array in exactly this order: [vendor, subtotal, tax, total, category, purchase_date, invoice_id, items]. "
-              "The items value must be an array of positional arrays in exactly this order: [[name, quantity, price], ...]. "
-              "For invoice_id, extract only a clearly labelled merchant-issued identifier such as Invoice #, Invoice ID, Receipt #, Transaction ID, Transaction #, Order #, Reference #, Bill #, or an obviously equivalent label. "
-              "When present, invoice_id MUST ALWAYS be a JSON string, even if the merchant identifier consists entirely of digits (never a JSON number). Preserve every character exactly as printed, including letters, dashes, and leading zeros. "
-              "For example, if the receipt shows `Transaction #: 00123456`, the seventh array value must be `\"00123456\"`, not `123456`. "
-              "Do not invent or infer an identifier, and use null when no clear merchant-issued identifier exists. "
-              "Ensure subtotal equals the sum of each item's quantity multiplied by its price; if you can't confirm a scalar value, use null. Use [] when there are no confirmable items. Do not add any explanation outside the JSON array."
+              "Extract readable receipt text and line items/totals. Output only this positional JSON array: "
+              "[vendor,subtotal,tax,total,category,purchase_date,invoice_id,items], where items=[[name,quantity,price],...]. "
+              "invoice_id: only a clearly labelled merchant-issued ID such as Invoice #, Invoice ID, Receipt #, Transaction ID, Transaction #, Order #, Reference #, Bill #, or obvious equivalent. "
+              "If present, invoice_id MUST ALWAYS be a JSON string even if all digits; preserve exact characters including letters, dashes, and leading zeros. "
+              "If `Transaction #: 00123456`, the seventh value must be `\"00123456\"`, not `123456`. Never invent or infer an ID; use null when no clear merchant-issued identifier exists. "
+              "subtotal must equal sum(quantity*price). Unknown scalar=null; no confirmable items=[]. JSON only."
           )
 
           def wrap(draw, font, text, max_width):
-              lines = []
-              current = ""
+              lines, current = [], ""
               for word in text.split():
                   candidate = word if not current else current + " " + word
                   if not current or draw.textlength(candidate, font=font) <= max_width:
@@ -252,8 +266,7 @@ jobs:
               probe = Image.new("RGB", (1, 1), "white")
               draw = ImageDraw.Draw(probe)
               lines = wrap(draw, font, PROMPT, WIDTH - 2 * MARGIN)
-              metrics = []
-              height = 2 * MARGIN
+              metrics, height = [], 2 * MARGIN
               for i, line in enumerate(lines):
                   bbox = draw.textbbox((0, 0), line, font=font)
                   metrics.append((line, bbox))
@@ -261,8 +274,7 @@ jobs:
                   if i != len(lines) - 1:
                       height += LINE_SPACING
               image = Image.new("RGB", (WIDTH, height), "white")
-              out = ImageDraw.Draw(image)
-              y = MARGIN
+              out, y = ImageDraw.Draw(image), MARGIN
               for line, bbox in metrics:
                   l, t, r, b = bbox
                   out.text((MARGIN - l, y - t), line, font=font, fill="black")
@@ -283,15 +295,14 @@ jobs:
               ap.add_argument("--png", required=True)
               ap.add_argument("--webp", required=True)
               args = ap.parse_args()
-              image, line_count = render(Path(args.font))
-              png = Path(args.png)
-              webp = Path(args.webp)
+              image, lines = render(Path(args.font))
+              png, webp = Path(args.png), Path(args.webp)
               png.parent.mkdir(parents=True, exist_ok=True)
               image.save(png, format="PNG", optimize=True)
               image.save(webp, format="WEBP", lossless=True, quality=100, method=6, exact=True)
               verify_webp(webp)
               patches = ((image.width + 31) // 32) * ((image.height + 31) // 32)
-              print(f"Positional prompt: {image.width}x{image.height}, lines={line_count}, patches={patches}, png={png.stat().st_size}, webp={webp.stat().st_size}")
+              print(f"Positional prompt: {image.width}x{image.height}, lines={lines}, patches={patches}, png={png.stat().st_size}, webp={webp.stat().st_size}")
 
           if __name__ == "__main__":
               main()
@@ -330,7 +341,7 @@ jobs:
         run: |
           set -euo pipefail
           cd cmd/apiserver
-          gofmt -w receipts.go ocr_positional.go ocr_positional_test.go openai_prompt_image.go
+          gofmt -w receipts.go ocr_positional.go ocr_positional_test.go openai_prompt_image.go openai_prompt_image_test.go receipt_invoice_test.go
           go test ./...
 
       - name: Commit positional JSON experiment
@@ -341,6 +352,8 @@ jobs:
             Dockerfile \
             cmd/apiserver/receipts.go \
             cmd/apiserver/openai_prompt_image.go \
+            cmd/apiserver/openai_prompt_image_test.go \
+            cmd/apiserver/receipt_invoice_test.go \
             cmd/apiserver/ocr_positional.go \
             cmd/apiserver/ocr_positional_test.go \
             cmd/apiserver/ocr_prompt_array.png \

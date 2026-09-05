@@ -1,0 +1,36 @@
+name: Positional JSON OCR retry
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/positional-json-experiment-retry.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  implement:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Pillow
+        run: python -m pip install --disable-pip-version-check "Pillow==12.3.0"
+      - name: Apply positional experiment
+        run: python scripts/apply_positional_experiment.py --font /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+      - name: Format and test
+        run: |
+          cd cmd/apiserver
+          gofmt -w receipts.go ocr_positional.go ocr_positional_test.go openai_prompt_image.go openai_prompt_image_test.go receipt_invoice_test.go
+          go test ./...
+      - name: Commit experiment
+        run: |
+          git add Dockerfile cmd/apiserver/receipts.go cmd/apiserver/openai_prompt_image.go cmd/apiserver/openai_prompt_image_test.go cmd/apiserver/receipt_invoice_test.go cmd/apiserver/ocr_positional.go cmd/apiserver/ocr_positional_test.go cmd/apiserver/ocr_prompt_array.png cmd/apiserver/ocr_prompt_array.webp scripts/generate_ocr_prompt_array.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "experiment(ocr): use positional JSON arrays"
+          git pull --rebase origin main
+          git push

@@ -1053,7 +1053,7 @@ func (s *apiServer) attachSignedImageURL(ctx context.Context, data map[string]in
 func buildOCRPrompt(categoryOptions []string) string {
 	prompt := "Extract the readable text from this receipt image and line items/totals. Output only this positional JSON array: " +
 		"[vendor,subtotal,tax,total,category,purchase_date,invoice_id,items], where items=[[name,quantity,price],...]. " +
-		"purchase_date: extract the receipt purchase/transaction date as printed; use null if no clear date. invoice_id: only a clearly labelled merchant-issued ID such as Invoice #, Invoice ID, Receipt #, Transaction ID, Transaction #, Order #, Reference #, Bill #, or obvious equivalent. " +
+		"purchase_date: extract the receipt purchase/transaction date and output it in MM-DD-YYYY format (example: 09-05-2026); use null if no clear date. invoice_id: only a clearly labelled merchant-issued ID such as Invoice #, Invoice ID, Receipt #, Transaction ID, Transaction #, Order #, Reference #, Bill #, or obvious equivalent. " +
 		"If present, invoice_id MUST ALWAYS be a JSON string even if all digits; preserve exact characters including letters, dashes, and leading zeros. " +
 		"If `Transaction #: 00123456`, the seventh value must be `\"00123456\"`, not `123456`. Never invent or infer an ID; use null when no clear merchant-issued identifier exists. " +
 		"subtotal must equal sum(quantity*price). Unknown scalar=null; no confirmable items=[]. JSON only."

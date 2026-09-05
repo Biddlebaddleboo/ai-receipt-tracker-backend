@@ -1,0 +1,62 @@
+name: Regenerate OCR prompt WebP
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/regenerate-ocr-prompt.yml"
+      - "scripts/generate_ocr_prompt.py"
+
+permissions:
+  contents: write
+
+jobs:
+  regenerate:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned Pillow
+        run: python -m pip install --disable-pip-version-check "Pillow==12.3.0"
+
+      - name: Download exact Fira Sans Regular font
+        shell: bash
+        run: |
+          set -euo pipefail
+          FONT="$RUNNER_TEMP/FiraSans-Regular.otf"
+          curl --fail --location --retry 4 --retry-delay 2 \
+            "https://ctan.math.illinois.edu/fonts/fira/opentype/FiraSans-Regular.otf" \
+            --output "$FONT"
+          echo "6249d77fa313215cd66a97b942041ddbca73664309ac5e25bd0ab937d727c96e  $FONT" | sha256sum --check --strict
+          echo "OCR_PROMPT_FONT=$FONT" >> "$GITHUB_ENV"
+
+      - name: Generate exact OCR prompt WebP
+        run: |
+          python scripts/generate_ocr_prompt.py \
+            --font "$OCR_PROMPT_FONT" \
+            --output cmd/apiserver/ocr_prompt.webp
+
+      - name: Run OCR prompt asset test
+        working-directory: cmd/apiserver
+        run: go test ./...
+
+      - name: Commit regenerated asset if changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add cmd/apiserver/ocr_prompt.webp
+          if git diff --cached --quiet; then
+            echo "ocr_prompt.webp is already reproducible; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore(ocr): regenerate prompt WebP reproducibly"
+          git push

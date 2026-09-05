@@ -50,9 +50,27 @@ func TestReadStructuredFieldsObjectFallback(t *testing.T) {
 	}
 }
 
+func TestObjectResponseItemsArrayIsNotMisreadAsPositionalVendor(t *testing.T) {
+	raw := `{"vendor":"Costco","subtotal":18.99,"items":[{"name":"Pizza","quantity":1,"price":18.99}]}`
+	got := readStructuredFields(raw, nil)
+	if got.Vendor == nil || *got.Vendor != "Costco" {
+		t.Fatalf("vendor=%v", got.Vendor)
+	}
+	if len(got.Items) != 1 || got.Items[0].Name == nil || *got.Items[0].Name != "Pizza" {
+		t.Fatalf("items=%#v", got.Items)
+	}
+}
+
 func TestPositionalInvoiceIDLeadingZeros(t *testing.T) {
 	got := readStructuredFields(`[null,null,null,null,null,null,"00123456",[]]`, nil)
 	if got.InvoiceID == nil || *got.InvoiceID != "00123456" {
 		t.Fatalf("invoice_id=%v", got.InvoiceID)
+	}
+}
+
+func TestFencedPositionalJSON(t *testing.T) {
+	got := readStructuredFields("```json\n[\"Costco\",null,null,21.46,null,null,null,[]]\n```", nil)
+	if got.Vendor == nil || *got.Vendor != "Costco" {
+		t.Fatalf("vendor=%v", got.Vendor)
 	}
 }

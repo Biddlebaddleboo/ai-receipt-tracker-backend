@@ -1,0 +1,84 @@
+name: Update positional OCR date format
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/update-positional-date-format.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Pillow
+        run: python -m pip install --disable-pip-version-check "Pillow==12.3.0"
+      - name: Require MM-DD-YYYY purchase dates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          old = "purchase_date: extract the receipt purchase/transaction date as printed; use null if no clear date. "
+          new = "purchase_date: extract the receipt purchase/transaction date and output it in MM-DD-YYYY format (example: 09-05-2026); use null if no clear date. "
+
+          for name in ["cmd/apiserver/receipts.go", "scripts/generate_ocr_prompt_array.py"]:
+              p = Path(name)
+              s = p.read_text()
+              if old not in s:
+                  raise SystemExit(f"purchase-date prompt anchor missing in {name}")
+              p.write_text(s.replace(old, new, 1))
+          PY
+      - name: Regenerate positional prompt image
+        run: |
+          python scripts/generate_ocr_prompt_array.py \
+            --font /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf \
+            --png cmd/apiserver/ocr_prompt_array.png \
+            --webp cmd/apiserver/ocr_prompt_array.webp
+      - name: Update purchase-date prompt regression test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > cmd/apiserver/receipt_purchase_date_prompt_test.go <<'EOF'
+          package main
+
+          import (
+          	"strings"
+          	"testing"
+          )
+
+          func TestBuildOCRPromptExplicitlyRequestsPurchaseDate(t *testing.T) {
+          	prompt := buildOCRPrompt(nil)
+          	for _, phrase := range []string{
+          		"purchase_date: extract the receipt purchase/transaction date and output it in MM-DD-YYYY format",
+          		"example: 09-05-2026",
+          		"use null if no clear date",
+          	} {
+          		if !strings.Contains(prompt, phrase) {
+          			t.Fatalf("prompt does not explicitly require %q: %s", phrase, prompt)
+          		}
+          	}
+          }
+          EOF
+      - name: Format and test
+        run: |
+          cd cmd/apiserver
+          gofmt -w receipts.go receipt_purchase_date_prompt_test.go
+          go test ./...
+      - name: Commit update
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add cmd/apiserver/receipts.go cmd/apiserver/receipt_purchase_date_prompt_test.go cmd/apiserver/ocr_prompt_array.png cmd/apiserver/ocr_prompt_array.webp scripts/generate_ocr_prompt_array.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "fix(ocr): require MM-DD-YYYY purchase dates"
+          git pull --rebase origin main
+          git push

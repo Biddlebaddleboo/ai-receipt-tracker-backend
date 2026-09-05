@@ -1,0 +1,352 @@
+name: Positional JSON OCR experiment
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/positional-json-experiment.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  implement:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned Pillow
+        run: python -m pip install --disable-pip-version-check "Pillow==12.3.0"
+
+      - name: Download exact Fira Sans Regular font
+        shell: bash
+        run: |
+          set -euo pipefail
+          FONT="$RUNNER_TEMP/FiraSans-Regular.otf"
+          curl --fail --location --retry 4 --retry-delay 2 \
+            "https://ctan.math.illinois.edu/fonts/fira/opentype/FiraSans-Regular.otf" \
+            --output "$FONT"
+          echo "6249d77fa313215cd66a97b942041ddbca73664309ac5e25bd0ab937d727c96e  $FONT" | sha256sum --check --strict
+          echo "OCR_PROMPT_FONT=$FONT" >> "$GITHUB_ENV"
+
+      - name: Add positional JSON parser and tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > cmd/apiserver/ocr_positional.go <<'EOF'
+          package main
+
+          import (
+              "encoding/json"
+              "strings"
+          )
+
+          const (
+              ocrPosVendor = iota
+              ocrPosSubtotal
+              ocrPosTax
+              ocrPosTotal
+              ocrPosCategory
+              ocrPosPurchaseDate
+              ocrPosInvoiceID
+              ocrPosItems
+              ocrPosFieldCount
+          )
+
+          func extractPositionalJSON(rawText string) ([]interface{}, bool) {
+              trimmed := strings.TrimSpace(rawText)
+              if trimmed == "" {
+                  return nil, false
+              }
+              var payload []interface{}
+              if err := json.Unmarshal([]byte(trimmed), &payload); err == nil {
+                  return payload, true
+              }
+              start := strings.Index(trimmed, "[")
+              end := strings.LastIndex(trimmed, "]")
+              if start < 0 || end <= start {
+                  return nil, false
+              }
+              if err := json.Unmarshal([]byte(trimmed[start:end+1]), &payload); err != nil {
+                  return nil, false
+              }
+              return payload, true
+          }
+
+          func readPositionalStructuredFields(rawText string, payload []interface{}, categoryOptions []string) ocrResult {
+              at := func(index int) interface{} {
+                  if index < 0 || index >= len(payload) {
+                      return nil
+                  }
+                  return payload[index]
+              }
+
+              category := normalizeString(at(ocrPosCategory))
+              if len(categoryOptions) > 0 {
+                  category = validateReceiptCategory(category, categoryOptions)
+              }
+
+              return ocrResult{
+                  Text:         rawText,
+                  Vendor:       normalizeString(at(ocrPosVendor)),
+                  Subtotal:     normalizeAmount(at(ocrPosSubtotal)),
+                  Tax:          normalizeAmount(at(ocrPosTax)),
+                  Total:        normalizeAmount(at(ocrPosTotal)),
+                  Category:     category,
+                  PurchaseDate: normalizeString(at(ocrPosPurchaseDate)),
+                  InvoiceID:    normalizeMerchantIdentifier(at(ocrPosInvoiceID)),
+                  Items:        extractPositionalReceiptItems(at(ocrPosItems)),
+              }
+          }
+
+          func extractPositionalReceiptItems(raw interface{}) []ocrItem {
+              entries, ok := raw.([]interface{})
+              if !ok {
+                  return nil
+              }
+              items := make([]ocrItem, 0, len(entries))
+              for _, rawEntry := range entries {
+                  entry, ok := rawEntry.([]interface{})
+                  if !ok {
+                      continue
+                  }
+                  var nameRaw, quantityRaw, priceRaw interface{}
+                  if len(entry) > 0 { nameRaw = entry[0] }
+                  if len(entry) > 1 { quantityRaw = entry[1] }
+                  if len(entry) > 2 { priceRaw = entry[2] }
+                  name := normalizeString(nameRaw)
+                  quantity := normalizeAmount(quantityRaw)
+                  price := normalizeAmount(priceRaw)
+                  if name == nil && quantity == nil && price == nil {
+                      continue
+                  }
+                  items = append(items, ocrItem{Name: name, Quantity: quantity, Price: price})
+              }
+              return items
+          }
+          EOF
+
+          cat > cmd/apiserver/ocr_positional_test.go <<'EOF'
+          package main
+
+          import "testing"
+
+          func TestReadStructuredFieldsPositionalJSON(t *testing.T) {
+              raw := `["Costco",18.99,2.47,21.46,"Meals","2026-09-05","00123456",[["Pizza",1,18.99]]]`
+              got := readStructuredFields(raw, []string{"Meals"})
+              if got.Vendor == nil || *got.Vendor != "Costco" { t.Fatalf("vendor=%v", got.Vendor) }
+              if got.Subtotal == nil || *got.Subtotal != 18.99 { t.Fatalf("subtotal=%v", got.Subtotal) }
+              if got.Tax == nil || *got.Tax != 2.47 { t.Fatalf("tax=%v", got.Tax) }
+              if got.Total == nil || *got.Total != 21.46 { t.Fatalf("total=%v", got.Total) }
+              if got.Category == nil || *got.Category != "Meals" { t.Fatalf("category=%v", got.Category) }
+              if got.PurchaseDate == nil || *got.PurchaseDate != "2026-09-05" { t.Fatalf("purchase_date=%v", got.PurchaseDate) }
+              if got.InvoiceID == nil || *got.InvoiceID != "00123456" { t.Fatalf("invoice_id=%v", got.InvoiceID) }
+              if len(got.Items) != 1 { t.Fatalf("items=%#v", got.Items) }
+              if got.Items[0].Name == nil || *got.Items[0].Name != "Pizza" { t.Fatalf("item.name=%v", got.Items[0].Name) }
+              if got.Items[0].Quantity == nil || *got.Items[0].Quantity != 1 { t.Fatalf("item.quantity=%v", got.Items[0].Quantity) }
+              if got.Items[0].Price == nil || *got.Items[0].Price != 18.99 { t.Fatalf("item.price=%v", got.Items[0].Price) }
+          }
+
+          func TestReadStructuredFieldsObjectFallback(t *testing.T) {
+              raw := `{"vendor":"Costco","invoice_id":"00123456"}`
+              got := readStructuredFields(raw, nil)
+              if got.Vendor == nil || *got.Vendor != "Costco" { t.Fatalf("vendor=%v", got.Vendor) }
+              if got.InvoiceID == nil || *got.InvoiceID != "00123456" { t.Fatalf("invoice_id=%v", got.InvoiceID) }
+          }
+
+          func TestPositionalInvoiceIDLeadingZeros(t *testing.T) {
+              raw := `[null,null,null,null,null,null,"00123456",[]]`
+              got := readStructuredFields(raw, nil)
+              if got.InvoiceID == nil || *got.InvoiceID != "00123456" { t.Fatalf("invoice_id=%v", got.InvoiceID) }
+          }
+          EOF
+
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('cmd/apiserver/receipts.go')
+          s = p.read_text()
+          old = '''func readStructuredFields(rawText string, categoryOptions []string) ocrResult {\n\tpayload := extractJSON(rawText)'''
+          new = '''func readStructuredFields(rawText string, categoryOptions []string) ocrResult {\n\tif payload, ok := extractPositionalJSON(rawText); ok {\n\t\treturn readPositionalStructuredFields(rawText, payload, categoryOptions)\n\t}\n\tpayload := extractJSON(rawText)'''
+          if old not in s:
+              raise SystemExit('readStructuredFields anchor not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+      - name: Change OCR prompt to positional JSON
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('cmd/apiserver/receipts.go')
+          s = p.read_text()
+          start = s.index('func buildOCRPrompt(categoryOptions []string) string {')
+          end = s.index('\nfunc collectOCRText(', start)
+          replacement = r'''func buildOCRPrompt(categoryOptions []string) string {
+          	prompt := "Extract the readable text from this receipt image and summarize the line items and totals. " +
+          		"Then output only a positional JSON array in exactly this order: [vendor, subtotal, tax, total, category, purchase_date, invoice_id, items]. " +
+          		"The items value must be an array of positional arrays in exactly this order: [[name, quantity, price], ...]. " +
+          		"For invoice_id, extract only a clearly labelled merchant-issued identifier such as Invoice #, Invoice ID, Receipt #, Transaction ID, Transaction #, Order #, Reference #, Bill #, or an obviously equivalent label. " +
+          		"When present, invoice_id MUST ALWAYS be a JSON string, even if the merchant identifier consists entirely of digits (never a JSON number). Preserve every character exactly as printed, including letters, dashes, and leading zeros. " +
+          		"For example, if the receipt shows `Transaction #: 00123456`, the seventh array value must be `\"00123456\"`, not `123456`. " +
+          		"Do not invent or infer an identifier, and use null when no clear merchant-issued identifier exists. " +
+          		"Ensure subtotal equals the sum of each item's quantity multiplied by its price; if you can't confirm a scalar value, use null. Use [] when there are no confirmable items. Do not add any explanation outside the JSON array."
+          	if len(categoryOptions) == 0 {
+          		return prompt
+          	}
+          	return prompt + " Use these categories when guessing the receipt type: " +
+          		strings.Join(categoryOptions, ", ") +
+          		". If none match, use null for the category position."
+          }'''
+          p.write_text(s[:start] + replacement + s[end:])
+          PY
+
+      - name: Add positional prompt generator
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > scripts/generate_ocr_prompt_array.py <<'PY'
+          #!/usr/bin/env python3
+          import argparse
+          import struct
+          from pathlib import Path
+          from PIL import Image, ImageDraw, ImageFont
+
+          WIDTH = 159
+          FONT_SIZE = 8
+          MARGIN = 1
+          LINE_SPACING = 1
+          PROMPT = (
+              "Extract the readable text from this receipt image and summarize the line items and totals. "
+              "Then output only a positional JSON array in exactly this order: [vendor, subtotal, tax, total, category, purchase_date, invoice_id, items]. "
+              "The items value must be an array of positional arrays in exactly this order: [[name, quantity, price], ...]. "
+              "For invoice_id, extract only a clearly labelled merchant-issued identifier such as Invoice #, Invoice ID, Receipt #, Transaction ID, Transaction #, Order #, Reference #, Bill #, or an obviously equivalent label. "
+              "When present, invoice_id MUST ALWAYS be a JSON string, even if the merchant identifier consists entirely of digits (never a JSON number). Preserve every character exactly as printed, including letters, dashes, and leading zeros. "
+              "For example, if the receipt shows `Transaction #: 00123456`, the seventh array value must be `\"00123456\"`, not `123456`. "
+              "Do not invent or infer an identifier, and use null when no clear merchant-issued identifier exists. "
+              "Ensure subtotal equals the sum of each item's quantity multiplied by its price; if you can't confirm a scalar value, use null. Use [] when there are no confirmable items. Do not add any explanation outside the JSON array."
+          )
+
+          def wrap(draw, font, text, max_width):
+              lines = []
+              current = ""
+              for word in text.split():
+                  candidate = word if not current else current + " " + word
+                  if not current or draw.textlength(candidate, font=font) <= max_width:
+                      current = candidate
+                  else:
+                      lines.append(current)
+                      current = word
+              if current:
+                  lines.append(current)
+              return lines
+
+          def render(font_path):
+              font = ImageFont.truetype(str(font_path), FONT_SIZE)
+              probe = Image.new("RGB", (1, 1), "white")
+              draw = ImageDraw.Draw(probe)
+              lines = wrap(draw, font, PROMPT, WIDTH - 2 * MARGIN)
+              metrics = []
+              height = 2 * MARGIN
+              for i, line in enumerate(lines):
+                  bbox = draw.textbbox((0, 0), line, font=font)
+                  metrics.append((line, bbox))
+                  height += bbox[3] - bbox[1]
+                  if i != len(lines) - 1:
+                      height += LINE_SPACING
+              image = Image.new("RGB", (WIDTH, height), "white")
+              out = ImageDraw.Draw(image)
+              y = MARGIN
+              for line, bbox in metrics:
+                  l, t, r, b = bbox
+                  out.text((MARGIN - l, y - t), line, font=font, fill="black")
+                  y += (b - t) + LINE_SPACING
+              return image, len(lines)
+
+          def verify_webp(path):
+              data = path.read_bytes()
+              if data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+                  raise SystemExit("invalid WebP header")
+              expected = struct.unpack("<I", data[4:8])[0] + 8
+              if expected != len(data):
+                  raise SystemExit(f"truncated WebP: expected={expected} actual={len(data)}")
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--font", required=True)
+              ap.add_argument("--png", required=True)
+              ap.add_argument("--webp", required=True)
+              args = ap.parse_args()
+              image, line_count = render(Path(args.font))
+              png = Path(args.png)
+              webp = Path(args.webp)
+              png.parent.mkdir(parents=True, exist_ok=True)
+              image.save(png, format="PNG", optimize=True)
+              image.save(webp, format="WEBP", lossless=True, quality=100, method=6, exact=True)
+              verify_webp(webp)
+              patches = ((image.width + 31) // 32) * ((image.height + 31) // 32)
+              print(f"Positional prompt: {image.width}x{image.height}, lines={line_count}, patches={patches}, png={png.stat().st_size}, webp={webp.stat().st_size}")
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python scripts/generate_ocr_prompt_array.py \
+            --font "$OCR_PROMPT_FONT" \
+            --png cmd/apiserver/ocr_prompt_array.png \
+            --webp cmd/apiserver/ocr_prompt_array.webp
+
+      - name: Switch runtime to positional prompt asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('cmd/apiserver/openai_prompt_image.go')
+          s = p.read_text()
+          old = '//go:embed ocr_prompt.webp\nvar ocrSystemPromptWebP []byte'
+          new = '//go:embed ocr_prompt_array.webp\nvar ocrSystemPromptWebP []byte'
+          if old not in s:
+              raise SystemExit('prompt embed anchor not found')
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path('Dockerfile')
+          s = p.read_text()
+          old = 'COPY cmd/apiserver/ocr_prompt.webp ./ocr_prompt.webp\n'
+          new = old + 'COPY cmd/apiserver/ocr_prompt_array.webp ./ocr_prompt_array.webp\n'
+          if old not in s:
+              raise SystemExit('Dockerfile prompt copy anchor not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+      - name: Format and test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd cmd/apiserver
+          gofmt -w receipts.go ocr_positional.go ocr_positional_test.go openai_prompt_image.go
+          go test ./...
+
+      - name: Commit positional JSON experiment
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add \
+            Dockerfile \
+            cmd/apiserver/receipts.go \
+            cmd/apiserver/openai_prompt_image.go \
+            cmd/apiserver/ocr_positional.go \
+            cmd/apiserver/ocr_positional_test.go \
+            cmd/apiserver/ocr_prompt_array.png \
+            cmd/apiserver/ocr_prompt_array.webp \
+            scripts/generate_ocr_prompt_array.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "experiment(ocr): use positional JSON arrays"
+          git push

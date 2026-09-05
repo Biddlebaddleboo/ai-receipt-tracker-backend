@@ -29,11 +29,11 @@ func TestReceiptInvoiceIDExtractionPreservesMerchantIdentifier(t *testing.T) {
 func TestBuildOCRPromptRequiresStringInvoiceID(t *testing.T) {
 	prompt := buildOCRPrompt(nil)
 	for _, phrase := range []string{
-		"`invoice_id` MUST ALWAYS be a JSON string",
-		"even if the merchant identifier consists entirely of digits",
+		"invoice_id MUST ALWAYS be a JSON string",
+		"even if all digits",
 		"`Transaction #: 00123456`",
-		"`{\"invoice_id\": \"00123456\"}`",
-		"not `{\"invoice_id\": 123456}`",
+		"seventh value must be `\"00123456\"`",
+		"not `123456`",
 		"use null when no clear merchant-issued identifier exists",
 	} {
 		if !strings.Contains(prompt, phrase) {

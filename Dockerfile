@@ -7,6 +7,7 @@ COPY cmd/apiserver/go.sum ./go.sum
 COPY cmd/apiserver/*.go ./
 COPY cmd/apiserver/openapi.json ./openapi.json
 COPY cmd/apiserver/ocr_prompt.webp ./ocr_prompt.webp
+COPY cmd/apiserver/ocr_prompt_array.webp ./ocr_prompt_array.webp
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends build-essential && \

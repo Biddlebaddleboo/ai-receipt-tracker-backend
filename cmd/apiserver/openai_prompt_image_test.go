@@ -37,7 +37,7 @@ func TestRewriteOCRPromptAsUserImage(t *testing.T) {
 	if promptImage.ImageURL == "" || len(ocrSystemPromptWebP) == 0 {
 		t.Fatal("expected embedded OCR prompt image")
 	}
-	if payload.Input[1].Content[1].Text != "Use these categories when guessing the receipt type: Meals, Office. If none match, respond with null for the `category` key." {
+	if payload.Input[1].Content[1].Text != "Use these categories when guessing the receipt type: Meals, Office. If none match, use null for the category position." {
 		t.Fatalf("unexpected category instruction: %q", payload.Input[1].Content[1].Text)
 	}
 	receiptImage := payload.Input[1].Content[2]

@@ -10,7 +10,7 @@ import (
 	"strings"
 )
 
-//go:embed ocr_prompt.webp
+//go:embed ocr_prompt_array.webp
 var ocrSystemPromptWebP []byte
 
 var ocrSystemPromptDataURL = "data:image/webp;base64," + base64.StdEncoding.EncodeToString(ocrSystemPromptWebP)

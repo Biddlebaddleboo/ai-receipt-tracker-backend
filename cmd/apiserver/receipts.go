@@ -1051,24 +1051,16 @@ func (s *apiServer) attachSignedImageURL(ctx context.Context, data map[string]in
 }
 
 func buildOCRPrompt(categoryOptions []string) string {
-	prompt := "Extract the readable text from this receipt image and summarize the line items and totals. " +
-		"After the summary, output a JSON object with the following keys: `vendor`, `subtotal`, `tax`, `total`, " +
-		"`category`, `purchase_date`, `invoice_id`, and `items`. For `invoice_id`, extract only a clearly labelled " +
-		"merchant-issued identifier such as Invoice #, Invoice ID, Receipt #, Transaction ID, Transaction #, Order #, " +
-		"Reference #, Bill #, or an obviously equivalent label. When present, `invoice_id` MUST ALWAYS be a JSON string, " +
-		"even if the merchant identifier consists entirely of digits (never a JSON number). Preserve every character " +
-		"exactly as printed, including letters, dashes, and leading zeros. For example, if the receipt shows " +
-		"`Transaction #: 00123456`, return `{\"invoice_id\": \"00123456\"}`, not `{\"invoice_id\": 123456}`. " +
-		"Do not invent or infer an identifier, and use null when no clear merchant-issued identifier exists. " +
-		"The `items` array should include objects with `name`, `quantity`, " +
-		"and `price`. Ensure the `subtotal` equals the sum of each item's `quantity` multiplied by its `price`; if you " +
-		"can't confirm a value, set it to null. Do not add any explanation outside the JSON object."
+	prompt := "Extract the readable text from this receipt image and line items/totals. Output only this positional JSON array: " +
+		"[vendor,subtotal,tax,total,category,purchase_date,invoice_id,items], where items=[[name,quantity,price],...]. " +
+		"invoice_id: only a clearly labelled merchant-issued ID such as Invoice #, Invoice ID, Receipt #, Transaction ID, Transaction #, Order #, Reference #, Bill #, or obvious equivalent. " +
+		"If present, invoice_id MUST ALWAYS be a JSON string even if all digits; preserve exact characters including letters, dashes, and leading zeros. " +
+		"If `Transaction #: 00123456`, the seventh value must be `\"00123456\"`, not `123456`. Never invent or infer an ID; use null when no clear merchant-issued identifier exists. " +
+		"subtotal must equal sum(quantity*price). Unknown scalar=null; no confirmable items=[]. JSON only."
 	if len(categoryOptions) == 0 {
 		return prompt
 	}
-	return prompt + " Use these categories when guessing the receipt type: " +
-		strings.Join(categoryOptions, ", ") +
-		". If none match, respond with null for the `category` key."
+	return prompt + " Use these categories when guessing the receipt type: " + strings.Join(categoryOptions, ", ") + ". If none match, use null for the category position."
 }
 
 func collectOCRText(envelope openAIResponsesEnvelope) string {
@@ -1087,6 +1079,9 @@ func collectOCRText(envelope openAIResponsesEnvelope) string {
 }
 
 func readStructuredFields(rawText string, categoryOptions []string) ocrResult {
+	if payload, ok := extractPositionalJSON(rawText); ok {
+		return readPositionalStructuredFields(rawText, payload, categoryOptions)
+	}
 	payload := extractJSON(rawText)
 	vendor := normalizeString(firstPresent(payload, "vendor", "store", "merchant", "merchant_name", "store_name"))
 	subtotal := normalizeAmount(firstPresent(payload, "subtotal", "sub_total", "pre_tax"))

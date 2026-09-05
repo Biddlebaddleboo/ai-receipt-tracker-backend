@@ -10,10 +10,10 @@ import (
 	"strings"
 )
 
-//go:embed ocr_prompt.png
-var ocrSystemPromptPNG []byte
+//go:embed ocr_prompt.webp
+var ocrSystemPromptWebP []byte
 
-var ocrSystemPromptDataURL = "data:image/png;base64," + base64.StdEncoding.EncodeToString(ocrSystemPromptPNG)
+var ocrSystemPromptDataURL = "data:image/webp;base64," + base64.StdEncoding.EncodeToString(ocrSystemPromptWebP)
 
 const ocrCategoryPromptMarker = " Use these categories when guessing the receipt type: "
 const ocrSystemInstruction = "Follow the first image."

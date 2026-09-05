@@ -21,6 +21,23 @@ jobs:
         run: python -m pip install --disable-pip-version-check "Pillow==12.3.0"
       - name: Apply positional experiment
         run: python scripts/apply_positional_experiment.py --font /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+      - name: Preserve OCR transport prompt prefix
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          old = "Extract readable receipt text and line items/totals."
+          new = "Extract the readable text from this receipt image and line items/totals."
+          for name in ["cmd/apiserver/receipts.go", "scripts/generate_ocr_prompt_array.py"]:
+              p = Path(name)
+              s = p.read_text()
+              if old not in s:
+                  raise SystemExit(f"prompt prefix anchor missing in {name}")
+              p.write_text(s.replace(old, new))
+          PY
+          python scripts/generate_ocr_prompt_array.py \
+            --font /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf \
+            --png cmd/apiserver/ocr_prompt_array.png \
+            --webp cmd/apiserver/ocr_prompt_array.webp
       - name: Format and test
         run: |
           cd cmd/apiserver

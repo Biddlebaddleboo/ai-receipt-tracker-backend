@@ -65,15 +65,31 @@ type signedUploadRequest struct {
 }
 
 type finalizeUploadRequest struct {
-	StoragePath    string   `json:"storage_path"`
-	Vendor         *string  `json:"vendor"`
-	Subtotal       *float64 `json:"subtotal"`
-	Tax            *float64 `json:"tax"`
-	Total          *float64 `json:"total"`
-	Category       *string  `json:"category"`
-	PurchaseDate   *string  `json:"purchase_date"`
-	InvoiceID      *string  `json:"invoice_id"`
-	ImageGrayscale *bool    `json:"image_grayscale"`
+	StoragePath        string                     `json:"storage_path"`
+	Vendor             *string                    `json:"vendor"`
+	Subtotal           *float64                   `json:"subtotal"`
+	Tax                *float64                   `json:"tax"`
+	Total              *float64                   `json:"total"`
+	Category           *string                    `json:"category"`
+	PurchaseDate       *string                    `json:"purchase_date"`
+	InvoiceID          *string                    `json:"invoice_id"`
+	ImageGrayscale     *bool                      `json:"image_grayscale"`
+	FrontendExtraction *frontendExtractionPayload `json:"frontend_extraction"`
+}
+
+type frontendTrustedField struct {
+	Value      string  `json:"value"`
+	Confidence float64 `json:"confidence"`
+	Status     string  `json:"status"`
+	Source     string  `json:"source"`
+	Evidence   string  `json:"evidence,omitempty"`
+}
+
+type frontendExtractionPayload struct {
+	Mode             string                          `json:"mode"`
+	TrustedFields    map[string]frontendTrustedField `json:"trusted_fields"`
+	UnresolvedFields []string                        `json:"unresolved_fields"`
+	OCRText          string                          `json:"ocr_text,omitempty"`
 }
 
 type openAIResponsesRequest struct {
@@ -550,13 +566,14 @@ func (s *apiServer) finalizeSignedUpload(writer http.ResponseWriter, request *ht
 		return
 	}
 	job := receiptJob{
-		ID:             receiptID,
-		OwnerEmail:     ownerEmail,
-		StoragePath:    storagePath,
-		ImageGrayscale: payload.ImageGrayscale != nil && *payload.ImageGrayscale,
-		DetailRef:      detailRef,
-		ShardRef:       shardRef,
-		CreatedAt:      now,
+		ID:                 receiptID,
+		OwnerEmail:         ownerEmail,
+		StoragePath:        storagePath,
+		ImageGrayscale:     payload.ImageGrayscale != nil && *payload.ImageGrayscale,
+		DetailRef:          detailRef,
+		ShardRef:           shardRef,
+		CreatedAt:          now,
+		FrontendExtraction: payload.FrontendExtraction,
 	}
 	s.processReceiptJob(request.Context(), job)
 	updated, err := s.getOwnedReceipt(request.Context(), receiptID, ownerEmail)
@@ -847,16 +864,21 @@ func categoryNamesFromMapValue(value interface{}) []string {
 }
 
 type receiptJob struct {
-	ID             string
-	OwnerEmail     string
-	StoragePath    string
-	ImageGrayscale bool
-	DetailRef      *fs.DocumentRef
-	ShardRef       *fs.DocumentRef
-	CreatedAt      time.Time
+	ID                 string
+	OwnerEmail         string
+	StoragePath        string
+	ImageGrayscale     bool
+	DetailRef          *fs.DocumentRef
+	ShardRef           *fs.DocumentRef
+	CreatedAt          time.Time
+	FrontendExtraction *frontendExtractionPayload
 }
 
 func (s *apiServer) processReceiptJob(ctx context.Context, job receiptJob) {
+	if job.FrontendExtraction != nil {
+		s.processFrontendReceiptJob(ctx, job)
+		return
+	}
 	categoryOptions, err := s.categoryNames(ctx, job.OwnerEmail)
 	if err != nil {
 		s.markReceiptProcessingFailed(ctx, job, err)
@@ -938,6 +960,147 @@ func (s *apiServer) processReceiptJob(ctx context.Context, job receiptJob) {
 	}
 }
 
+func validateFrontendExtraction(payload *frontendExtractionPayload) (ocrResult, []string, error) {
+	if payload == nil {
+		return ocrResult{}, nil, nil
+	}
+	if payload.Mode != "remaining" && payload.Mode != "entire" && payload.Mode != "none" {
+		return ocrResult{}, nil, fmt.Errorf("invalid frontend extraction mode")
+	}
+	allowed := map[string]bool{"vendor": true, "purchase_date": true, "subtotal": true, "tax": true, "total": true}
+	result := ocrResult{Text: strings.TrimSpace(payload.OCRText)}
+	for key, field := range payload.TrustedFields {
+		if !allowed[key] {
+			return ocrResult{}, nil, fmt.Errorf("unsupported trusted frontend field %q", key)
+		}
+		if strings.TrimSpace(field.Value) == "" || field.Status != "trusted" {
+			return ocrResult{}, nil, fmt.Errorf("trusted frontend field %q is not trusted", key)
+		}
+		if field.Source != "manual" && (field.Source != "browser-ocr" && field.Source != "rule" || field.Confidence < 0.92) {
+			return ocrResult{}, nil, fmt.Errorf("trusted frontend field %q failed confidence validation", key)
+		}
+		switch key {
+		case "vendor":
+			result.Vendor = normalizeString(field.Value)
+		case "purchase_date":
+			result.PurchaseDate = normalizeString(field.Value)
+		case "subtotal":
+			result.Subtotal = normalizeAmount(field.Value)
+		case "tax":
+			result.Tax = normalizeAmount(field.Value)
+		case "total":
+			result.Total = normalizeAmount(field.Value)
+		}
+	}
+	if payload.Mode == "entire" {
+		return ocrResult{}, []string{"vendor", "purchase_date", "subtotal", "tax", "total"}, nil
+	}
+	seen := map[string]bool{}
+	unresolved := make([]string, 0, len(payload.UnresolvedFields))
+	for _, key := range payload.UnresolvedFields {
+		if !allowed[key] || seen[key] {
+			if !allowed[key] {
+				return ocrResult{}, nil, fmt.Errorf("unsupported unresolved frontend field %q", key)
+			}
+			continue
+		}
+		seen[key] = true
+		unresolved = append(unresolved, key)
+	}
+	for key := range allowed {
+		if _, trusted := payload.TrustedFields[key]; !trusted && !seen[key] {
+			unresolved = append(unresolved, key)
+		}
+	}
+	sort.Strings(unresolved)
+	return result, unresolved, nil
+}
+
+func mergeFrontendOCR(base, ai ocrResult, unresolved []string) ocrResult {
+	merged := base
+	for _, key := range unresolved {
+		switch key {
+		case "vendor":
+			merged.Vendor = ai.Vendor
+		case "purchase_date":
+			merged.PurchaseDate = ai.PurchaseDate
+		case "subtotal":
+			merged.Subtotal = ai.Subtotal
+		case "tax":
+			merged.Tax = ai.Tax
+		case "total":
+			merged.Total = ai.Total
+		}
+	}
+	return merged
+}
+
+func (s *apiServer) processFrontendReceiptJob(ctx context.Context, job receiptJob) {
+	base, unresolved, err := validateFrontendExtraction(job.FrontendExtraction)
+	if err != nil {
+		s.markReceiptProcessingFailed(ctx, job, err)
+		return
+	}
+	ocrRes := base
+	if len(unresolved) > 0 {
+		imageURL, imageErr := s.signedImageURL(ctx, job.StoragePath)
+		if imageErr != nil {
+			s.markReceiptProcessingFailed(ctx, job, imageErr)
+			return
+		}
+		aiResult, aiErr := s.extractReceiptOCRFields(ctx, imageURL, unresolved)
+		if aiErr != nil {
+			s.markReceiptProcessingFailed(ctx, job, aiErr)
+			return
+		}
+		ocrRes = mergeFrontendOCR(base, aiResult, unresolved)
+	}
+
+	itemsPayload := []map[string]interface{}{}
+	extractedFields := map[string]interface{}{
+		"frontend_first":             true,
+		"gpt_fields":                 unresolved,
+		"ai_skipped":                 len(unresolved) == 0,
+		"frontend_ocr_text_length":   len(base.Text),
+		"frontend_fields":            job.FrontendExtraction.TrustedFields,
+		"frontend_unresolved_fields": job.FrontendExtraction.UnresolvedFields,
+	}
+	detailUpdate := map[string]interface{}{
+		"owner_email":      ownerEmailOrFallback(job.OwnerEmail),
+		"vendor":           ocrRes.Vendor,
+		"subtotal":         ocrRes.Subtotal,
+		"tax":              ocrRes.Tax,
+		"total":            ocrRes.Total,
+		"purchase_date":    ocrRes.PurchaseDate,
+		"items":            itemsPayload,
+		"extracted_text":   base.Text,
+		"extracted_fields": extractedFields,
+	}
+	if job.DetailRef != nil && job.ShardRef != nil {
+		batch := s.firestore.Batch()
+		batch.Set(job.DetailRef, detailUpdate, fs.MergeAll)
+		createdAt := job.CreatedAt
+		if createdAt.IsZero() {
+			createdAt = time.Now().UTC()
+		}
+		metadataSummary := buildReceiptMetadataSummary(job.OwnerEmail, ocrRes.Vendor, ocrRes.Total, ocrRes.PurchaseDate, nil, nil, createdAt)
+		if job.ImageGrayscale {
+			metadataSummary["image_grayscale"] = true
+		}
+		batch.Update(job.ShardRef, []fs.Update{
+			{Path: fmt.Sprintf("%s.%s", receiptShardMetadataField, job.ID), Value: metadataSummary},
+			{Path: "updated_at", Value: time.Now().UTC()},
+		})
+		if _, err := batch.Commit(ctx); err != nil {
+			s.markReceiptProcessingFailed(ctx, job, err)
+		}
+		return
+	}
+	if _, err := s.receipts.Doc(job.ID).Set(ctx, detailUpdate, fs.MergeAll); err != nil {
+		s.markReceiptProcessingFailed(ctx, job, err)
+	}
+}
+
 func (s *apiServer) markReceiptProcessingFailed(ctx context.Context, job receiptJob, err error) {
 	extractedFields := map[string]interface{}{
 		"ocr_error": err.Error(),
@@ -1009,6 +1172,99 @@ func (s *apiServer) extractReceiptOCR(ctx context.Context, imageURL string, cate
 	}
 	rawText := collectOCRText(envelope)
 	return readStructuredFields(rawText, categoryOptions), nil
+}
+
+func (s *apiServer) extractReceiptOCRFields(ctx context.Context, imageURL string, unresolved []string) (ocrResult, error) {
+	if strings.TrimSpace(s.cfg.openAIAPIKey) == "" {
+		return ocrResult{}, fmt.Errorf("OPENAI_API_KEY is required")
+	}
+	payload := openAIResponsesRequest{
+		Model: s.cfg.openAIModel,
+		Input: []openAIInputMessage{{
+			Role: "user",
+			Content: []openAIInputContent{
+				{Type: "input_text", Text: buildFrontendResolutionPrompt(unresolved)},
+				{Type: "input_image", ImageURL: imageURL, Detail: "low"},
+			},
+		}},
+		Temperature: 0,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return ocrResult{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, openAIResponsesURL, bytes.NewReader(body))
+	if err != nil {
+		return ocrResult{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+s.cfg.openAIAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 2 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ocrResult{}, err
+	}
+	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ocrResult{}, err
+	}
+	var envelope openAIResponsesEnvelope
+	if err := json.Unmarshal(responseBody, &envelope); err != nil {
+		return ocrResult{}, err
+	}
+	if resp.StatusCode >= 400 {
+		if envelope.Error != nil && strings.TrimSpace(envelope.Error.Message) != "" {
+			return ocrResult{}, fmt.Errorf("OpenAI API error: %s", envelope.Error.Message)
+		}
+		return ocrResult{}, fmt.Errorf("OpenAI API error: status %d", resp.StatusCode)
+	}
+	return readFrontendResolution(collectOCRText(envelope), unresolved), nil
+}
+
+func buildFrontendResolutionPrompt(unresolved []string) string {
+	allowed := map[string]string{
+		"vendor":        "store name",
+		"purchase_date": "receipt purchase date in YYYY-MM-DD format",
+		"subtotal":      "subtotal as a number",
+		"tax":           "tax as a number; do not infer it from other amounts",
+		"total":         "total as a number",
+	}
+	fields := make([]string, 0, len(unresolved))
+	for _, key := range unresolved {
+		if description, ok := allowed[key]; ok {
+			fields = append(fields, key+" ("+description+")")
+		}
+	}
+	sort.Strings(fields)
+	return "Resolve only these unresolved receipt fields: " + strings.Join(fields, ", ") + ". Return one JSON object containing only these keys. Use null when the requested value is not clearly readable. Never guess, and do not return or alter any other receipt field."
+}
+
+func readFrontendResolution(rawText string, unresolved []string) ocrResult {
+	payload := extractJSON(rawText)
+	allowed := map[string]bool{}
+	for _, key := range unresolved {
+		allowed[key] = true
+	}
+	result := ocrResult{Text: rawText}
+	for key, value := range payload {
+		if !allowed[key] {
+			continue
+		}
+		switch key {
+		case "vendor":
+			result.Vendor = normalizeString(value)
+		case "purchase_date":
+			result.PurchaseDate = normalizeString(value)
+		case "subtotal":
+			result.Subtotal = normalizeAmount(value)
+		case "tax":
+			result.Tax = normalizeAmount(value)
+		case "total":
+			result.Total = normalizeAmount(value)
+		}
+	}
+	return result
 }
 
 func (s *apiServer) signedImageURL(ctx context.Context, storagePath string) (string, error) {

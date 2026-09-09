@@ -976,7 +976,7 @@ func validateFrontendExtraction(payload *frontendExtractionPayload) (ocrResult, 
 		if strings.TrimSpace(field.Value) == "" || field.Status != "trusted" {
 			return ocrResult{}, nil, fmt.Errorf("trusted frontend field %q is not trusted", key)
 		}
-		if field.Source != "manual" && (field.Source != "browser-ocr" && field.Source != "rule" || field.Confidence < 0.92) {
+		if field.Source != "manual" && (field.Source != "browser-ocr" && field.Source != "rule" && field.Source != "ml" || field.Confidence < 0.92) {
 			return ocrResult{}, nil, fmt.Errorf("trusted frontend field %q failed confidence validation", key)
 		}
 		switch key {

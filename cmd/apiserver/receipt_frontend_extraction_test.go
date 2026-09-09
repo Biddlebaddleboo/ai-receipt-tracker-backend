@@ -37,6 +37,25 @@ func TestValidateFrontendExtractionRejectsLowConfidenceTrustedField(t *testing.T
 	}
 }
 
+func TestValidateFrontendExtractionAcceptsCalibratedMLField(t *testing.T) {
+	got, unresolved, err := validateFrontendExtraction(&frontendExtractionPayload{
+		Mode: "remaining",
+		TrustedFields: map[string]frontendTrustedField{
+			"purchase_date": {Value: "2026-09-25", Confidence: 0.94, Status: "trusted", Source: "ml"},
+		},
+		UnresolvedFields: []string{"vendor"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PurchaseDate == nil || *got.PurchaseDate != "2026-09-25" {
+		t.Fatalf("purchase_date=%v", got.PurchaseDate)
+	}
+	if len(unresolved) != 4 {
+		t.Fatalf("unresolved=%v", unresolved)
+	}
+}
+
 func TestFrontendResolutionPromptOnlyNamesUnresolvedFields(t *testing.T) {
 	prompt := buildFrontendResolutionPrompt([]string{"tax", "purchase_date"})
 	if !strings.Contains(prompt, "tax") || !strings.Contains(prompt, "purchase_date") {

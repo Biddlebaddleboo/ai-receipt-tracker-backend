@@ -1415,6 +1415,18 @@ func (s *apiServer) normalizePrepaidCardUpdate(ctx context.Context, ownerEmail s
 	}
 	update := map[string]interface{}{}
 	newPANProvided := false
+	if barcode := digitsOnly(input.ActivationBarcode); barcode != "" {
+		if !prepaidDigits30.MatchString(barcode) {
+			return nil, httpError{status: http.StatusBadRequest, detail: "activation_barcode must be exactly 30 digits"}
+		}
+		update["activation_barcode"] = barcode
+	}
+	if serial := digitsOnly(firstNonEmptyString(input.VanillaSerial, input.SerialNumber)); serial != "" {
+		if !prepaidDigits11.MatchString(serial) {
+			return nil, httpError{status: http.StatusBadRequest, detail: "vanilla_serial must be exactly 11 digits"}
+		}
+		update["vanilla_serial"] = serial
+	}
 	activationReceiptID := strings.TrimSpace(input.ActivationReceiptID)
 	if input.activationReceiptIDSet || activationReceiptID != "" {
 		if err := validatePrepaidActivationReceiptID(activationReceiptID, validActivationReceiptIDs...); err != nil {

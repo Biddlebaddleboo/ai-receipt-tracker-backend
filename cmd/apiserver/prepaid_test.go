@@ -314,6 +314,29 @@ func TestNormalizePrepaidCardUpdatePreservesBarcodeSerial(t *testing.T) {
 	}
 }
 
+func TestNormalizePrepaidCardUpdateAllowsBarcodeAndSerialEdits(t *testing.T) {
+	server := &apiServer{}
+	update, err := server.normalizePrepaidCardUpdate(requestContext(), "owner@example.com", prepaidCardInput{
+		ActivationBarcode: "999999999999999999999999999999",
+		VanillaSerial:     "98765432109",
+		Confirmed:         true,
+	}, time.Now().UTC(), map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("unexpected update error: %v", err)
+	}
+	if update["activation_barcode"] != "999999999999999999999999999999" || update["vanilla_serial"] != "98765432109" {
+		t.Fatalf("expected barcode/serial update, got %#v", update)
+	}
+
+	_, err = server.normalizePrepaidCardUpdate(requestContext(), "owner@example.com", prepaidCardInput{
+		ActivationBarcode: "123",
+		Confirmed:         true,
+	}, time.Now().UTC(), map[string]interface{}{})
+	if err == nil {
+		t.Fatal("expected invalid barcode update to be rejected")
+	}
+}
+
 func TestNormalizePrepaidCardUpdateUsesNewPANLast4(t *testing.T) {
 	server := &apiServer{}
 	now := time.Now().UTC()

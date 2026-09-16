@@ -230,17 +230,16 @@ func TestPrepaidCardActivationAssociationValidationAndPatchPresence(t *testing.T
 		ActivationReceiptID: "activation-1",
 		Confirmed:           true,
 	}
-	cards, err := server.normalizePrepaidCardInputs(requestContext(), "owner@example.com", []prepaidCardInput{base, base}, time.Now().UTC(), validIDs)
+	if _, err := server.normalizePrepaidCardInputs(requestContext(), "owner@example.com", []prepaidCardInput{base, base}, time.Now().UTC(), validIDs); err == nil {
+		t.Fatal("expected duplicate activation association to be rejected")
+	}
+	cards, err := server.normalizePrepaidCardInputs(requestContext(), "owner@example.com", []prepaidCardInput{base}, time.Now().UTC(), validIDs)
 	if err != nil {
-		t.Fatalf("normalize associated cards: %v", err)
+		t.Fatalf("normalize associated card: %v", err)
 	}
-	if len(cards) != 2 {
-		t.Fatalf("expected one activation receipt to link to both cards, got %#v", cards)
-	}
-	firstCard := cards[0].(map[string]interface{})
-	secondCard := cards[1].(map[string]interface{})
-	if firstCard["activation_receipt_id"] != "activation-1" || secondCard["activation_receipt_id"] != "activation-1" {
-		t.Fatalf("expected one activation receipt to link to both cards, got %#v", cards)
+	card := cards[0].(map[string]interface{})
+	if card["activation_receipt_id"] != "activation-1" {
+		t.Fatalf("expected activation receipt association, got %#v", card)
 	}
 	optional := base
 	optional.ActivationReceiptID = ""

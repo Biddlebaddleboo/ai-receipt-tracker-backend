@@ -43,15 +43,16 @@ const (
 )
 
 type prepaidPurchaseRecord struct {
-	ID                 string                     `json:"id"`
-	OwnerEmail         string                     `json:"owner_email"`
-	SalesReceiptID     string                     `json:"sales_receipt_id"`
-	ActivationReceipts []prepaidActivationReceipt `json:"activation_receipts"`
-	Cards              []prepaidCardRecord        `json:"cards"`
-	ActiveCardCount    int                        `json:"active_card_count"`
-	ArchivedCardCount  int                        `json:"archived_card_count"`
-	CreatedAt          string                     `json:"created_at,omitempty"`
-	UpdatedAt          string                     `json:"updated_at,omitempty"`
+	ID                  string                     `json:"id"`
+	OwnerEmail          string                     `json:"owner_email"`
+	SalesReceiptID      string                     `json:"sales_receipt_id"`
+	ActivationReceipts  []prepaidActivationReceipt `json:"activation_receipts"`
+	Cards               []prepaidCardRecord        `json:"cards"`
+	ActiveCardCount     int                        `json:"active_card_count"`
+	ArchivedCardCount   int                        `json:"archived_card_count"`
+	PendingImageCleanup []string                   `json:"pending_image_cleanup,omitempty"`
+	CreatedAt           string                     `json:"created_at,omitempty"`
+	UpdatedAt           string                     `json:"updated_at,omitempty"`
 }
 
 type prepaidActivationReceipt struct {
@@ -294,22 +295,55 @@ func (s *apiServer) handlePrepaidPurchasePath(writer http.ResponseWriter, reques
 		s.getPrepaidPurchase(writer, request, user, purchaseID)
 	case len(parts) == 2 && parts[1] == "activation-receipts" && request.Method == http.MethodPost:
 		s.addPrepaidActivationReceipt(writer, request, user, purchaseID)
+	case len(parts) == 3 && parts[1] == "activation-receipts" && request.Method == http.MethodDelete:
+		s.deletePrepaidActivationReceipt(writer, request, user, purchaseID, strings.TrimSpace(parts[2]))
+	case len(parts) == 4 && parts[1] == "activation-receipts" && parts[3] == "replace-image" && request.Method == http.MethodPost:
+		s.replacePrepaidActivationReceiptImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]))
 	case len(parts) == 2 && parts[1] == "cards" && request.Method == http.MethodPost:
 		s.addPrepaidCard(writer, request, user, purchaseID)
+	case len(parts) == 3 && parts[1] == "cards" && request.Method == http.MethodDelete:
+		s.deletePrepaidCard(writer, request, user, purchaseID, strings.TrimSpace(parts[2]))
 	case len(parts) == 3 && parts[1] == "cards" && request.Method == http.MethodGet:
 		s.getPrepaidCardDetail(writer, request, user, purchaseID, strings.TrimSpace(parts[2]))
 	case len(parts) == 3 && parts[1] == "cards" && request.Method == http.MethodPatch:
 		s.updatePrepaidCard(writer, request, user, purchaseID, strings.TrimSpace(parts[2]))
 	case len(parts) == 4 && parts[1] == "activation-receipts" && parts[3] == "image" && request.Method == http.MethodGet:
 		s.signPrepaidActivationReceiptImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]))
+	case len(parts) == 4 && parts[1] == "activation-receipts" && parts[3] == "image" && request.Method == http.MethodDelete:
+		s.deletePrepaidActivationReceiptImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]))
+	case len(parts) == 4 && parts[1] == "activation-receipts" && parts[3] == "image" && request.Method == http.MethodPost:
+		s.replacePrepaidActivationReceiptImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]))
 	case len(parts) == 4 && parts[1] == "cards" && parts[3] == "package-image" && request.Method == http.MethodGet:
 		s.signPrepaidCardImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]), prepaidImagePackage)
+	case len(parts) == 4 && parts[1] == "cards" && parts[3] == "package-image" && request.Method == http.MethodDelete:
+		s.deletePrepaidCardImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]), prepaidImagePackage)
+	case len(parts) == 4 && parts[1] == "cards" && parts[3] == "package-image" && request.Method == http.MethodPost:
+		s.replacePrepaidCardImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]), prepaidImagePackage)
 	case len(parts) == 4 && parts[1] == "cards" && parts[3] == "card-front-image" && request.Method == http.MethodGet:
 		s.signPrepaidCardImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]), prepaidImageCardFront)
+	case len(parts) == 4 && parts[1] == "cards" && parts[3] == "card-front-image" && request.Method == http.MethodDelete:
+		s.deletePrepaidCardImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]), prepaidImageCardFront)
+	case len(parts) == 4 && parts[1] == "cards" && parts[3] == "card-front-image" && request.Method == http.MethodPost:
+		s.replacePrepaidCardImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]), prepaidImageCardFront)
 	case len(parts) == 4 && parts[1] == "cards" && parts[3] == "card-back-image" && request.Method == http.MethodGet:
 		s.signPrepaidCardImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]), prepaidImageCardBack)
+	case len(parts) == 4 && parts[1] == "cards" && parts[3] == "card-back-image" && request.Method == http.MethodDelete:
+		s.deletePrepaidCardImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]), prepaidImageCardBack)
+	case len(parts) == 4 && parts[1] == "cards" && parts[3] == "card-back-image" && request.Method == http.MethodPost:
+		s.replacePrepaidCardImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]), prepaidImageCardBack)
 	case len(parts) == 4 && parts[1] == "cards" && parts[3] == "opened-card-image" && request.Method == http.MethodGet:
 		s.signPrepaidCardImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]), prepaidImageOpenedCard)
+	case len(parts) == 4 && parts[1] == "cards" && parts[3] == "opened-card-image" && request.Method == http.MethodDelete:
+		s.deletePrepaidCardImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]), prepaidImageOpenedCard)
+	case len(parts) == 4 && parts[1] == "cards" && parts[3] == "opened-card-image" && request.Method == http.MethodPost:
+		s.replacePrepaidCardImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]), prepaidImageOpenedCard)
+	case len(parts) == 5 && parts[1] == "cards" && parts[3] == "replace-image" && request.Method == http.MethodPost:
+		imageType, ok := prepaidImageTypeFromRoute(parts[4])
+		if !ok || imageType == prepaidImageActivation {
+			writeJSONError(writer, http.StatusNotFound, "Not found")
+			return
+		}
+		s.replacePrepaidCardImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]), imageType)
 	case len(parts) == 4 && parts[1] == "cards" && parts[3] == "archive" && request.Method == http.MethodPost:
 		s.archivePrepaidCard(writer, request, user, purchaseID, strings.TrimSpace(parts[2]))
 	default:
@@ -538,6 +572,7 @@ func (s *apiServer) cleanupArchivedPrepaidPurchase(ctx context.Context, purchase
 	updated := purchase
 	updated.Cards = append([]prepaidCardRecord(nil), purchase.Cards...)
 	updated.ActivationReceipts = append([]prepaidActivationReceipt(nil), purchase.ActivationReceipts...)
+	updated.PendingImageCleanup = append([]string(nil), purchase.PendingImageCleanup...)
 	changed := false
 
 	if strings.TrimSpace(purchase.SalesReceiptID) != "" {
@@ -609,6 +644,36 @@ func (s *apiServer) cleanupArchivedPrepaidPurchase(ctx context.Context, purchase
 		}
 	}
 
+	current := make(map[string]struct{})
+	for _, receipt := range updated.ActivationReceipts {
+		if path := strings.TrimSpace(receipt.StoragePath); path != "" {
+			current[path] = struct{}{}
+		}
+	}
+	for _, card := range updated.Cards {
+		for _, path := range []string{card.PackageImageStoragePath, card.CardFrontImageStoragePath, card.CardBackImageStoragePath, card.OpenedCardImageStoragePath} {
+			if path = strings.TrimSpace(path); path != "" {
+				current[path] = struct{}{}
+			}
+		}
+	}
+	remainingPending := make([]string, 0, len(updated.PendingImageCleanup))
+	for _, path := range dedupePrepaidPaths(updated.PendingImageCleanup) {
+		if _, stillCurrent := current[path]; stillCurrent {
+			changed = true
+			continue
+		}
+		if err := s.deletePrepaidImage(ctx, purchase.OwnerEmail, path); err != nil {
+			summary.ImageDeletionFailures++
+			remainingPending = append(remainingPending, path)
+			continue
+		}
+		changed = true
+	}
+	if len(remainingPending) != len(updated.PendingImageCleanup) {
+		updated.PendingImageCleanup = remainingPending
+	}
+
 	return updated, changed, nil
 }
 
@@ -638,50 +703,33 @@ func (s *apiServer) deletePrepaidImage(ctx context.Context, ownerEmail string, s
 }
 
 func (s *apiServer) savePrepaidCleanupSnapshot(ctx context.Context, snapshot *fs.DocumentSnapshot, updated prepaidPurchaseRecord) error {
-	data := snapshot.Data()
-	cards, ok := data["cards"].([]interface{})
-	if !ok {
-		return fmt.Errorf("prepaid purchase cards have an invalid format")
+	if s.firestore == nil {
+		return fmt.Errorf("prepaid Firestore client is unavailable")
 	}
-	for _, rawCard := range cards {
-		cardData, ok := rawCard.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		cardID := strings.TrimSpace(stringFromAny(cardData["id"]))
-		for _, updatedCard := range updated.Cards {
-			if strings.TrimSpace(updatedCard.ID) != cardID {
-				continue
+	baselineData := snapshot.Data()
+	return s.firestore.RunTransaction(ctx, func(ctx context.Context, tx *fs.Transaction) error {
+		currentSnapshot, err := tx.Get(snapshot.Ref)
+		if err != nil || !currentSnapshot.Exists() {
+			if err != nil {
+				return err
 			}
-			cardData["package_image_storage_path"] = updatedCard.PackageImageStoragePath
-			cardData["card_front_image_storage_path"] = updatedCard.CardFrontImageStoragePath
-			cardData["card_back_image_storage_path"] = updatedCard.CardBackImageStoragePath
-			cardData["opened_card_image_storage_path"] = updatedCard.OpenedCardImageStoragePath
-			break
+			return httpError{status: http.StatusNotFound, detail: "Prepaid purchase not found"}
 		}
-	}
-	if receipts, ok := data["activation_receipts"].([]interface{}); ok {
-		for _, rawReceipt := range receipts {
-			receiptData, ok := rawReceipt.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			receiptID := strings.TrimSpace(stringFromAny(receiptData["id"]))
-			for _, updatedReceipt := range updated.ActivationReceipts {
-				if strings.TrimSpace(updatedReceipt.ID) != receiptID {
-					continue
-				}
-				receiptData["storage_path"] = updatedReceipt.StoragePath
-				break
-			}
+		merged, changed, err := mergePrepaidCleanupSnapshotData(baselineData, currentSnapshot.Data(), updated)
+		if err != nil {
+			return err
 		}
-	}
-	_, err := snapshot.Ref.Set(ctx, map[string]interface{}{
-		"cards":               cards,
-		"activation_receipts": data["activation_receipts"],
-		"updated_at":          time.Now().UTC(),
-	}, fs.MergeAll)
-	return err
+		if !changed {
+			return nil
+		}
+		merged["updated_at"] = time.Now().UTC()
+		return tx.Set(snapshot.Ref, map[string]interface{}{
+			"cards":                    merged["cards"],
+			"activation_receipts":      merged["activation_receipts"],
+			prepaidPendingCleanupField: merged[prepaidPendingCleanupField],
+			"updated_at":               merged["updated_at"],
+		}, fs.MergeAll)
+	})
 }
 
 func (s *apiServer) prepaidPurchasesForSearch(ctx context.Context, ownerEmail string) ([]prepaidPurchaseRecord, error) {
@@ -947,35 +995,32 @@ func (s *apiServer) addPrepaidCard(writer http.ResponseWriter, request *http.Req
 		writeJSON(writer, http.StatusCreated, record)
 		return
 	}
-	snapshot, err := s.getOwnedPrepaidPurchase(request.Context(), purchaseID, user.Email)
-	if err != nil {
-		s.writeErr(writer, err)
-		return
-	}
 	now := time.Now().UTC()
-	validActivationReceiptIDs := prepaidActivationReceiptIDsFromAny(snapshot.Data()["activation_receipts"])
-	entries, err := s.normalizePrepaidCardInputs(request.Context(), user.Email, []prepaidCardInput{payload}, now, validActivationReceiptIDs)
+	entries, err := s.normalizePrepaidCardInputs(request.Context(), user.Email, []prepaidCardInput{payload}, now)
 	if err != nil {
 		s.writeErr(writer, err)
 		return
 	}
-	existing, _ := snapshot.Data()["cards"].([]interface{})
-	next := append(existing, entries[0])
-	if _, err := snapshot.Ref.Set(request.Context(), map[string]interface{}{
-		"cards":               next,
-		"active_card_count":   countCardsByState(next, "active"),
-		"archived_card_count": countCardsByState(next, "archived"),
-		"updated_at":          now,
-	}, fs.MergeAll); err != nil {
-		s.writeErr(writer, err)
-		return
-	}
-	updated, err := snapshot.Ref.Get(request.Context())
+	record, err := s.mutateOwnedPrepaidPurchase(request.Context(), purchaseID, user.Email, func(data map[string]interface{}) ([]string, error) {
+		validActivationReceiptIDs := prepaidActivationReceiptIDsFromAny(data["activation_receipts"])
+		activationReceiptID := strings.TrimSpace(stringFromAny(entries[0].(map[string]interface{})["activation_receipt_id"]))
+		if err := validatePrepaidActivationReceiptID(activationReceiptID, validActivationReceiptIDs); err != nil {
+			return nil, err
+		}
+		cards, _ := data["cards"].([]interface{})
+		if err := validatePrepaidActivationAssociation(cards, activationReceiptID, "", false); err != nil {
+			return nil, err
+		}
+		cards = append(append([]interface{}(nil), cards...), entries[0])
+		data["cards"] = cards
+		data["active_card_count"] = countCardsByState(cards, "active")
+		data["archived_card_count"] = countCardsByState(cards, "archived")
+		return nil, nil
+	})
 	if err != nil {
 		s.writeErr(writer, err)
 		return
 	}
-	record := prepaidPurchaseFromSnapshot(updated)
 	record.Cards = redactPrepaidCards(record.Cards)
 	writeJSON(writer, http.StatusCreated, record)
 }
@@ -1030,56 +1075,54 @@ func (s *apiServer) updatePrepaidCard(writer http.ResponseWriter, request *http.
 		writeJSON(writer, http.StatusOK, record)
 		return
 	}
-	snapshot, err := s.getOwnedPrepaidPurchase(request.Context(), purchaseID, user.Email)
-	if err != nil {
-		s.writeErr(writer, err)
-		return
-	}
 	now := time.Now().UTC()
-	data := snapshot.Data()
-	cards, _ := data["cards"].([]interface{})
-	validActivationReceiptIDs := prepaidActivationReceiptIDsFromAny(data["activation_receipts"])
-	found := false
-	for index, rawCard := range cards {
-		card, ok := rawCard.(map[string]interface{})
-		if !ok || strings.TrimSpace(stringFromAny(card["id"])) != cardID {
-			continue
+	record, err := s.mutateOwnedPrepaidPurchase(request.Context(), purchaseID, user.Email, func(data map[string]interface{}) ([]string, error) {
+		cards, _ := data["cards"].([]interface{})
+		validActivationReceiptIDs := prepaidActivationReceiptIDsFromAny(data["activation_receipts"])
+		for index, rawCard := range cards {
+			card, ok := rawCard.(map[string]interface{})
+			if !ok || strings.TrimSpace(stringFromAny(card["id"])) != cardID {
+				continue
+			}
+			update, err := s.normalizePrepaidCardUpdate(request.Context(), user.Email, payload, now, card, validActivationReceiptIDs)
+			if err != nil {
+				return nil, err
+			}
+			if candidate, ok := update["activation_receipt_id"]; ok {
+				candidateID := strings.TrimSpace(stringFromAny(candidate))
+				currentID := strings.TrimSpace(stringFromAny(card["activation_receipt_id"]))
+				if candidateID != "" && !strings.EqualFold(candidateID, currentID) {
+					if err := validatePrepaidActivationAssociation(cards, candidateID, cardID, false); err != nil {
+						return nil, err
+					}
+				}
+			}
+			merged := cloneMap(card)
+			cleanupPaths := make([]string, 0, 4)
+			for _, field := range prepaidCardImageFields {
+				if next, ok := update[field]; ok {
+					oldPath := strings.TrimSpace(stringFromAny(card[field]))
+					newPath := strings.TrimSpace(stringFromAny(next))
+					if oldPath != "" && oldPath != newPath {
+						cleanupPaths = append(cleanupPaths, oldPath)
+					}
+				}
+			}
+			for key, value := range update {
+				merged[key] = value
+			}
+			cards[index] = merged
+			data["cards"] = cards
+			data["active_card_count"] = countCardsByState(cards, "active")
+			data["archived_card_count"] = countCardsByState(cards, "archived")
+			return cleanupPaths, nil
 		}
-		found = true
-		merged := map[string]interface{}{}
-		for key, value := range card {
-			merged[key] = value
-		}
-		update, err := s.normalizePrepaidCardUpdate(request.Context(), user.Email, payload, now, card, validActivationReceiptIDs)
-		if err != nil {
-			s.writeErr(writer, err)
-			return
-		}
-		for key, value := range update {
-			merged[key] = value
-		}
-		cards[index] = merged
-		break
-	}
-	if !found {
-		writeJSONError(writer, http.StatusNotFound, "Card not found")
-		return
-	}
-	if _, err := snapshot.Ref.Set(request.Context(), map[string]interface{}{
-		"cards":               cards,
-		"active_card_count":   countCardsByState(cards, "active"),
-		"archived_card_count": countCardsByState(cards, "archived"),
-		"updated_at":          now,
-	}, fs.MergeAll); err != nil {
-		s.writeErr(writer, err)
-		return
-	}
-	updated, err := snapshot.Ref.Get(request.Context())
+		return nil, httpError{status: http.StatusNotFound, detail: "Card not found"}
+	})
 	if err != nil {
 		s.writeErr(writer, err)
 		return
 	}
-	record := prepaidPurchaseFromSnapshot(updated)
 	record.Cards = redactPrepaidCards(record.Cards)
 	writeJSON(writer, http.StatusOK, record)
 }
@@ -1323,6 +1366,9 @@ func (s *apiServer) normalizePrepaidActivationInputs(ctx context.Context, ownerE
 }
 
 func (s *apiServer) normalizePrepaidCardInputs(ctx context.Context, ownerEmail string, inputs []prepaidCardInput, now time.Time, validActivationReceiptIDs ...map[string]struct{}) ([]interface{}, error) {
+	if err := validatePrepaidActivationInputAssociations(inputs); err != nil {
+		return nil, err
+	}
 	result := make([]interface{}, 0, len(inputs))
 	for _, input := range inputs {
 		if !input.Confirmed {
@@ -1649,15 +1695,16 @@ func prepaidPurchaseFromSnapshot(snapshot *fs.DocumentSnapshot) prepaidPurchaseR
 		archivedCount = len(filterPrepaidCards(cards, "archived"))
 	}
 	return prepaidPurchaseRecord{
-		ID:                 snapshot.Ref.ID,
-		OwnerEmail:         stringFromAny(data["owner_email"]),
-		SalesReceiptID:     stringFromAny(data["sales_receipt_id"]),
-		ActivationReceipts: prepaidActivationReceiptsFromAny(data["activation_receipts"]),
-		Cards:              cards,
-		ActiveCardCount:    activeCount,
-		ArchivedCardCount:  archivedCount,
-		CreatedAt:          isoString(data["created_at"]),
-		UpdatedAt:          isoString(data["updated_at"]),
+		ID:                  snapshot.Ref.ID,
+		OwnerEmail:          stringFromAny(data["owner_email"]),
+		SalesReceiptID:      stringFromAny(data["sales_receipt_id"]),
+		ActivationReceipts:  prepaidActivationReceiptsFromAny(data["activation_receipts"]),
+		Cards:               cards,
+		ActiveCardCount:     activeCount,
+		ArchivedCardCount:   archivedCount,
+		PendingImageCleanup: prepaidPendingCleanupPaths(data[prepaidPendingCleanupField]),
+		CreatedAt:           isoString(data["created_at"]),
+		UpdatedAt:           isoString(data["updated_at"]),
 	}
 }
 

@@ -42,6 +42,8 @@ var prepaidUpdateCardOverride func(s *apiServer, ctx context.Context, user *veri
 
 var prepaidArchiveCardOverride func(s *apiServer, ctx context.Context, user *verifiedUser, purchaseID string, cardID string) (prepaidPurchaseRecord, error)
 
+var prepaidPurchaseMutationOverride func(s *apiServer, ctx context.Context, purchaseID string, ownerEmail string, mutate prepaidPurchaseMutator) (prepaidPurchaseRecord, error)
+
 var signedImageURLOverride func(ctx context.Context, storagePath string) (string, error)
 
 var receiptObjectAttrsOverride func(ctx context.Context, storagePath string) (*gcs.ObjectAttrs, error)
@@ -68,6 +70,7 @@ func resetPrepaidTestOverrides() {
 	prepaidGetCardDetailOverride = nil
 	prepaidUpdateCardOverride = nil
 	prepaidArchiveCardOverride = nil
+	prepaidPurchaseMutationOverride = nil
 	signedImageURLOverride = nil
 	receiptObjectAttrsOverride = nil
 	receiptStoragePathUpdateOverride = nil

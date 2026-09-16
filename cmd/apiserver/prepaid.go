@@ -38,6 +38,8 @@ const (
 	prepaidImageActivation prepaidImageType = "activation_receipt"
 	prepaidImagePackage    prepaidImageType = "package"
 	prepaidImageOpenedCard prepaidImageType = "opened_card"
+	prepaidImageCardFront  prepaidImageType = "card_front"
+	prepaidImageCardBack   prepaidImageType = "card_back"
 )
 
 type prepaidPurchaseRecord struct {
@@ -62,6 +64,7 @@ type prepaidActivationReceipt struct {
 
 type prepaidCardRecord struct {
 	ID                         string   `json:"id"`
+	ActivationReceiptID        string   `json:"activation_receipt_id,omitempty"`
 	ActivationBarcode          string   `json:"activation_barcode"`
 	VanillaSerial              string   `json:"vanilla_serial"`
 	Denomination               *float64 `json:"denomination,omitempty"`
@@ -73,6 +76,8 @@ type prepaidCardRecord struct {
 	State                      string   `json:"state"`
 	ArchivedAt                 string   `json:"archived_at,omitempty"`
 	PackageImageStoragePath    string   `json:"package_image_storage_path,omitempty"`
+	CardFrontImageStoragePath  string   `json:"card_front_image_storage_path,omitempty"`
+	CardBackImageStoragePath   string   `json:"card_back_image_storage_path,omitempty"`
 	OpenedCardImageStoragePath string   `json:"opened_card_image_storage_path,omitempty"`
 	ExtractionStatus           string   `json:"extraction_status,omitempty"`
 	CreatedAt                  string   `json:"created_at,omitempty"`
@@ -92,6 +97,7 @@ type prepaidCreatePurchaseRequest struct {
 }
 
 type prepaidActivationReceiptInput struct {
+	ID          string `json:"id"`
 	StoragePath string `json:"storage_path"`
 	Filename    string `json:"filename"`
 	ContentType string `json:"content_type"`
@@ -101,13 +107,66 @@ type prepaidCardInput struct {
 	ActivationBarcode          string   `json:"activation_barcode"`
 	VanillaSerial              string   `json:"vanilla_serial"`
 	SerialNumber               string   `json:"serial_number"`
+	ActivationReceiptID        string   `json:"activation_receipt_id"`
 	Denomination               *float64 `json:"denomination"`
 	PAN                        string   `json:"pan"`
 	Expiry                     string   `json:"expiry"`
 	CVV                        string   `json:"cvv"`
 	PackageImageStoragePath    string   `json:"package_image_storage_path"`
+	CardFrontImageStoragePath  string   `json:"card_front_image_storage_path"`
+	CardBackImageStoragePath   string   `json:"card_back_image_storage_path"`
 	OpenedCardImageStoragePath string   `json:"opened_card_image_storage_path"`
 	Confirmed                  bool     `json:"confirmed"`
+
+	activationReceiptIDSet bool
+}
+
+func (input *prepaidCardInput) UnmarshalJSON(data []byte) error {
+	type prepaidCardInputJSON struct {
+		ActivationBarcode          string   `json:"activation_barcode"`
+		VanillaSerial              string   `json:"vanilla_serial"`
+		SerialNumber               string   `json:"serial_number"`
+		ActivationReceiptID        *string  `json:"activation_receipt_id"`
+		Denomination               *float64 `json:"denomination"`
+		PAN                        string   `json:"pan"`
+		Expiry                     string   `json:"expiry"`
+		CVV                        string   `json:"cvv"`
+		PackageImageStoragePath    string   `json:"package_image_storage_path"`
+		CardFrontImageStoragePath  string   `json:"card_front_image_storage_path"`
+		CardBackImageStoragePath   string   `json:"card_back_image_storage_path"`
+		OpenedCardImageStoragePath string   `json:"opened_card_image_storage_path"`
+		Confirmed                  bool     `json:"confirmed"`
+	}
+	var decoded prepaidCardInputJSON
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*input = prepaidCardInput{
+		ActivationBarcode:          decoded.ActivationBarcode,
+		VanillaSerial:              decoded.VanillaSerial,
+		SerialNumber:               decoded.SerialNumber,
+		Denomination:               decoded.Denomination,
+		PAN:                        decoded.PAN,
+		Expiry:                     decoded.Expiry,
+		CVV:                        decoded.CVV,
+		PackageImageStoragePath:    decoded.PackageImageStoragePath,
+		CardFrontImageStoragePath:  decoded.CardFrontImageStoragePath,
+		CardBackImageStoragePath:   decoded.CardBackImageStoragePath,
+		OpenedCardImageStoragePath: decoded.OpenedCardImageStoragePath,
+		Confirmed:                  decoded.Confirmed,
+		activationReceiptIDSet:     false,
+	}
+	if decoded.ActivationReceiptID != nil {
+		input.ActivationReceiptID = *decoded.ActivationReceiptID
+	}
+	_, input.activationReceiptIDSet = fields["activation_receipt_id"]
+	return nil
 }
 
 type prepaidExtractRequest struct {
@@ -135,6 +194,8 @@ type prepaidSearchResult struct {
 
 type prepaidCleanupSummary struct {
 	PackageImagesDeleted           int `json:"package_images_deleted"`
+	CardFrontImagesDeleted         int `json:"card_front_images_deleted"`
+	CardBackImagesDeleted          int `json:"card_back_images_deleted"`
 	OpenedCardImagesDeleted        int `json:"opened_card_images_deleted"`
 	ActivationReceiptImagesDeleted int `json:"activation_receipt_images_deleted"`
 	SalesReceiptsPreserved         int `json:"sales_receipts_preserved"`
@@ -151,6 +212,15 @@ type prepaidOpenedCardExtraction struct {
 	PAN    string `json:"pan"`
 	Expiry string `json:"expiry"`
 	CVV    string `json:"cvv"`
+}
+
+type prepaidCardFrontExtraction struct {
+	PAN    string `json:"pan"`
+	Expiry string `json:"expiry"`
+}
+
+type prepaidCardBackExtraction struct {
+	CVV string `json:"cvv"`
 }
 
 func (s *apiServer) handlePrepaid(writer http.ResponseWriter, request *http.Request) {
@@ -174,6 +244,10 @@ func (s *apiServer) handlePrepaid(writer http.ResponseWriter, request *http.Requ
 		s.createPrepaidSignedUpload(writer, request, user)
 	case path == "package-extract" && request.Method == http.MethodPost:
 		s.extractPrepaidPackageImage(writer, request, user)
+	case path == "card-front-extract" && request.Method == http.MethodPost:
+		s.extractPrepaidCardFrontImage(writer, request, user)
+	case path == "card-back-extract" && request.Method == http.MethodPost:
+		s.extractPrepaidCardBackImage(writer, request, user)
 	case path == "opened-card-extract" && request.Method == http.MethodPost:
 		s.extractPrepaidOpenedCardImage(writer, request, user)
 	case path == "search" && request.Method == http.MethodPost:
@@ -230,6 +304,10 @@ func (s *apiServer) handlePrepaidPurchasePath(writer http.ResponseWriter, reques
 		s.signPrepaidActivationReceiptImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]))
 	case len(parts) == 4 && parts[1] == "cards" && parts[3] == "package-image" && request.Method == http.MethodGet:
 		s.signPrepaidCardImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]), prepaidImagePackage)
+	case len(parts) == 4 && parts[1] == "cards" && parts[3] == "card-front-image" && request.Method == http.MethodGet:
+		s.signPrepaidCardImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]), prepaidImageCardFront)
+	case len(parts) == 4 && parts[1] == "cards" && parts[3] == "card-back-image" && request.Method == http.MethodGet:
+		s.signPrepaidCardImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]), prepaidImageCardBack)
 	case len(parts) == 4 && parts[1] == "cards" && parts[3] == "opened-card-image" && request.Method == http.MethodGet:
 		s.signPrepaidCardImage(writer, request, user, purchaseID, strings.TrimSpace(parts[2]), prepaidImageOpenedCard)
 	case len(parts) == 4 && parts[1] == "cards" && parts[3] == "archive" && request.Method == http.MethodPost:
@@ -250,7 +328,7 @@ func (s *apiServer) createPrepaidSignedUpload(writer http.ResponseWriter, reques
 	}
 	imageType := prepaidImageType(strings.TrimSpace(payload.ImageType))
 	if !validPrepaidImageType(imageType) {
-		writeJSONError(writer, http.StatusBadRequest, "image_type must be activation_receipt, package, or opened_card")
+		writeJSONError(writer, http.StatusBadRequest, "image_type must be activation_receipt, package, opened_card, card_front, or card_back")
 		return
 	}
 	contentType := strings.TrimSpace(payload.ContentType)
@@ -480,6 +558,24 @@ func (s *apiServer) cleanupArchivedPrepaidPurchase(ctx context.Context, purchase
 				changed = true
 			}
 		}
+		if path := strings.TrimSpace(card.CardFrontImageStoragePath); path != "" {
+			if err := s.deletePrepaidImage(ctx, purchase.OwnerEmail, path); err != nil {
+				summary.ImageDeletionFailures++
+			} else {
+				card.CardFrontImageStoragePath = ""
+				summary.CardFrontImagesDeleted++
+				changed = true
+			}
+		}
+		if path := strings.TrimSpace(card.CardBackImageStoragePath); path != "" {
+			if err := s.deletePrepaidImage(ctx, purchase.OwnerEmail, path); err != nil {
+				summary.ImageDeletionFailures++
+			} else {
+				card.CardBackImageStoragePath = ""
+				summary.CardBackImagesDeleted++
+				changed = true
+			}
+		}
 		if path := strings.TrimSpace(card.OpenedCardImageStoragePath); path != "" {
 			if err := s.deletePrepaidImage(ctx, purchase.OwnerEmail, path); err != nil {
 				summary.ImageDeletionFailures++
@@ -558,6 +654,8 @@ func (s *apiServer) savePrepaidCleanupSnapshot(ctx context.Context, snapshot *fs
 				continue
 			}
 			cardData["package_image_storage_path"] = updatedCard.PackageImageStoragePath
+			cardData["card_front_image_storage_path"] = updatedCard.CardFrontImageStoragePath
+			cardData["card_back_image_storage_path"] = updatedCard.CardBackImageStoragePath
 			cardData["opened_card_image_storage_path"] = updatedCard.OpenedCardImageStoragePath
 			break
 		}
@@ -666,7 +764,8 @@ func (s *apiServer) createPrepaidPurchase(writer http.ResponseWriter, request *h
 		s.writeErr(writer, err)
 		return
 	}
-	cards, err := s.normalizePrepaidCardInputs(request.Context(), user.Email, payload.Cards, now)
+	validActivationReceiptIDs := prepaidActivationReceiptIDsFromAny(activationReceipts)
+	cards, err := s.normalizePrepaidCardInputs(request.Context(), user.Email, payload.Cards, now, validActivationReceiptIDs)
 	if err != nil {
 		s.writeErr(writer, err)
 		return
@@ -721,7 +820,9 @@ func (s *apiServer) addPrepaidActivationReceipt(writer http.ResponseWriter, requ
 		return
 	}
 	now := time.Now().UTC()
-	entries, err := s.normalizePrepaidActivationInputs(request.Context(), user.Email, []prepaidActivationReceiptInput{payload}, now)
+	existingReceipts := prepaidActivationReceiptsFromAny(snapshot.Data()["activation_receipts"])
+	existingIDs := prepaidActivationReceiptIDs(existingReceipts)
+	entries, err := s.normalizePrepaidActivationInputs(request.Context(), user.Email, []prepaidActivationReceiptInput{payload}, now, existingIDs)
 	if err != nil {
 		s.writeErr(writer, err)
 		return
@@ -789,6 +890,10 @@ func (s *apiServer) signPrepaidCardImage(writer http.ResponseWriter, request *ht
 		switch imageType {
 		case prepaidImagePackage:
 			storagePath = strings.TrimSpace(card.PackageImageStoragePath)
+		case prepaidImageCardFront:
+			storagePath = strings.TrimSpace(card.CardFrontImageStoragePath)
+		case prepaidImageCardBack:
+			storagePath = strings.TrimSpace(card.CardBackImageStoragePath)
 		case prepaidImageOpenedCard:
 			storagePath = strings.TrimSpace(card.OpenedCardImageStoragePath)
 		}
@@ -848,7 +953,8 @@ func (s *apiServer) addPrepaidCard(writer http.ResponseWriter, request *http.Req
 		return
 	}
 	now := time.Now().UTC()
-	entries, err := s.normalizePrepaidCardInputs(request.Context(), user.Email, []prepaidCardInput{payload}, now)
+	validActivationReceiptIDs := prepaidActivationReceiptIDsFromAny(snapshot.Data()["activation_receipts"])
+	entries, err := s.normalizePrepaidCardInputs(request.Context(), user.Email, []prepaidCardInput{payload}, now, validActivationReceiptIDs)
 	if err != nil {
 		s.writeErr(writer, err)
 		return
@@ -932,6 +1038,7 @@ func (s *apiServer) updatePrepaidCard(writer http.ResponseWriter, request *http.
 	now := time.Now().UTC()
 	data := snapshot.Data()
 	cards, _ := data["cards"].([]interface{})
+	validActivationReceiptIDs := prepaidActivationReceiptIDsFromAny(data["activation_receipts"])
 	found := false
 	for index, rawCard := range cards {
 		card, ok := rawCard.(map[string]interface{})
@@ -943,7 +1050,7 @@ func (s *apiServer) updatePrepaidCard(writer http.ResponseWriter, request *http.
 		for key, value := range card {
 			merged[key] = value
 		}
-		update, err := s.normalizePrepaidCardUpdate(request.Context(), user.Email, payload, now, card)
+		update, err := s.normalizePrepaidCardUpdate(request.Context(), user.Email, payload, now, card, validActivationReceiptIDs)
 		if err != nil {
 			s.writeErr(writer, err)
 			return
@@ -1062,6 +1169,68 @@ func (s *apiServer) extractPrepaidPackageImage(writer http.ResponseWriter, reque
 	})
 }
 
+func (s *apiServer) extractPrepaidCardFrontImage(writer http.ResponseWriter, request *http.Request, user *verifiedUser) {
+	defer request.Body.Close()
+	var payload prepaidExtractRequest
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		writeJSONError(writer, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := s.ensurePrepaidUploadedImage(request.Context(), user.Email, payload.StoragePath); err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+	imageURL, err := s.signedImageURL(request.Context(), strings.TrimSpace(payload.StoragePath))
+	if err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+	result, err := s.runPrepaidCardFrontExtraction(request.Context(), imageURL)
+	if err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+	warnings := validatePrepaidCardFrontExtraction(result)
+	writeJSON(writer, http.StatusOK, map[string]interface{}{
+		"extraction":            result,
+		"warnings":              warnings,
+		"requires_confirmation": true,
+	})
+}
+
+func (s *apiServer) extractPrepaidCardBackImage(writer http.ResponseWriter, request *http.Request, user *verifiedUser) {
+	defer request.Body.Close()
+	var payload prepaidExtractRequest
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		writeJSONError(writer, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := s.ensurePrepaidUploadedImage(request.Context(), user.Email, payload.StoragePath); err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+	imageURL, err := s.signedImageURL(request.Context(), strings.TrimSpace(payload.StoragePath))
+	if err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+	result, err := s.runPrepaidCardBackExtraction(request.Context(), imageURL)
+	if err != nil {
+		s.writeErr(writer, err)
+		return
+	}
+	warnings := validatePrepaidCardBackExtraction(result)
+	writeJSON(writer, http.StatusOK, map[string]interface{}{
+		"extraction":            result,
+		"warnings":              warnings,
+		"requires_confirmation": true,
+	})
+}
+
 func (s *apiServer) extractPrepaidOpenedCardImage(writer http.ResponseWriter, request *http.Request, user *verifiedUser) {
 	defer request.Body.Close()
 	var payload prepaidExtractRequest
@@ -1104,8 +1273,25 @@ func (s *apiServer) getOwnedPrepaidPurchase(ctx context.Context, purchaseID stri
 	return snapshot, nil
 }
 
-func (s *apiServer) normalizePrepaidActivationInputs(ctx context.Context, ownerEmail string, inputs []prepaidActivationReceiptInput, now time.Time) ([]interface{}, error) {
+func validatePrepaidActivationReceiptID(value string, validActivationReceiptIDs ...map[string]struct{}) error {
+	value = strings.TrimSpace(value)
+	if value == "" || len(validActivationReceiptIDs) == 0 {
+		return nil
+	}
+	if _, ok := validActivationReceiptIDs[0][strings.ToLower(value)]; !ok {
+		return httpError{status: http.StatusBadRequest, detail: "activation_receipt_id must refer to an activation receipt in this purchase"}
+	}
+	return nil
+}
+
+func (s *apiServer) normalizePrepaidActivationInputs(ctx context.Context, ownerEmail string, inputs []prepaidActivationReceiptInput, now time.Time, existingIDs ...map[string]struct{}) ([]interface{}, error) {
 	result := make([]interface{}, 0, len(inputs))
+	seenIDs := make(map[string]struct{})
+	if len(existingIDs) > 0 {
+		for id := range existingIDs[0] {
+			seenIDs[strings.ToLower(strings.TrimSpace(id))] = struct{}{}
+		}
+	}
 	for _, input := range inputs {
 		storagePath := strings.TrimSpace(input.StoragePath)
 		if storagePath == "" {
@@ -1114,8 +1300,19 @@ func (s *apiServer) normalizePrepaidActivationInputs(ctx context.Context, ownerE
 		if err := s.ensurePrepaidUploadedImage(ctx, ownerEmail, storagePath); err != nil {
 			return nil, err
 		}
+		id := strings.TrimSpace(input.ID)
+		if id == "" {
+			id = uuid.NewString()
+		} else if _, err := uuid.Parse(id); err != nil {
+			return nil, httpError{status: http.StatusBadRequest, detail: "activation receipt id must be a valid UUID"}
+		}
+		idKey := strings.ToLower(id)
+		if _, exists := seenIDs[idKey]; exists {
+			return nil, httpError{status: http.StatusBadRequest, detail: "activation receipt ids must be unique within the purchase"}
+		}
+		seenIDs[idKey] = struct{}{}
 		result = append(result, map[string]interface{}{
-			"id":           uuid.NewString(),
+			"id":           id,
 			"storage_path": storagePath,
 			"filename":     strings.TrimSpace(input.Filename),
 			"content_type": fallbackString(input.ContentType, "image/webp"),
@@ -1125,13 +1322,13 @@ func (s *apiServer) normalizePrepaidActivationInputs(ctx context.Context, ownerE
 	return result, nil
 }
 
-func (s *apiServer) normalizePrepaidCardInputs(ctx context.Context, ownerEmail string, inputs []prepaidCardInput, now time.Time) ([]interface{}, error) {
+func (s *apiServer) normalizePrepaidCardInputs(ctx context.Context, ownerEmail string, inputs []prepaidCardInput, now time.Time, validActivationReceiptIDs ...map[string]struct{}) ([]interface{}, error) {
 	result := make([]interface{}, 0, len(inputs))
 	for _, input := range inputs {
 		if !input.Confirmed {
 			return nil, httpError{status: http.StatusBadRequest, detail: "card details must be confirmed before saving"}
 		}
-		card, err := s.normalizePrepaidCardInput(ctx, ownerEmail, input, now, true)
+		card, err := s.normalizePrepaidCardInput(ctx, ownerEmail, input, now, true, validActivationReceiptIDs...)
 		if err != nil {
 			return nil, err
 		}
@@ -1140,7 +1337,7 @@ func (s *apiServer) normalizePrepaidCardInputs(ctx context.Context, ownerEmail s
 	return result, nil
 }
 
-func (s *apiServer) normalizePrepaidCardInput(ctx context.Context, ownerEmail string, input prepaidCardInput, now time.Time, requirePackageFields bool) (map[string]interface{}, error) {
+func (s *apiServer) normalizePrepaidCardInput(ctx context.Context, ownerEmail string, input prepaidCardInput, now time.Time, requirePackageFields bool, validActivationReceiptIDs ...map[string]struct{}) (map[string]interface{}, error) {
 	barcode := digitsOnly(input.ActivationBarcode)
 	if requirePackageFields && !prepaidDigits30.MatchString(barcode) {
 		return nil, httpError{status: http.StatusBadRequest, detail: "activation_barcode must be exactly 30 digits"}
@@ -1161,6 +1358,10 @@ func (s *apiServer) normalizePrepaidCardInput(ctx context.Context, ownerEmail st
 	if strings.TrimSpace(input.Expiry) != "" && expiry == "" {
 		return nil, httpError{status: http.StatusBadRequest, detail: "expiry must be MM/YY or YYYY-MM"}
 	}
+	activationReceiptID := strings.TrimSpace(input.ActivationReceiptID)
+	if err := validatePrepaidActivationReceiptID(activationReceiptID, validActivationReceiptIDs...); err != nil {
+		return nil, err
+	}
 	packagePath := strings.TrimSpace(input.PackageImageStoragePath)
 	if packagePath != "" {
 		if err := s.ensurePrepaidUploadedImage(ctx, ownerEmail, packagePath); err != nil {
@@ -1170,6 +1371,18 @@ func (s *apiServer) normalizePrepaidCardInput(ctx context.Context, ownerEmail st
 	openedPath := strings.TrimSpace(input.OpenedCardImageStoragePath)
 	if openedPath != "" {
 		if err := s.ensurePrepaidUploadedImage(ctx, ownerEmail, openedPath); err != nil {
+			return nil, err
+		}
+	}
+	frontPath := strings.TrimSpace(input.CardFrontImageStoragePath)
+	if frontPath != "" {
+		if err := s.ensurePrepaidUploadedImage(ctx, ownerEmail, frontPath); err != nil {
+			return nil, err
+		}
+	}
+	backPath := strings.TrimSpace(input.CardBackImageStoragePath)
+	if backPath != "" {
+		if err := s.ensurePrepaidUploadedImage(ctx, ownerEmail, backPath); err != nil {
 			return nil, err
 		}
 	}
@@ -1183,20 +1396,32 @@ func (s *apiServer) normalizePrepaidCardInput(ctx context.Context, ownerEmail st
 		"cvv":                            cvv,
 		"state":                          "active",
 		"package_image_storage_path":     packagePath,
+		"card_front_image_storage_path":  frontPath,
+		"card_back_image_storage_path":   backPath,
 		"opened_card_image_storage_path": openedPath,
 		"extraction_status":              "confirmed",
 		"created_at":                     now,
 		"updated_at":                     now,
 	}
+	if activationReceiptID != "" {
+		card["activation_receipt_id"] = activationReceiptID
+	}
 	return card, nil
 }
 
-func (s *apiServer) normalizePrepaidCardUpdate(ctx context.Context, ownerEmail string, input prepaidCardInput, now time.Time, existing map[string]interface{}) (map[string]interface{}, error) {
+func (s *apiServer) normalizePrepaidCardUpdate(ctx context.Context, ownerEmail string, input prepaidCardInput, now time.Time, existing map[string]interface{}, validActivationReceiptIDs ...map[string]struct{}) (map[string]interface{}, error) {
 	if !input.Confirmed {
 		return nil, httpError{status: http.StatusBadRequest, detail: "card details must be confirmed before saving"}
 	}
 	update := map[string]interface{}{}
 	newPANProvided := false
+	activationReceiptID := strings.TrimSpace(input.ActivationReceiptID)
+	if input.activationReceiptIDSet || activationReceiptID != "" {
+		if err := validatePrepaidActivationReceiptID(activationReceiptID, validActivationReceiptIDs...); err != nil {
+			return nil, err
+		}
+		update["activation_receipt_id"] = activationReceiptID
+	}
 	if input.Denomination != nil {
 		update["denomination"] = input.Denomination
 	}
@@ -1237,6 +1462,20 @@ func (s *apiServer) normalizePrepaidCardUpdate(ctx context.Context, ownerEmail s
 		}
 		update["opened_card_image_storage_path"] = openedPath
 	}
+	frontPath := strings.TrimSpace(input.CardFrontImageStoragePath)
+	if frontPath != "" {
+		if !prepaidStoragePathBelongsToOwner(ownerEmail, frontPath) {
+			return nil, httpError{status: http.StatusForbidden, detail: "storage_path does not belong to the authenticated user"}
+		}
+		update["card_front_image_storage_path"] = frontPath
+	}
+	backPath := strings.TrimSpace(input.CardBackImageStoragePath)
+	if backPath != "" {
+		if !prepaidStoragePathBelongsToOwner(ownerEmail, backPath) {
+			return nil, httpError{status: http.StatusForbidden, detail: "storage_path does not belong to the authenticated user"}
+		}
+		update["card_back_image_storage_path"] = backPath
+	}
 	if !newPANProvided {
 		if pan := stringFromAny(existing["pan"]); strings.TrimSpace(pan) != "" {
 			update["last4"] = last4(pan)
@@ -1261,7 +1500,18 @@ func (s *apiServer) ensurePrepaidUploadedImage(ctx context.Context, ownerEmail s
 	if !prepaidStoragePathBelongsToOwner(ownerEmail, storagePath) {
 		return httpError{status: http.StatusForbidden, detail: "storage_path does not belong to the authenticated user"}
 	}
-	attrs, err := s.bucket.Object(storagePath).Attrs(ctx)
+	var (
+		attrs *gcs.ObjectAttrs
+		err   error
+	)
+	if prepaidObjectAttrsOverride != nil {
+		attrs, err = prepaidObjectAttrsOverride(ctx, storagePath)
+	} else {
+		if s.bucket == nil {
+			return fmt.Errorf("prepaid storage bucket is unavailable")
+		}
+		attrs, err = s.bucket.Object(storagePath).Attrs(ctx)
+	}
 	if err != nil {
 		if err == gcs.ErrObjectNotExist {
 			return httpError{status: http.StatusNotFound, detail: "uploaded object not found"}
@@ -1288,6 +1538,29 @@ func (s *apiServer) runPrepaidPackageExtraction(ctx context.Context, imageURL st
 	}, nil
 }
 
+func (s *apiServer) runPrepaidCardFrontExtraction(ctx context.Context, imageURL string) (prepaidCardFrontExtraction, error) {
+	rawText, err := s.runPrepaidVisionPrompt(ctx, imageURL, "Extract only JSON from this prepaid Vanilla card front image with keys pan and expiry. The pan must be the 16 digit card number. The expiry should be MM/YY if visible. Return only these fields. Do not include explanation.")
+	if err != nil {
+		return prepaidCardFrontExtraction{}, err
+	}
+	payload := extractJSON(rawText)
+	return prepaidCardFrontExtraction{
+		PAN:    digitsOnly(firstPresentString(payload, "pan", "card_number", "number")),
+		Expiry: normalizePrepaidExpiry(firstPresentString(payload, "expiry", "expiration", "expiration_date")),
+	}, nil
+}
+
+func (s *apiServer) runPrepaidCardBackExtraction(ctx context.Context, imageURL string) (prepaidCardBackExtraction, error) {
+	rawText, err := s.runPrepaidVisionPrompt(ctx, imageURL, "Extract only JSON from this prepaid Vanilla card back image with key cvv. The cvv/cvc/security code must be 3 or 4 digits. Return only this field. Do not include explanation.")
+	if err != nil {
+		return prepaidCardBackExtraction{}, err
+	}
+	payload := extractJSON(rawText)
+	return prepaidCardBackExtraction{
+		CVV: digitsOnly(firstPresentString(payload, "cvv", "cvc", "security_code")),
+	}, nil
+}
+
 func (s *apiServer) runPrepaidOpenedCardExtraction(ctx context.Context, imageURL string) (prepaidOpenedCardExtraction, error) {
 	rawText, err := s.runPrepaidVisionPrompt(ctx, imageURL, "Extract only JSON from this opened prepaid card image with keys pan, expiry, cvv. The pan must be the 16 digit card number. The expiry should be MM/YY if visible. Do not include explanation.")
 	if err != nil {
@@ -1302,6 +1575,9 @@ func (s *apiServer) runPrepaidOpenedCardExtraction(ctx context.Context, imageURL
 }
 
 func (s *apiServer) runPrepaidVisionPrompt(ctx context.Context, imageURL string, prompt string) (string, error) {
+	if prepaidVisionPromptOverride != nil {
+		return prepaidVisionPromptOverride(ctx, imageURL, prompt)
+	}
 	if strings.TrimSpace(s.cfg.openAIAPIKey) == "" {
 		return "", fmt.Errorf("OPENAI_API_KEY is required")
 	}
@@ -1374,6 +1650,16 @@ func prepaidPurchaseFromSnapshot(snapshot *fs.DocumentSnapshot) prepaidPurchaseR
 }
 
 func prepaidActivationReceiptsFromAny(value interface{}) []prepaidActivationReceipt {
+	if typed, ok := value.([]prepaidActivationReceipt); ok {
+		return append([]prepaidActivationReceipt(nil), typed...)
+	}
+	if typed, ok := value.([]map[string]interface{}); ok {
+		raw := make([]interface{}, 0, len(typed))
+		for _, entry := range typed {
+			raw = append(raw, entry)
+		}
+		value = raw
+	}
 	raw, ok := value.([]interface{})
 	if !ok {
 		return []prepaidActivationReceipt{}
@@ -1395,7 +1681,31 @@ func prepaidActivationReceiptsFromAny(value interface{}) []prepaidActivationRece
 	return result
 }
 
+func prepaidActivationReceiptIDs(receipts []prepaidActivationReceipt) map[string]struct{} {
+	result := make(map[string]struct{}, len(receipts))
+	for _, receipt := range receipts {
+		if id := strings.TrimSpace(receipt.ID); id != "" {
+			result[strings.ToLower(id)] = struct{}{}
+		}
+	}
+	return result
+}
+
+func prepaidActivationReceiptIDsFromAny(value interface{}) map[string]struct{} {
+	return prepaidActivationReceiptIDs(prepaidActivationReceiptsFromAny(value))
+}
+
 func prepaidCardsFromAny(value interface{}) []prepaidCardRecord {
+	if typed, ok := value.([]prepaidCardRecord); ok {
+		return append([]prepaidCardRecord(nil), typed...)
+	}
+	if typed, ok := value.([]map[string]interface{}); ok {
+		raw := make([]interface{}, 0, len(typed))
+		for _, entry := range typed {
+			raw = append(raw, entry)
+		}
+		value = raw
+	}
 	raw, ok := value.([]interface{})
 	if !ok {
 		return []prepaidCardRecord{}
@@ -1406,19 +1716,30 @@ func prepaidCardsFromAny(value interface{}) []prepaidCardRecord {
 		if !ok {
 			continue
 		}
+		pan := stringFromAny(data["pan"])
+		existingLast4 := last4(stringFromAny(data["last4"]))
+		cardLast4 := last4(pan)
+		if cardLast4 == "" {
+			cardLast4 = existingLast4
+		}
+		detailsCaptured, _ := data["details_captured"].(bool)
+		detailsCaptured = detailsCaptured || prepaidDetailsCaptured(pan, stringFromAny(data["expiry"]), stringFromAny(data["cvv"]))
 		result = append(result, prepaidCardRecord{
 			ID:                         stringFromAny(data["id"]),
+			ActivationReceiptID:        stringFromAny(data["activation_receipt_id"]),
 			ActivationBarcode:          stringFromAny(data["activation_barcode"]),
 			VanillaSerial:              stringFromAny(data["vanilla_serial"]),
 			Denomination:               normalizeAmount(data["denomination"]),
-			PAN:                        stringFromAny(data["pan"]),
+			PAN:                        pan,
 			Expiry:                     stringFromAny(data["expiry"]),
 			CVV:                        stringFromAny(data["cvv"]),
-			Last4:                      last4(stringFromAny(data["pan"])),
-			DetailsCaptured:            prepaidDetailsCaptured(stringFromAny(data["pan"]), stringFromAny(data["expiry"]), stringFromAny(data["cvv"])),
+			Last4:                      cardLast4,
+			DetailsCaptured:            detailsCaptured,
 			State:                      fallbackString(data["state"], "active"),
 			ArchivedAt:                 isoString(data["archived_at"]),
 			PackageImageStoragePath:    stringFromAny(data["package_image_storage_path"]),
+			CardFrontImageStoragePath:  stringFromAny(data["card_front_image_storage_path"]),
+			CardBackImageStoragePath:   stringFromAny(data["card_back_image_storage_path"]),
 			OpenedCardImageStoragePath: stringFromAny(data["opened_card_image_storage_path"]),
 			ExtractionStatus:           stringFromAny(data["extraction_status"]),
 			CreatedAt:                  isoString(data["created_at"]),
@@ -1431,8 +1752,8 @@ func prepaidCardsFromAny(value interface{}) []prepaidCardRecord {
 func redactPrepaidCards(cards []prepaidCardRecord) []prepaidCardRecord {
 	result := make([]prepaidCardRecord, 0, len(cards))
 	for _, card := range cards {
-		card.Last4 = last4(card.PAN)
-		card.DetailsCaptured = prepaidDetailsCaptured(card.PAN, card.Expiry, card.CVV)
+		card.Last4 = prepaidCardLast4(card)
+		card.DetailsCaptured = card.DetailsCaptured || prepaidDetailsCaptured(card.PAN, card.Expiry, card.CVV)
 		card.PAN = ""
 		card.Expiry = ""
 		card.CVV = ""
@@ -1547,8 +1868,27 @@ func validateOpenedCardExtraction(value prepaidOpenedCardExtraction) []string {
 	return warnings
 }
 
+func validatePrepaidCardFrontExtraction(value prepaidCardFrontExtraction) []string {
+	warnings := make([]string, 0)
+	if !prepaidDigits16.MatchString(value.PAN) {
+		warnings = append(warnings, "pan must be exactly 16 digits")
+	}
+	if value.Expiry == "" {
+		warnings = append(warnings, "expiry must be MM/YY or YYYY-MM")
+	}
+	return warnings
+}
+
+func validatePrepaidCardBackExtraction(value prepaidCardBackExtraction) []string {
+	warnings := make([]string, 0)
+	if !prepaidCVV.MatchString(value.CVV) {
+		warnings = append(warnings, "cvv must be 3 or 4 digits")
+	}
+	return warnings
+}
+
 func validPrepaidImageType(value prepaidImageType) bool {
-	return value == prepaidImageActivation || value == prepaidImagePackage || value == prepaidImageOpenedCard
+	return value == prepaidImageActivation || value == prepaidImagePackage || value == prepaidImageOpenedCard || value == prepaidImageCardFront || value == prepaidImageCardBack
 }
 
 func buildPrepaidStorageKeyForOwner(ownerEmail string, imageType string, filename string) string {

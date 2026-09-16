@@ -491,6 +491,30 @@ func TestPrepaidCardImageSigning(t *testing.T) {
 			wantSignedPath: ownerStoragePrefix("owner@example.com") + "prepaid/opened/card-1.webp",
 		},
 		{
+			name:           "owner can obtain card front image url",
+			ownerEmail:     "owner@example.com",
+			path:           "/prepaid/purchases/purchase-1/cards/card-1/card-front-image",
+			wantStatus:     http.StatusOK,
+			wantSignedPath: ownerStoragePrefix("owner@example.com") + "prepaid/card_front/card-1.webp",
+			configureRecord: func() prepaidPurchaseRecord {
+				record := fixturePrepaidPurchase()
+				record.Cards[0].CardFrontImageStoragePath = ownerStoragePrefix("owner@example.com") + "prepaid/card_front/card-1.webp"
+				return record
+			},
+		},
+		{
+			name:           "owner can obtain card back image url",
+			ownerEmail:     "owner@example.com",
+			path:           "/prepaid/purchases/purchase-1/cards/card-1/card-back-image",
+			wantStatus:     http.StatusOK,
+			wantSignedPath: ownerStoragePrefix("owner@example.com") + "prepaid/card_back/card-1.webp",
+			configureRecord: func() prepaidPurchaseRecord {
+				record := fixturePrepaidPurchase()
+				record.Cards[0].CardBackImageStoragePath = ownerStoragePrefix("owner@example.com") + "prepaid/card_back/card-1.webp"
+				return record
+			},
+		},
+		{
 			name:       "another user cannot obtain package image url",
 			ownerEmail: "other@example.com",
 			path:       "/prepaid/purchases/purchase-1/cards/card-1/package-image",

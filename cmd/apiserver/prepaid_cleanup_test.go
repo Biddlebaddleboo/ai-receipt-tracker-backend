@@ -73,6 +73,25 @@ func TestCleanupArchivedPrepaidImagesDeletesArchivedPhotosAndPreservesCardData(t
 	}
 }
 
+func TestCleanupArchivedPrepaidImagesDeletesFrontAndBackImagesIndependently(t *testing.T) {
+	purchase := fixtureArchivedPrepaidPurchase()
+	ownerPrefix := ownerStoragePrefix("owner@example.com")
+	purchase.Cards[0].CardFrontImageStoragePath = ownerPrefix + "prepaid/card_front/card-1.webp"
+	purchase.Cards[0].CardBackImageStoragePath = ownerPrefix + "prepaid/card_back/card-1.webp"
+
+	summary, records, deletedPaths := runPrepaidCleanupTest(t, "owner@example.com", []prepaidPurchaseRecord{purchase}, nil)
+	if summary.CardFrontImagesDeleted != 1 || summary.CardBackImagesDeleted != 1 {
+		t.Fatalf("expected front/back images deleted, got %+v", summary)
+	}
+	if len(deletedPaths) != 5 {
+		t.Fatalf("expected package/front/back/opened/activation paths deleted, got %v", deletedPaths)
+	}
+	card := records[0].Cards[0]
+	if card.CardFrontImageStoragePath != "" || card.CardBackImageStoragePath != "" {
+		t.Fatalf("expected front/back paths cleared, got front=%q back=%q", card.CardFrontImageStoragePath, card.CardBackImageStoragePath)
+	}
+}
+
 func TestCleanupArchivedPrepaidImagesPreservesActiveAndMixedPurchaseImages(t *testing.T) {
 	active := fixturePrepaidPurchase()
 	activeOriginal := active

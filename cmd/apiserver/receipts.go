@@ -1385,19 +1385,45 @@ func extractReceiptItems(payload map[string]interface{}) []ocrItem {
 	}
 	items := make([]ocrItem, 0)
 	for _, rawEntry := range entries {
-		entry, ok := rawEntry.(map[string]interface{})
+		item, ok := ocrItemFromAny(rawEntry)
 		if !ok {
 			continue
 		}
-		name := normalizeString(firstPresent(entry, "name", "item", "description"))
-		quantity := normalizeAmount(firstPresent(entry, "quantity", "qty", "count"))
-		price := normalizeAmount(firstPresent(entry, "price", "unit_price", "amount"))
-		if name == nil && quantity == nil && price == nil {
-			continue
-		}
-		items = append(items, ocrItem{Name: name, Quantity: quantity, Price: price})
+		items = append(items, item)
 	}
 	return items
+}
+
+func ocrItemFromAny(raw interface{}) (ocrItem, bool) {
+	var nameRaw, quantityRaw, priceRaw interface{}
+	switch entry := raw.(type) {
+	case map[string]interface{}:
+		nameRaw = firstPresent(entry, "name", "item", "description")
+		quantityRaw = firstPresent(entry, "quantity", "qty", "count")
+		priceRaw = firstPresent(entry, "price", "unit_price", "amount")
+	case []interface{}:
+		if len(entry) > 0 {
+			nameRaw = entry[0]
+		}
+		if len(entry) > 1 {
+			quantityRaw = entry[1]
+		}
+		if len(entry) > 2 {
+			priceRaw = entry[2]
+		}
+	default:
+		return ocrItem{}, false
+	}
+
+	item := ocrItem{
+		Name:     normalizeString(nameRaw),
+		Quantity: normalizeAmount(quantityRaw),
+		Price:    normalizeAmount(priceRaw),
+	}
+	if item.Name == nil && item.Quantity == nil && item.Price == nil {
+		return ocrItem{}, false
+	}
+	return item, true
 }
 
 func firstPresent(payload map[string]interface{}, keys ...string) interface{} {
@@ -1553,11 +1579,9 @@ func receiptItemsFromAny(value interface{}) []receiptItem {
 		if typed, ok := value.([]map[string]interface{}); ok {
 			result := make([]receiptItem, 0, len(typed))
 			for _, item := range typed {
-				result = append(result, receiptItem{
-					Name:     stringFromAny(item["name"]),
-					Quantity: existingFloatOrZeroPtr(item["quantity"]),
-					Price:    existingFloatOrZeroPtr(item["price"]),
-				})
+				if normalized, ok := receiptItemFromAny(item); ok {
+					result = append(result, normalized)
+				}
 			}
 			return result
 		}
@@ -1565,17 +1589,37 @@ func receiptItemsFromAny(value interface{}) []receiptItem {
 	}
 	result := make([]receiptItem, 0, len(raw))
 	for _, entry := range raw {
-		item, ok := entry.(map[string]interface{})
-		if !ok {
-			continue
+		if normalized, ok := receiptItemFromAny(entry); ok {
+			result = append(result, normalized)
 		}
-		result = append(result, receiptItem{
-			Name:     stringFromAny(item["name"]),
-			Quantity: existingFloatOrZeroPtr(item["quantity"]),
-			Price:    existingFloatOrZeroPtr(item["price"]),
-		})
 	}
 	return result
+}
+
+func receiptItemFromAny(raw interface{}) (receiptItem, bool) {
+	if entry, ok := raw.(map[string]interface{}); ok {
+		return receiptItem{
+			Name:     stringFromAny(firstPresent(entry, "name", "item", "description")),
+			Quantity: existingFloatOrZeroPtr(firstPresent(entry, "quantity", "qty", "count")),
+			Price:    existingFloatOrZeroPtr(firstPresent(entry, "price", "unit_price", "amount")),
+		}, true
+	}
+	if normalized, ok := ocrItemFromAny(raw); ok {
+		return receiptItemFromOCRItem(normalized), true
+	}
+	return receiptItem{}, false
+}
+
+func receiptItemFromOCRItem(item ocrItem) receiptItem {
+	name := ""
+	if item.Name != nil {
+		name = *item.Name
+	}
+	return receiptItem{
+		Name:     name,
+		Quantity: item.Quantity,
+		Price:    item.Price,
+	}
 }
 
 func parseNullableString(raw json.RawMessage) interface{} {

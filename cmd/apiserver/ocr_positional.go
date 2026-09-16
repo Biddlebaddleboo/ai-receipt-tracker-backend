@@ -100,27 +100,11 @@ func extractPositionalReceiptItems(raw interface{}) []ocrItem {
 	}
 	items := make([]ocrItem, 0, len(entries))
 	for _, rawEntry := range entries {
-		entry, ok := rawEntry.([]interface{})
+		item, ok := ocrItemFromAny(rawEntry)
 		if !ok {
 			continue
 		}
-		var nameRaw, quantityRaw, priceRaw interface{}
-		if len(entry) > 0 {
-			nameRaw = entry[0]
-		}
-		if len(entry) > 1 {
-			quantityRaw = entry[1]
-		}
-		if len(entry) > 2 {
-			priceRaw = entry[2]
-		}
-		name := normalizeString(nameRaw)
-		quantity := normalizeAmount(quantityRaw)
-		price := normalizeAmount(priceRaw)
-		if name == nil && quantity == nil && price == nil {
-			continue
-		}
-		items = append(items, ocrItem{Name: name, Quantity: quantity, Price: price})
+		items = append(items, item)
 	}
 	return items
 }

@@ -1,0 +1,61 @@
+name: Deploy backend to receipt-keeper-510215
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: receipt-keeper-backend-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PROJECT_ID: receipt-keeper-510215
+      REGION: northamerica-northeast2
+      SERVICE_NAME: ai-receipt-tracker-backend
+      AR_HOSTNAME: northamerica-northeast2-docker.pkg.dev
+      AR_REPOSITORY: cloud-run-source-deploy
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: projects/974614483217/locations/global/workloadIdentityPools/receipt-keeper-github/providers/backend-github
+          service_account: receipt-keeper-backend-deploy@receipt-keeper-510215.iam.gserviceaccount.com
+
+      - name: Set up Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: receipt-keeper-510215
+
+      - name: Build and deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${AR_HOSTNAME}/${PROJECT_ID}/${AR_REPOSITORY}/${SERVICE_NAME}/${SERVICE_NAME}:${GITHUB_SHA}"
+
+          gcloud auth configure-docker "${AR_HOSTNAME}" --quiet
+          docker build --pull --tag "${image}" .
+          docker push "${image}"
+
+          gcloud run services update "${SERVICE_NAME}" \
+            --project="${PROJECT_ID}" \
+            --region="${REGION}" \
+            --platform=managed \
+            --image="${image}" \
+            --update-env-vars="FIREBASE_PROJECT_ID=${PROJECT_ID},FIRESTORE_DATABASE_ID=(default),REQUIRE_FIREBASE_AUTH=true" \
+            --remove-env-vars=OAUTH_CLIENT_ID,REQUIRE_OAUTH \
+            --quiet

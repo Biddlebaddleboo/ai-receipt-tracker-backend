@@ -14,11 +14,14 @@ import (
 
 	fs "cloud.google.com/go/firestore"
 	"cloud.google.com/go/storage"
+	firebase "firebase.google.com/go/v4"
+	firebaseauth "firebase.google.com/go/v4/auth"
 	"google.golang.org/api/idtoken"
 )
 
 type config struct {
 	port                string
+	firebaseProjectID   string
 	firestoreDatabase   string
 	firestoreCollection string
 	categoriesColl      string
@@ -42,16 +45,17 @@ type verifiedUser struct {
 }
 
 type apiServer struct {
-	cfg        config
-	helcim     *helcimClient
-	firestore  *fs.Client
-	storage    *storage.Client
-	receipts   *fs.CollectionRef
-	categories *fs.CollectionRef
-	plans      *fs.CollectionRef
-	users      *fs.CollectionRef
-	bucket     *storage.BucketHandle
-	httpServer *http.Server
+	cfg          config
+	helcim       *helcimClient
+	firestore    *fs.Client
+	storage      *storage.Client
+	firebaseAuth *firebaseauth.Client
+	receipts     *fs.CollectionRef
+	categories   *fs.CollectionRef
+	plans        *fs.CollectionRef
+	users        *fs.CollectionRef
+	bucket       *storage.BucketHandle
+	httpServer   *http.Server
 }
 
 func main() {
@@ -94,6 +98,7 @@ func main() {
 func loadConfig() (config, error) {
 	cfg := config{
 		port:                envOrDefault("PORT", "8080"),
+		firebaseProjectID:   envOrDefault("FIREBASE_PROJECT_ID", envOrDefault("GOOGLE_CLOUD_PROJECT", "")),
 		firestoreDatabase:   envOrDefault("FIRESTORE_DATABASE_ID", "(default)"),
 		firestoreCollection: envOrDefault("FIRESTORE_COLLECTION_NAME", "receipts"),
 		categoriesColl:      envOrDefault("CATEGORIES_COLLECTION_NAME", "categories"),
@@ -102,7 +107,7 @@ func loadConfig() (config, error) {
 		gcsBucketName:       strings.TrimSpace(os.Getenv("GCLOUD_BUCKET_NAME")),
 		openAIModel:         envOrDefault("OPENAI_MODEL_NAME", "gpt-4.1-mini"),
 		openAIAPIKey:        strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
-		requireOAuth:        parseBool(os.Getenv("REQUIRE_OAUTH")),
+		requireOAuth:        parseBool(envOrDefault("REQUIRE_FIREBASE_AUTH", os.Getenv("REQUIRE_OAUTH"))),
 		oauthClientIDs:      normalizeListField(os.Getenv("OAUTH_CLIENT_ID")),
 		oauthAllowedDomain:  normalizeListField(os.Getenv("OAUTH_ALLOWED_DOMAINS")),
 		allowedOrigins:      normalizeListField(envOrDefault("ALLOWED_ORIGINS", "http://localhost:3000")),
@@ -123,7 +128,19 @@ func loadConfig() (config, error) {
 
 func newAPIServer(cfg config) (*apiServer, error) {
 	ctx := context.Background()
-	client, err := fs.NewClientWithDatabase(ctx, fs.DetectProjectID, cfg.firestoreDatabase)
+	firebaseApp, err := firebase.NewApp(ctx, &firebase.Config{ProjectID: cfg.firebaseProjectID})
+	if err != nil {
+		return nil, err
+	}
+	firebaseAuthClient, err := firebaseApp.Auth(ctx)
+	if err != nil {
+		return nil, err
+	}
+	projectID := cfg.firebaseProjectID
+	if projectID == "" {
+		projectID = fs.DetectProjectID
+	}
+	client, err := fs.NewClientWithDatabase(ctx, projectID, cfg.firestoreDatabase)
 	if err != nil {
 		return nil, err
 	}
@@ -133,15 +150,16 @@ func newAPIServer(cfg config) (*apiServer, error) {
 		return nil, err
 	}
 	return &apiServer{
-		cfg:        cfg,
-		helcim:     newHelcimClient(cfg),
-		firestore:  client,
-		storage:    storageClient,
-		receipts:   client.Collection(cfg.firestoreCollection),
-		categories: client.Collection(cfg.categoriesColl),
-		plans:      client.Collection(cfg.plansCollection),
-		users:      client.Collection(cfg.usersCollection),
-		bucket:     storageClient.Bucket(cfg.gcsBucketName),
+		cfg:          cfg,
+		helcim:       newHelcimClient(cfg),
+		firestore:    client,
+		storage:      storageClient,
+		firebaseAuth: firebaseAuthClient,
+		receipts:     client.Collection(cfg.firestoreCollection),
+		categories:   client.Collection(cfg.categoriesColl),
+		plans:        client.Collection(cfg.plansCollection),
+		users:        client.Collection(cfg.usersCollection),
+		bucket:       storageClient.Bucket(cfg.gcsBucketName),
 	}, nil
 }
 
@@ -197,11 +215,7 @@ func (s *apiServer) handleHealthz(writer http.ResponseWriter, request *http.Requ
 func (s *apiServer) authenticateRequest(writer http.ResponseWriter, request *http.Request) (*verifiedUser, bool) {
 	if !s.cfg.requireOAuth {
 		writer.Header().Set("WWW-Authenticate", "Bearer")
-		writeJSONError(writer, http.StatusUnauthorized, "OAuth bearer token required")
-		return nil, false
-	}
-	if len(s.cfg.oauthClientIDs) == 0 {
-		writeJSONError(writer, http.StatusInternalServerError, "OAuth is required but no client ID is configured")
+		writeJSONError(writer, http.StatusUnauthorized, "Firebase Authentication bearer token required")
 		return nil, false
 	}
 	authHeader := strings.TrimSpace(request.Header.Get("Authorization"))
@@ -216,22 +230,47 @@ func (s *apiServer) authenticateRequest(writer http.ResponseWriter, request *htt
 		writeJSONError(writer, http.StatusUnauthorized, "Missing bearer token")
 		return nil, false
 	}
-	var (
-		user       *verifiedUser
-		statusCode int
-		message    string
-	)
+	var user *verifiedUser
 	if verifyGoogleTokenOverride != nil {
+		var statusCode int
+		var message string
 		user, statusCode, message = verifyGoogleTokenOverride(request.Context(), token, s.cfg.oauthClientIDs, s.cfg.oauthAllowedDomain)
-	} else {
-		user, statusCode, message = verifyGoogleToken(request.Context(), token, s.cfg.oauthClientIDs, s.cfg.oauthAllowedDomain)
-	}
-	if statusCode != 0 {
-		if statusCode == http.StatusUnauthorized {
-			writer.Header().Set("WWW-Authenticate", "Bearer")
+		if statusCode != 0 {
+			if statusCode == http.StatusUnauthorized {
+				writer.Header().Set("WWW-Authenticate", "Bearer")
+			}
+			writeJSONError(writer, statusCode, message)
+			return nil, false
 		}
-		writeJSONError(writer, statusCode, message)
-		return nil, false
+	} else {
+		if s.firebaseAuth == nil {
+			writeJSONError(writer, http.StatusInternalServerError, "Firebase Authentication is not initialized")
+			return nil, false
+		}
+		firebaseToken, err := s.firebaseAuth.VerifyIDToken(request.Context(), token)
+		if err != nil {
+			writer.Header().Set("WWW-Authenticate", "Bearer")
+			writeJSONError(writer, http.StatusUnauthorized, "Invalid or expired Firebase ID token")
+			return nil, false
+		}
+		email := claimString(firebaseToken.Claims, "email")
+		if email == "" || firebaseToken.UID == "" {
+			writeJSONError(writer, http.StatusUnauthorized, "Firebase ID token is missing the user identity")
+			return nil, false
+		}
+		if len(s.cfg.oauthAllowedDomain) > 0 {
+			parts := strings.Split(email, "@")
+			if len(parts) != 2 || !containsFold(s.cfg.oauthAllowedDomain, parts[1]) {
+				writeJSONError(writer, http.StatusForbidden, "Firebase user does not belong to an allowed domain")
+				return nil, false
+			}
+		}
+		user = &verifiedUser{
+			Iss:   firebaseToken.Issuer,
+			Sub:   firebaseToken.UID,
+			Email: email,
+			Name:  claimString(firebaseToken.Claims, "name"),
+		}
 	}
 	return user, true
 }

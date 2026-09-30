@@ -7,7 +7,7 @@
   },
   "servers": [
     {
-      "url": "https://ai-receipt-tracker-backend-267658267276.northamerica-northeast2.run.app"
+      "url": "https://ai-receipt-tracker-backend-974614483217.northamerica-northeast2.run.app"
     }
   ],
   "tags": [
@@ -19,7 +19,9 @@
   "paths": {
     "/ai/receipts": {
       "get": {
-        "tags": ["AI receipts"],
+        "tags": [
+          "AI receipts"
+        ],
         "operationId": "listAIReceipts",
         "summary": "List the owner's receipt summaries",
         "description": "Returns all receipt summaries owned by the AI bearer token's user, newest first.",
@@ -53,7 +55,9 @@
     },
     "/ai/receipts/{receipt_id}": {
       "get": {
-        "tags": ["AI receipts"],
+        "tags": [
+          "AI receipts"
+        ],
         "operationId": "getAIReceipt",
         "summary": "Get one complete receipt",
         "description": "Returns the complete structured receipt record when the receipt belongs to the AI bearer token's user.",
@@ -102,7 +106,9 @@
     },
     "/ai/receipts/{receipt_id}/image": {
       "get": {
-        "tags": ["AI receipts"],
+        "tags": [
+          "AI receipts"
+        ],
         "operationId": "getAIReceiptImage",
         "summary": "Get one receipt image as JPEG",
         "description": "Returns the owner's private stored receipt image converted to JPEG. The response contains image bytes, not a permanent or signed storage URL.",
@@ -243,7 +249,9 @@
     "schemas": {
       "ErrorResponse": {
         "type": "object",
-        "required": ["detail"],
+        "required": [
+          "detail"
+        ],
         "properties": {
           "detail": {
             "type": "string"
@@ -253,7 +261,9 @@
       },
       "ReceiptItem": {
         "type": "object",
-        "required": ["name"],
+        "required": [
+          "name"
+        ],
         "properties": {
           "name": {
             "type": "string"
@@ -271,7 +281,9 @@
       },
       "AIReceiptSummary": {
         "type": "object",
-        "required": ["id"],
+        "required": [
+          "id"
+        ],
         "properties": {
           "id": {
             "type": "string"
@@ -301,7 +313,10 @@
       },
       "AIReceiptSummaryList": {
         "type": "object",
-        "required": ["receipts", "count"],
+        "required": [
+          "receipts",
+          "count"
+        ],
         "properties": {
           "receipts": {
             "type": "array",
@@ -319,7 +334,14 @@
       },
       "AIReceipt": {
         "type": "object",
-        "required": ["id", "items", "image_url", "extracted_text", "extracted_fields", "created_at"],
+        "required": [
+          "id",
+          "items",
+          "image_url",
+          "extracted_text",
+          "extracted_fields",
+          "created_at"
+        ],
         "properties": {
           "id": {
             "type": "string"

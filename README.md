@@ -9,7 +9,7 @@ Lean Go backend for receipt upload finalization, OCR extraction, image URL signi
 
 ## What This Service Does
 
-- Verifies Google OAuth bearer tokens for protected app routes.
+- Verifies Firebase Authentication ID tokens issued by `receipt-keeper-510215` for protected app routes.
 - Generates and revokes one server-owned, read-only AI receipt access token per user.
 - Stores only the AI token secret hash in the server-only `ai_access_tokens` Firestore collection.
 - Issues signed Google Cloud Storage upload URLs.
@@ -38,7 +38,7 @@ Lean Go backend for receipt upload finalization, OCR extraction, image URL signi
 - `GET /billing/helcim/approval`
 - `POST /billing/helcim/approval`
 
-### Authenticated (Google ID token bearer)
+### Authenticated (Firebase ID token bearer)
 
 #### AI access management
 
@@ -87,6 +87,7 @@ These routes accept only an AI access token created through `/ai-access/token`. 
 ## Required Environment Variables
 
 Core:
+- `FIREBASE_PROJECT_ID` (Firebase Auth and Firestore project; destination project in production)
 - `PORT` (default `8080`)
 - `GCLOUD_BUCKET_NAME`
 - `FIRESTORE_DATABASE_ID` (default `(default)`)
@@ -96,9 +97,8 @@ Core:
 - `USERS_COLLECTION_NAME` (default `users`)
 
 Auth/CORS:
-- `REQUIRE_OAUTH` (`true`/`false`)
-- `OAUTH_CLIENT_ID` (single string or JSON array/comma-list)
-- `OAUTH_ALLOWED_DOMAINS` (optional)
+- `REQUIRE_FIREBASE_AUTH` (`true`/`false`)
+- `OAUTH_ALLOWED_DOMAINS` (optional email-domain allowlist)
 - `ALLOWED_ORIGINS` (JSON array or comma-list)
 - `ALLOWED_ORIGIN_REGEX` (optional)
 
